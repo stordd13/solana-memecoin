@@ -1,0 +1,57 @@
+# Core dependencies
+streamlit>=1.32.0
+polars>=0.20.5
+numpy>=1.26.4
+plotly>=5.19.0
+
+# Data processing and analysis
+python-dateutil>=2.8.2
+pytz>=2024.1
+
+# Visualization
+matplotlib>=3.8.3
+seaborn>=0.13.2
+
+# Utilities
+tqdm>=4.66.2
+python-dotenv>=1.0.1
+requests>=2.31.0
+
+# Development tools
+black>=24.2.0
+pylint>=3.0.3
+pytest>=8.0.2
+
+# Web scraping libraries
+selenium==4.11.2
+playwright==1.38.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+
+# Data storage
+pyarrow>=7.0.0  # for parquet support
+fastparquet==2024.2.0
+
+pycoingecko==3.2.0
+
+# Added from the code block
+statsmodels>=0.13.0
+scikit-learn>=1.0.0
+tensorflow>=2.12.0
+
+# Original requirements preserved
+folium==0.17.0
+prophet==1.1.6
+ruptures==1.1.9
+stumpy==1.13.0
+pymannkendall==1.4.3
+xgboost==2.1.2
+lightgbm==4.5.0
+click==8.1.7
+ipykernel==6.29.5
+statsmodels==0.14.4
+pathlib==1.0.1
+ipython==8.29.0
+openpyxl==3.1.5
+Pillow==10.4.0
+optuna==4.0.0 
