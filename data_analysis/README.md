@@ -129,4 +129,33 @@ Each parquet file should contain:
 ### Performance Tips
 - Analyze in batches of 50 tokens or less
 - Use quality filters to focus on good data
-- Close other applications when analyzing large datasets 
+- Close other applications when analyzing large datasets
+
+## Additional Tools
+
+### Token Overlap Analyzer (`token_overlap_analyzer.py`)
+A comprehensive tool for analyzing overlaps between token categories with both quick and detailed analysis modes.
+
+**Features:**
+- **Quick Mode**: Fast overlap checking between specific folders
+- **Comprehensive Mode**: Detailed analysis of all folder overlaps
+- **Command-line interface** for easy automation
+- **Multi-category token detection**
+- **Detailed reporting** with statistics
+- **JSON export** for further analysis
+- **Support for exclusive category system**
+
+**Usage:**
+```bash
+# Quick comparison between two folders
+python token_overlap_analyzer.py --mode quick --folder1 normal_behavior_tokens --folder2 dead_tokens
+
+# Compare one folder with all others
+python token_overlap_analyzer.py --mode quick --folder1 normal_behavior_tokens
+
+# Comprehensive analysis (default)
+python token_overlap_analyzer.py --mode comprehensive
+
+# Use custom processed data path
+python token_overlap_analyzer.py --processed-path /path/to/processed/data
+``` 

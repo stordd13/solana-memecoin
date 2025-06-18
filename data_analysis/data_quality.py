@@ -29,6 +29,13 @@ class DataQualityAnalyzer:
             'min_data_points': 60,      # Minimum data points required (1 hour)
             'max_gap_for_interpolation': 10  # Maximum gap size for interpolation
         }
+        # New extreme thresholds
+        self.extreme_thresholds = {
+            'extreme_minute_return': 100.0,  # 10,000% in one minute
+            'extreme_total_return': 10000.0,  # 1,000,000% total return
+            'extreme_volatility': 100.0,     # 10,000% volatility
+            'extreme_range': 100.0           # 10,000% price range
+        }
     
     def extract_launch_context(self, df: pl.DataFrame) -> Dict:
         """Extract launch context from the first timestamp using Polars"""
@@ -58,6 +65,79 @@ class DataQualityAnalyzer:
             return "2024_bull"
         else:
             return "2025_unknown"
+            
+    def _detect_extreme_movements(self, df: pl.DataFrame) -> Dict:
+        """
+        Detect extreme price movements based on new thresholds
+        
+        Args:
+            df: DataFrame with token data
+            
+        Returns:
+            Dictionary with extreme movement metrics
+        """
+        try:
+            if df.height == 0:
+                return {
+                    'has_extreme_minute_jump': False,
+                    'max_minute_return': 0.0,
+                    'has_extreme_total_return': False,
+                    'total_return': 0.0,
+                    'extreme_minute_count': 0,
+                    'extreme_details': []
+                }
+            
+            # Calculate minute-by-minute returns
+            df = df.with_columns([
+                pl.col('price').pct_change().alias('returns')
+            ])
+            
+            # Find extreme minute returns (>10,000% in one minute)
+            extreme_minute_mask = pl.col('returns') > self.extreme_thresholds['extreme_minute_return']
+            extreme_minutes = df.filter(extreme_minute_mask)
+            
+            # Calculate total return from first to last price
+            first_price = df.select(pl.col('price').first()).item()
+            last_price = df.select(pl.col('price').last()).item()
+            total_return = ((last_price - first_price) / first_price) * 100 if first_price and first_price > 0 else 0
+            
+            # Get maximum minute return
+            max_minute_return = df.select(pl.col('returns').max()).item() or 0
+            max_minute_return_pct = max_minute_return * 100  # Convert to percentage
+            
+            # Check thresholds
+            has_extreme_minute_jump = max_minute_return_pct > self.extreme_thresholds['extreme_minute_return'] * 100
+            has_extreme_total_return = abs(total_return) > self.extreme_thresholds['extreme_total_return'] * 100
+            
+            # Collect extreme movement details
+            extreme_details = []
+            if extreme_minutes.height > 0:
+                for row in extreme_minutes.to_dicts():
+                    extreme_details.append({
+                        'datetime': row['datetime'],
+                        'price': row['price'],
+                        'return_pct': row['returns'] * 100 if row['returns'] else 0
+                    })
+            
+            return {
+                'has_extreme_minute_jump': has_extreme_minute_jump,
+                'max_minute_return': max_minute_return_pct,
+                'has_extreme_total_return': has_extreme_total_return,
+                'total_return': total_return,
+                'extreme_minute_count': extreme_minutes.height,
+                'extreme_details': extreme_details[:10]  # Limit to first 10 for performance
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting extreme movements: {e}")
+            return {
+                'has_extreme_minute_jump': False,
+                'max_minute_return': 0.0,
+                'has_extreme_total_return': False,
+                'total_return': 0.0,
+                'extreme_minute_count': 0,
+                'extreme_details': []
+            }
             
     def analyze_single_file(self, df: pl.DataFrame, token: str) -> Dict:
         """
@@ -89,7 +169,10 @@ class DataQualityAnalyzer:
             price_anomalies = self._analyze_price_anomalies(df)
             has_extreme_jump = price_anomalies.get('has_extreme_jump', False)
 
-            # --- NEW: Compute volatility, total return, price range ---
+            # --- NEW: Enhanced extreme movement detection ---
+            extreme_movements = self._detect_extreme_movements(df)
+            
+            # --- Existing: Compute volatility, total return, price range ---
             pa = PriceAnalyzer()
             price_stats = pa._calculate_price_stats(df)
             volatility_metrics = pa._calculate_volatility_metrics(df)
@@ -101,6 +184,15 @@ class DataQualityAnalyzer:
             has_extreme_return = abs(total_return) > 100
             has_extreme_range = price_range > 100
             # ---
+            
+            # NEW: Determine if token has extreme characteristics
+            is_extreme_token = (
+                extreme_movements['has_extreme_minute_jump'] or 
+                extreme_movements['has_extreme_total_return'] or
+                has_extreme_volatility or 
+                has_extreme_return or 
+                has_extreme_range
+            )
             
             # Extract launch context
             launch_context = self.extract_launch_context(df)
@@ -117,8 +209,8 @@ class DataQualityAnalyzer:
             # Calculate how long the token has been "dead" (constant price at the end)
             death_duration_hours = self._get_death_duration(df)
             
-            # A token is considered dead if its price is constant for at least 4 hours
-            is_dead = death_duration_hours >= 4
+            # A token is considered dead if its price is constant for at least 2 hours
+            is_dead = death_duration_hours >= 2
             
             return {
                 'token': token,
@@ -134,7 +226,13 @@ class DataQualityAnalyzer:
                 'has_extreme_jump': has_extreme_jump,
                 'has_extreme_volatility': has_extreme_volatility,
                 'has_extreme_return': has_extreme_return,
-                'has_extreme_range': has_extreme_range
+                'has_extreme_range': has_extreme_range,
+                # NEW: Enhanced extreme movement metrics
+                'extreme_movements': extreme_movements,
+                'is_extreme_token': is_extreme_token,
+                'max_minute_return': extreme_movements['max_minute_return'],
+                'total_return_pct': extreme_movements['total_return'],
+                'extreme_minute_count': extreme_movements['extreme_minute_count']
             }
             
         except Exception as e:
@@ -144,20 +242,31 @@ class DataQualityAnalyzer:
     def _analyze_gaps(self, datetime_series: pl.Series) -> Dict:
         """Analyze gaps in the time series using Polars"""
         if datetime_series.len() <= 1:
-            return {'total_gaps': 0, 'gap_details': []}
+            return {'total_gaps': 0, 'gap_details': [], 'max_gap': 0, 'avg_gap': 0}
             
-        # Calculate time differences
-        time_diff = datetime_series.diff()
+        # Get launch time (first timestamp)
+        launch_time = datetime_series.min()
         
-        # Identify gaps
+        # Calculate time differences in seconds
+        time_diff_seconds = datetime_series.diff().dt.total_seconds()
+        
+        # Identify gaps - anything significantly longer than 1 minute (60 seconds)
+        # Allow some tolerance for slight variations (e.g., 1.5 minutes = 90 seconds)
         gaps = []
-        for i, diff in enumerate(time_diff):
-            if diff is not None and diff > timedelta(minutes=1):
-                gap_size = diff.total_seconds() / 60
+        for i, diff_seconds in enumerate(time_diff_seconds):
+            if diff_seconds is not None and diff_seconds > 90:  # More than 1.5 minutes
+                gap_size_minutes = diff_seconds / 60
+                
+                # Calculate gap starting point (minutes after launch)
+                gap_start_time = datetime_series[i]  # Time when gap starts
+                minutes_after_launch = (gap_start_time - launch_time).total_seconds() / 60
+                
                 gaps.append({
                     'position': i,
-                    'size_minutes': gap_size,
-                    'interpolation_type': self._get_interpolation_type(gap_size)
+                    'size_minutes': gap_size_minutes,
+                    'start_minutes_after_launch': minutes_after_launch,
+                    'start_time': gap_start_time,
+                    'interpolation_type': self._get_interpolation_type(gap_size_minutes)
                 })
                 
         # Calculate gap statistics
@@ -225,26 +334,28 @@ class DataQualityAnalyzer:
         
     def _calculate_quality_score(self, total_rows: int, unique_dates: int,
                                gaps: Dict, price_anomalies: Dict, has_extreme_jump: bool = False) -> float:
-        """Calculate a quality score (0-100) for the data"""
+        """Calculate a simplified quality score (0-100) based only on basic data integrity"""
         score = 100
         
-        # Penalize for missing data
+        # Only penalize for basic data integrity issues
+        if total_rows == 0:
+            return 0
+        
+        # Penalize for missing data (duplicates)
         completeness = (unique_dates / total_rows) * 100 if total_rows > 0 else 0
         score -= (100 - completeness)
         
-        # Penalize for gaps
-        score -= gaps['total_gaps'] * 2
+        # Penalize for invalid prices (zero/negative)
+        invalid_prices = price_anomalies['zero_prices'] + price_anomalies['negative_prices']
+        if total_rows > 0:
+            invalid_price_pct = (invalid_prices / total_rows) * 100
+            score -= invalid_price_pct
         
-        # Penalize for price anomalies
-        score -= (price_anomalies['zero_prices'] + 
-                 price_anomalies['negative_prices'] + 
-                 price_anomalies['extreme_ups'] + 
-                 price_anomalies['extreme_downs']) * 0.5
+        # Penalize for missing data points (gaps) - but less severely
+        if total_rows > 0:
+            gap_penalty = min(gaps['total_gaps'], 10)  # Cap at 10 points
+            score -= gap_penalty
         
-        # Heavily penalize tokens with extreme jumps
-        if has_extreme_jump:
-            score -= 50
-
         # Ensure score is between 0 and 100
         return max(0, min(100, score))
         
@@ -275,7 +386,20 @@ class DataQualityAnalyzer:
             'has_extreme_jump': False,
             'has_extreme_volatility': False,
             'has_extreme_return': False,
-            'has_extreme_range': False
+            'has_extreme_range': False,
+            # NEW: Enhanced extreme movement metrics
+            'extreme_movements': {
+                'has_extreme_minute_jump': False,
+                'max_minute_return': 0.0,
+                'has_extreme_total_return': False,
+                'total_return': 0.0,
+                'extreme_minute_count': 0,
+                'extreme_details': []
+            },
+            'is_extreme_token': False,
+            'max_minute_return': 0.0,
+            'total_return_pct': 0.0,
+            'extreme_minute_count': 0
         }
         if error:
             report['error'] = error
@@ -363,6 +487,121 @@ class DataQualityAnalyzer:
             'time_gaps': quality_df.filter(pl.col('time_gaps') > 0).select(['token', 'time_gaps', 'max_gap_minutes']),
             'extreme_changes': quality_df.filter(pl.col('extreme_changes') > 0).select(['token', 'extreme_changes'])
         }
+    
+    def identify_extreme_tokens(self, quality_reports: Dict) -> Dict[str, Dict]:
+        """
+        Identify tokens with extreme price movements
+        
+        Args:
+            quality_reports: Dictionary of quality reports from analyze_multiple_files
+            
+        Returns:
+            Dictionary of extreme tokens with their metrics
+        """
+        extreme_tokens = {}
+        
+        for token, report in quality_reports.items():
+            if report.get('is_extreme_token', False):
+                extreme_tokens[token] = {
+                    'token': token,
+                    'max_minute_return': report.get('max_minute_return', 0),
+                    'total_return_pct': report.get('total_return_pct', 0),
+                    'extreme_minute_count': report.get('extreme_minute_count', 0),
+                    'has_extreme_minute_jump': report.get('extreme_movements', {}).get('has_extreme_minute_jump', False),
+                    'has_extreme_total_return': report.get('extreme_movements', {}).get('has_extreme_total_return', False),
+                    'has_extreme_volatility': report.get('has_extreme_volatility', False),
+                    'has_extreme_return': report.get('has_extreme_return', False),
+                    'has_extreme_range': report.get('has_extreme_range', False),
+                    'quality_score': report.get('quality_score', 0),
+                    'total_rows': report.get('total_rows', 0)
+                }
+        
+        return extreme_tokens
+    
+    def export_extreme_tokens(self, quality_reports: Dict) -> List[str]:
+        """
+        Export extreme tokens to parquet files in data/processed/tokens_with_extremes/
+        
+        Args:
+            quality_reports: Dictionary of quality reports
+            
+        Returns:
+            List of exported token names
+        """
+        extreme_tokens = self.identify_extreme_tokens(quality_reports)
+        
+        if not extreme_tokens:
+            raise ValueError("No extreme tokens found to export.")
+        
+        token_list = list(extreme_tokens.keys())
+        
+        try:
+            exported = export_parquet_files(token_list, "Tokens with Extremes")
+            self.logger.info(f"Exported {len(exported)} extreme tokens to data/processed/tokens_with_extremes/")
+            return exported
+        except Exception as e:
+            self.logger.error(f"Error exporting extreme tokens: {e}")
+            raise
+    
+    def identify_normal_behavior_tokens(self, quality_reports: Dict) -> Dict[str, Dict]:
+        """
+        Identify tokens with normal behavior (not in dead, gaps, or extremes categories)
+        
+        Args:
+            quality_reports: Dictionary of quality reports from analyze_multiple_files
+            
+        Returns:
+            Dictionary of normal behavior tokens with their metrics
+        """
+        normal_tokens = {}
+        
+        for token, report in quality_reports.items():
+            # Exclude tokens that are:
+            # - Dead (constant price for 4+ hours)
+            # - Have extreme movements
+            # - Have significant gaps
+            is_dead = report.get('is_dead', False)
+            is_extreme = report.get('is_extreme_token', False)
+            has_significant_gaps = report.get('gaps', {}).get('total_gaps', 0) > 5  # More than 5 gaps
+            
+            # Only include tokens with normal behavior
+            if not (is_dead or is_extreme or has_significant_gaps):
+                normal_tokens[token] = {
+                    'token': token,
+                    'quality_score': report.get('quality_score', 0),
+                    'total_rows': report.get('total_rows', 0),
+                    'gaps': report.get('gaps', {}).get('total_gaps', 0),
+                    'is_dead': is_dead,
+                    'is_extreme': is_extreme,
+                    'has_significant_gaps': has_significant_gaps
+                }
+        
+        return normal_tokens
+    
+    def export_normal_behavior_tokens(self, quality_reports: Dict) -> List[str]:
+        """
+        Export normal behavior tokens to parquet files in data/processed/normal_behavior_tokens/
+        
+        Args:
+            quality_reports: Dictionary of quality reports
+            
+        Returns:
+            List of exported token names
+        """
+        normal_tokens = self.identify_normal_behavior_tokens(quality_reports)
+        
+        if not normal_tokens:
+            raise ValueError("No normal behavior tokens found to export.")
+        
+        token_list = list(normal_tokens.keys())
+        
+        try:
+            exported = export_parquet_files(token_list, "Normal Behavior Tokens")
+            self.logger.info(f"Exported {len(exported)} normal behavior tokens to data/processed/normal_behavior_tokens/")
+            return exported
+        except Exception as e:
+            self.logger.error(f"Error exporting normal behavior tokens: {e}")
+            raise
     
     def recommend_tokens_for_analysis(self, quality_df: pl.DataFrame, 
                                     min_hours: float = 1.0,
@@ -474,7 +713,11 @@ class DataQualityAnalyzer:
                     'has_extreme_jump': report['has_extreme_jump'],
                     'has_extreme_volatility': report['has_extreme_volatility'],
                     'has_extreme_return': report['has_extreme_return'],
-                    'has_extreme_range': report['has_extreme_range']
+                    'has_extreme_range': report['has_extreme_range'],
+                    'is_extreme_token': report.get('is_extreme_token', False),
+                    'max_minute_return': report.get('max_minute_return', 0),
+                    'total_return_pct': report.get('total_return_pct', 0),
+                    'extreme_minute_count': report.get('extreme_minute_count', 0)
                 }
                 for report in quality_reports.values()
             ])
@@ -488,13 +731,15 @@ class DataQualityAnalyzer:
                 st.metric("Average Quality Score", f"{quality_df['quality_score'].mean():.1f}")
             
             with col2:
-                # Gap statistics
+                # Missing data statistics
                 tokens_with_gaps = sum(1 for report in quality_reports.values() 
                                      if report['gaps']['total_gaps'] > 0)
-                max_gap_all = max((report['gaps']['max_gap'] 
-                                 for report in quality_reports.values()), default=0)
+                tokens_with_missing_data = sum(1 for report in quality_reports.values() 
+                                             if report['gaps']['total_gaps'] > 0 or 
+                                             report['duplicate_pct'] > 0 or
+                                             report['total_rows'] != report['unique_dates'])
+                st.metric("Tokens with Missing Data", tokens_with_missing_data)
                 st.metric("Tokens with Gaps", tokens_with_gaps)
-                st.metric("Maximum Gap (minutes)", f"{max_gap_all:.1f}")
             
             with col3:
                 # Price anomaly statistics
@@ -506,8 +751,10 @@ class DataQualityAnalyzer:
                 st.metric("Total Negative Prices", total_negative)
             
             with col4:
-                tokens_with_issues = sum(1 for report in quality_reports.values() if report['has_extreme_jump'])
-                st.metric("Tokens with Issues", tokens_with_issues)
+                tokens_with_extremes = sum(1 for report in quality_reports.values() if report.get('is_extreme_token', False))
+                dead_tokens_count = sum(1 for report in quality_reports.values() if report.get('is_dead', False))
+                st.metric("Tokens with Extremes", tokens_with_extremes)
+                st.metric("Dead Tokens", dead_tokens_count)
             
             # Quality score distribution
             st.subheader("Quality Score Distribution")
@@ -521,10 +768,23 @@ class DataQualityAnalyzer:
             
             # Gap analysis
             st.subheader("Gap Analysis")
+            
+            # Calculate gap statistics from tokens that have gaps
+            tokens_with_gaps_data = [report for report in quality_reports.values() if report['gaps']['total_gaps'] > 0]
+            if tokens_with_gaps_data:
+                all_gap_sizes = []
+                for report in tokens_with_gaps_data:
+                    all_gap_sizes.extend([gap['size_minutes'] for gap in report['gaps']['gap_details']])
+                avg_gap_size = sum(all_gap_sizes) / len(all_gap_sizes) if all_gap_sizes else 0
+                max_gap_all = max(all_gap_sizes) if all_gap_sizes else 0
+            else:
+                avg_gap_size = 0
+                max_gap_all = 0
+            
             gap_stats = {
                 'tokens_with_gaps': tokens_with_gaps,
                 'max_gap_all': max_gap_all,
-                'avg_gap_size': quality_df['avg_gap'].mean(),
+                'avg_gap_size': avg_gap_size,
                 'total_gaps': quality_df['total_gaps'].sum()
             }
             
@@ -577,55 +837,57 @@ class DataQualityAnalyzer:
             with col3:
                 st.metric("Low Quality Tokens (<60)", len(low_quality))
             
-            # Display high quality tokens
-            if high_quality:
-                st.subheader("High Quality Tokens (Score ≥ 80)")
-                # Create a table with key metrics
-                table_data = []
-                for token, report in high_quality.items():
-                    table_data.append({
+            # Normal behavior tokens section
+            normal_tokens = self.identify_normal_behavior_tokens(quality_reports)
+            if normal_tokens:
+                st.subheader("Normal Behavior Tokens")
+                st.write(f"Found {len(normal_tokens)} tokens with normal behavior (not dead, not extreme, minimal gaps)")
+                
+                # Create a table with normal token metrics
+                normal_table_data = []
+                for token, metrics in normal_tokens.items():
+                    normal_table_data.append({
                         'Token': token,
-                        'Quality Score': f"{report['quality_score']:.1f}",
-                        'Total Rows': report['total_rows'],
-                        'Gaps': report['gaps']['total_gaps'],
-                        'Zero Prices': report['price_anomalies']['zero_prices'],
-                        'Negative Prices': report['price_anomalies']['negative_prices']
+                        'Quality Score': f"{metrics['quality_score']:.1f}",
+                        'Total Rows': metrics['total_rows'],
+                        'Gaps': metrics['gaps']
                     })
-                table_df = pl.DataFrame(table_data)
-                # Add pagination
-                items_per_page = 10
-                total_pages = (len(table_df) + items_per_page - 1) // items_per_page
-                page = st.selectbox("Page", range(1, total_pages + 1), index=0)
-                start_idx = (page - 1) * items_per_page
-                end_idx = min(start_idx + items_per_page, len(table_df))
-                st.dataframe(
-                    table_df.slice(start_idx, end_idx - start_idx),
-                    height=400,
-                    use_container_width=True
-                )
-                st.write(f"Showing {start_idx + 1}-{end_idx} of {len(table_df)} tokens")
-                # Add download button for high quality tokens
-                if st.button("Download High Quality Tokens List", key="download_high_quality_csv_inline"):
-                    high_quality_tokens = list(high_quality.keys())
-                    st.download_button(
-                        label="Download as CSV",
-                        data="\n".join(high_quality_tokens),
-                        file_name="high_quality_tokens.csv",
-                        mime="text/csv",
-                        key="download_high_quality_csv_file_inline"
+                
+                if normal_table_data:
+                    normal_df = pl.DataFrame(normal_table_data)
+                    # Add pagination for normal tokens
+                    items_per_page = 10
+                    total_pages = (len(normal_df) + items_per_page - 1) // items_per_page
+                    page = st.selectbox("Normal Tokens Page", range(1, total_pages + 1), index=0, key="normal_tokens_page")
+                    start_idx = (page - 1) * items_per_page
+                    end_idx = min(start_idx + items_per_page, len(normal_df))
+                    st.dataframe(
+                        normal_df.slice(start_idx, end_idx - start_idx),
+                        height=400,
+                        use_container_width=True
                     )
-                # Add export button for high quality token parquet files directly below the table
-                if st.button("Export High Quality Token Parquet Files to processed/", key="export_high_quality_parquet_inline"):
-                    try:
-                        export_parquet_files(list(high_quality.keys()), "High Quality Tokens")
-                        st.success('Exported high quality token parquet files!')
-                    except Exception as e:
-                        st.error(f'Export failed: {e}')
+                    st.write(f"Showing {start_idx + 1}-{end_idx} of {len(normal_df)} normal behavior tokens")
+                    
+                    # Add download button for normal tokens list
+                    if st.button("Download Normal Behavior Tokens List", key="download_normal_tokens_csv"):
+                        normal_tokens_list = list(normal_tokens.keys())
+                        st.download_button(
+                            label="Download as CSV",
+                            data="\n".join(normal_tokens_list),
+                            file_name="normal_behavior_tokens.csv",
+                            mime="text/csv",
+                            key="download_normal_tokens_csv_file"
+                        )
+                    
+                    # Add export button for normal token parquet files
+                    if st.button("Export Normal Behavior Token Parquet Files to processed/", key="export_normal_behavior_parquet_dq"):
+                        try:
+                            exported = self.export_normal_behavior_tokens(quality_reports)
+                            st.success(f'Exported {len(exported)} normal behavior token parquet files to data/processed/normal_behavior_tokens/')
+                        except Exception as e:
+                            st.error(f'Export failed: {e}')
             
-            # High-quality tokens
-            st.subheader("High Quality Tokens")
-            high_quality_tokens = quality_df.filter(pl.col('quality_score') > 80)
-            st.dataframe(high_quality_tokens.select(['token', 'quality_score']))
+
             
         except Exception as e:
             self.logger.error(f"Error displaying quality summary: {e}")
