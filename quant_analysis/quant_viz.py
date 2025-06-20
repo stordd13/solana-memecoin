@@ -123,7 +123,7 @@ class QuantVisualizations:
         
         for df, name in zip(dfs, names):
             # Use log returns for all risk metrics
-            returns = pl.Series(np.log(df['price'] / df['price'].shift(1)).dropna()).to_numpy()
+            returns = np.log(df['price'] / df['price'].shift(1)).drop_nulls().to_numpy()
             
             # Calculate metrics
             total_return = (df['price'].to_numpy()[-1] / df['price'].to_numpy()[0] - 1) * 100
@@ -217,7 +217,7 @@ class QuantVisualizations:
             if len(positive_returns) > 0 and len(negative_returns) > 0:
                 avg_gain = positive_returns.mean() * 100
                 avg_loss = abs(negative_returns.mean()) * 100
-                win_rate = len(positive_returns) / len(rolling_returns.dropna()) * 100
+                win_rate = len(positive_returns) / len(rolling_returns.drop_nulls()) * 100
                 
                 # Risk/Reward ratio
                 risk_reward = avg_gain / avg_loss if avg_loss > 0 else 0
@@ -426,7 +426,7 @@ class QuantVisualizations:
             start_idx = i * period_size
             end_idx = (i + 1) * period_size if i < n_periods - 1 else len(df)
             
-            period_returns = df['price'].to_numpy()[start_idx:end_idx].pct_change().dropna() * 100
+            period_returns = pl.Series(df['price'].to_numpy()[start_idx:end_idx]).pct_change().drop_nulls().to_numpy() * 100
             
             row = i // 3 + 1
             col = i % 3 + 1
@@ -717,9 +717,13 @@ class QuantVisualizations:
         text_matrix = np.round(z_matrix, 2)
         text_conf = np.round(z_conf, 2)
 
-        fig = make_subplots(rows=1, cols=2,
-                            subplot_titles=('Average Returns (%)', 
-                                          'Statistical Confidence (95% CI)'))
+        fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=('Average Returns (%)', 'Statistical Confidence (95% CI)'),
+            horizontal_spacing=0.15,  # Increase spacing between subplots
+            column_widths=[0.45, 0.45]  # Make subplots slightly smaller to accommodate colorbars
+        )
+        
         # Main heatmap
         fig.add_trace(
             go.Heatmap(
@@ -730,11 +734,19 @@ class QuantVisualizations:
                 zmid=0,
                 text=text_matrix,
                 texttemplate='%{text}%',
-                colorbar=dict(title="Avg Return %", x=0.45)
+                textfont={"size": 10},
+                colorbar=dict(
+                    title="Avg Return %", 
+                    x=0.42,  # Move colorbar closer to first plot
+                    len=0.8,  # Make colorbar shorter
+                    thickness=15
+                ),
+                hovertemplate='Entry: %{y}<br>Exit: %{x}<br>Avg Return: %{z:.2f}%<extra></extra>'
             ),
             row=1, col=1
         )
-        # Confidence interval heatmap
+        
+        # Confidence interval heatmap  
         fig.add_trace(
             go.Heatmap(
                 z=z_conf,
@@ -743,13 +755,29 @@ class QuantVisualizations:
                 colorscale='Viridis',
                 text=text_conf,
                 texttemplate='±%{text}%',
-                colorbar=dict(title="95% CI", x=1.02)
+                textfont={"size": 10},
+                colorbar=dict(
+                    title="95% CI", 
+                    x=1.05,  # Move colorbar further right
+                    len=0.8,  # Make colorbar shorter
+                    thickness=15
+                ),
+                hovertemplate='Entry: %{y}<br>Exit: %{x}<br>95% CI: ±%{z:.2f}%<extra></extra>'
             ),
             row=1, col=2
         )
+        
+        # Update axis labels
+        fig.update_xaxes(title_text="Exit Window", row=1, col=1)
+        fig.update_xaxes(title_text="Exit Window", row=1, col=2)
+        fig.update_yaxes(title_text="Entry Window", row=1, col=1)
+        fig.update_yaxes(title_text="Entry Window", row=1, col=2)
+        
         fig.update_layout(
             title=f"Multi-Token Entry/Exit Analysis (n={n_tokens} tokens)",
-            height=600
+            height=600,
+            width=1200,  # Increase total width to accommodate better spacing
+            showlegend=False
         )
         return fig
 
@@ -834,6 +862,120 @@ class QuantVisualizations:
                 i += 1
         return returns
 
+    def plot_entry_exit_moment_matrix_optimized(self, dfs: list, max_entry_minute: int = 240, max_exit_minute: int = 240) -> go.Figure:
+        """
+        FULLY OPTIMIZED: Plot entry/exit moment matrix using pure Polars cross joins
+        Extremely fast vectorized operations - no nested loops at all
+        """
+        all_results = []
+        
+        for df_idx, df in enumerate(dfs):
+            if not isinstance(df, pl.DataFrame):
+                continue
+                
+            # Ensure we have enough data and limit to max_exit_minute
+            n_rows = min(len(df), max_exit_minute)
+            if n_rows < 2:
+                continue
+                
+            # Create indexed price data
+            price_data = df.head(n_rows).with_row_index('minute').select(['minute', 'price'])
+            
+            # Create entry and exit minute ranges
+            entry_minutes = pl.DataFrame({'entry_minute': range(min(max_entry_minute, n_rows - 1))})
+            exit_minutes = pl.DataFrame({'exit_minute': range(1, n_rows)})  # Start from 1 to ensure exit > entry
+            
+            # Cross join to get all combinations
+            combinations = entry_minutes.join(exit_minutes, how='cross')
+            
+            # Filter to only valid combinations (exit > entry)
+            valid_combinations = combinations.filter(pl.col('exit_minute') > pl.col('entry_minute'))
+            
+            if valid_combinations.is_empty():
+                continue
+            
+            # Join with price data to get entry prices
+            with_entry_prices = valid_combinations.join(
+                price_data.rename({'minute': 'entry_minute', 'price': 'entry_price'}),
+                on='entry_minute',
+                how='left'
+            )
+            
+            # Join with price data to get exit prices
+            with_both_prices = with_entry_prices.join(
+                price_data.rename({'minute': 'exit_minute', 'price': 'exit_price'}),
+                on='exit_minute',
+                how='left'
+            )
+            
+            # Calculate returns using pure Polars vectorized operations
+            returns_df = with_both_prices.filter(
+                (pl.col('entry_price').is_not_null()) & 
+                (pl.col('exit_price').is_not_null()) &
+                (pl.col('entry_price') > 0)
+            ).with_columns([
+                ((pl.col('exit_price') / pl.col('entry_price') - 1) * 100).alias('return_pct'),
+                pl.lit(df_idx).alias('token_id')
+            ])
+            
+            all_results.append(returns_df)
+        
+        if not all_results:
+            fig = go.Figure()
+            fig.add_annotation(text="No valid data for moment matrix", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        # Combine all results using Polars concat
+        combined_results = pl.concat(all_results)
+        
+        # Aggregate by entry/exit minute pairs using Polars group_by
+        aggregated = combined_results.group_by(['entry_minute', 'exit_minute']).agg([
+            pl.col('return_pct').mean().alias('avg_return'),
+            pl.col('return_pct').count().alias('trade_count'),
+            pl.col('return_pct').std().alias('return_std')
+        ]).sort(['entry_minute', 'exit_minute'])
+        
+        # Create matrix for heatmap
+        entry_range = range(max_entry_minute)
+        exit_range = range(max_exit_minute)
+        heatmap = np.full((max_entry_minute, max_exit_minute), np.nan)
+        
+        # Fill matrix with aggregated data - this is the only remaining loop
+        for row in aggregated.iter_rows():
+            entry_idx, exit_idx, avg_return, trade_count, return_std = row
+            if 0 <= entry_idx < max_entry_minute and 0 <= exit_idx < max_exit_minute:
+                heatmap[entry_idx, exit_idx] = avg_return
+        
+        # Mask lower triangle (entry >= exit) - this ensures we only show valid trades
+        mask = np.tri(max_entry_minute, max_exit_minute, k=0, dtype=bool)
+        heatmap = np.where(mask, np.nan, heatmap)
+        
+        # Create enhanced heatmap with better formatting
+        fig = go.Figure(data=go.Heatmap(
+            z=heatmap,
+            x=list(exit_range),
+            y=list(entry_range),
+            colorscale='RdBu',
+            zmid=0,
+                         colorbar=dict(title="Avg Return %"),
+            hoverongaps=False,
+            hovertemplate='Entry: %{y} min<br>Exit: %{x} min<br>Avg Return: %{z:.2f}%<extra></extra>',
+            showscale=True
+        ))
+        
+        fig.update_layout(
+            title=f"Entry/Exit Moment Matrix (Polars Optimized)<br>Avg Return % by Entry/Exit Minute - {len(dfs)} Tokens",
+            xaxis_title="Exit Minute",
+            yaxis_title="Entry Minute",
+            height=700,
+            width=1000,
+            xaxis=dict(tickmode='linear', dtick=20),
+            yaxis=dict(tickmode='linear', dtick=20)
+        )
+        
+        return fig
+
     def plot_entry_exit_moment_matrix(self, dfs: list, max_entry_minute: int = 240, max_exit_minute: int = 240) -> go.Figure:
         """
         Plot a heatmap showing the average return for each (entry minute, exit minute) pair across all tokens.
@@ -887,7 +1029,10 @@ class QuantVisualizations:
             colorscale='RdBu',
             zmid=0,
             colorbar=dict(title="Avg Return %"),
-            hoverongaps=False
+            hoverongaps=False,
+            text=np.round(heatmap, 2),
+            texttemplate='%{text}%',
+            textfont={"size": 8}
         ))
         fig.update_layout(
             title="Entry/Exit Moment Matrix: Avg Return by Entry and Exit Minute",
@@ -896,4 +1041,733 @@ class QuantVisualizations:
             height=700,
             width=1000
         )
+        return fig
+
+    def plot_lifecycle_summary_charts(self, lifecycle_df: pl.DataFrame, analysis_metrics: List[str]) -> go.Figure:
+        """
+        Create comprehensive summary charts for 24-hour lifecycle analysis
+        Shows multiple metrics across lifecycle segments
+        """
+        # Aggregate data by segment
+        numeric_cols = [col for col in lifecycle_df.columns if col.endswith('_Pct') or col in ['Trend_Strength', 'Volume_Proxy']]
+        
+        if not numeric_cols:
+            # Create empty figure if no numeric data
+            fig = go.Figure()
+            fig.add_annotation(text="No numeric data available for visualization", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        summary_stats = lifecycle_df.group_by('Lifecycle_Segment').agg([
+            pl.col(col).mean().alias(f'Avg_{col}') for col in numeric_cols if col in lifecycle_df.columns
+        ] + [
+            pl.col('Token').count().alias('Token_Count'),
+            pl.col('Hours_Into_Lifecycle').first().alias('Hours_Range')
+        ]).sort('Lifecycle_Segment')
+        
+        # Count actual available metrics in the data
+        available_metrics = []
+        if "Returns" in analysis_metrics and 'Avg_Cumulative_Return_Pct' in summary_stats.columns:
+            available_metrics.append("Returns")
+        if "Volatility" in analysis_metrics and 'Avg_Volatility_Pct' in summary_stats.columns:
+            available_metrics.append("Volatility")
+        if "Price Momentum" in analysis_metrics and 'Avg_Win_Rate_Pct' in summary_stats.columns:
+            available_metrics.append("Price Momentum")
+        if "Volume Proxy" in analysis_metrics and 'Avg_Volume_Proxy' in summary_stats.columns:
+            available_metrics.append("Volume Proxy")
+        if "Trend Strength" in analysis_metrics and 'Avg_Trend_Strength' in summary_stats.columns:
+            available_metrics.append("Trend Strength")
+        
+        n_metrics = len(available_metrics)
+        if n_metrics == 0:
+            fig = go.Figure()
+            fig.add_annotation(text="No metrics available for visualization", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        # Calculate grid dimensions
+        n_cols = 2 if n_metrics > 1 else 1
+        n_rows = (n_metrics + 1) // 2 if n_metrics > 1 else 1
+        
+        subplot_titles = []
+        for metric in available_metrics:
+            if metric == "Returns":
+                subplot_titles.append("Average Returns by Lifecycle Segment")
+            elif metric == "Volatility":
+                subplot_titles.append("Average Volatility by Lifecycle Segment")
+            elif metric == "Price Momentum":
+                subplot_titles.append("Win Rate by Lifecycle Segment")
+            elif metric == "Volume Proxy":
+                subplot_titles.append("Volume Proxy by Lifecycle Segment")
+            elif metric == "Trend Strength":
+                subplot_titles.append("Trend Strength by Lifecycle Segment")
+        
+        fig = make_subplots(
+            rows=n_rows, cols=n_cols,
+            subplot_titles=subplot_titles,
+            vertical_spacing=0.15,
+            horizontal_spacing=0.1
+        )
+        
+        segments = summary_stats['Lifecycle_Segment'].to_list()
+        hours_ranges = summary_stats['Hours_Range'].to_list()
+        
+        # Plot each available metric
+        for plot_idx, metric in enumerate(available_metrics, 1):
+            row, col = ((plot_idx - 1) // n_cols) + 1, ((plot_idx - 1) % n_cols) + 1
+            
+            if metric == "Returns":
+                returns = summary_stats['Avg_Cumulative_Return_Pct'].to_list()
+                fig.add_trace(
+                    go.Bar(
+                        x=hours_ranges,
+                        y=returns,
+                        name="Avg Returns",
+                        marker_color=['green' if r > 0 else 'red' for r in returns],
+                        text=[f"{r:.2f}%" for r in returns],
+                        textposition='outside'
+                    ),
+                    row=row, col=col
+                )
+                fig.update_yaxes(title_text="Return %", row=row, col=col)
+                fig.update_xaxes(title_text="Hours into Lifecycle", row=row, col=col)
+                
+            elif metric == "Volatility":
+                volatility = summary_stats['Avg_Volatility_Pct'].to_list()
+                fig.add_trace(
+                    go.Scatter(
+                        x=hours_ranges,
+                        y=volatility,
+                        mode='lines+markers',
+                        name="Avg Volatility",
+                        line=dict(color='orange', width=3),
+                        marker=dict(size=8),
+                        text=[f"{v:.2f}%" for v in volatility],
+                        textposition='top center'
+                    ),
+                    row=row, col=col
+                )
+                fig.update_yaxes(title_text="Volatility %", row=row, col=col)
+                fig.update_xaxes(title_text="Hours into Lifecycle", row=row, col=col)
+                
+            elif metric == "Price Momentum":
+                win_rates = summary_stats['Avg_Win_Rate_Pct'].to_list()
+                fig.add_trace(
+                    go.Bar(
+                        x=hours_ranges,
+                        y=win_rates,
+                        name="Win Rate",
+                        marker_color='blue',
+                        text=[f"{w:.1f}%" for w in win_rates],
+                        textposition='outside'
+                    ),
+                    row=row, col=col
+                )
+                fig.update_yaxes(title_text="Win Rate %", row=row, col=col)
+                fig.update_xaxes(title_text="Hours into Lifecycle", row=row, col=col)
+                
+            elif metric == "Volume Proxy":
+                volume_proxy = summary_stats['Avg_Volume_Proxy'].to_list()
+                fig.add_trace(
+                    go.Scatter(
+                        x=hours_ranges,
+                        y=volume_proxy,
+                        mode='lines+markers',
+                        name="Volume Proxy",
+                        line=dict(color='purple', width=3),
+                        marker=dict(size=8),
+                        text=[f"{v:.2f}" for v in volume_proxy],
+                        textposition='top center'
+                    ),
+                    row=row, col=col
+                )
+                fig.update_yaxes(title_text="Volume Proxy", row=row, col=col)
+                fig.update_xaxes(title_text="Hours into Lifecycle", row=row, col=col)
+                
+            elif metric == "Trend Strength":
+                trend_strength = summary_stats['Avg_Trend_Strength'].to_list()
+                fig.add_trace(
+                    go.Scatter(
+                        x=hours_ranges,
+                        y=trend_strength,
+                        mode='lines+markers',
+                        name="Trend Strength",
+                        line=dict(color='darkgreen', width=3),
+                        marker=dict(size=8),
+                        text=[f"{t:.3f}" for t in trend_strength],
+                        textposition='top center'
+                    ),
+                    row=row, col=col
+                )
+                fig.update_yaxes(title_text="Trend Strength", row=row, col=col)
+                fig.update_xaxes(title_text="Hours into Lifecycle", row=row, col=col)
+        
+        fig.update_layout(
+            height=400 * n_rows,
+            width=1200,
+            title_text="24-Hour Lifecycle Analysis - Summary Charts",
+            showlegend=False
+        )
+        
+        return fig
+    
+    def plot_lifecycle_aggregated_analysis(self, lifecycle_df: pl.DataFrame, metric_col: str, segment_col: str = 'Lifecycle_Segment') -> go.Figure:
+        """
+        Create aggregated analysis plots instead of unreadable heatmaps for large token counts
+        Shows distribution statistics, percentiles, and patterns across lifecycle segments
+        """
+        if metric_col not in lifecycle_df.columns:
+            fig = go.Figure()
+            fig.add_annotation(text=f"Metric '{metric_col}' not found in data", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        # Calculate statistics for each segment
+        segment_stats = lifecycle_df.group_by(segment_col).agg([
+            pl.col(metric_col).mean().alias('Mean'),
+            pl.col(metric_col).median().alias('Median'),
+            pl.col(metric_col).std().alias('Std_Dev'),
+            pl.col(metric_col).quantile(0.25).alias('Q25'),
+            pl.col(metric_col).quantile(0.75).alias('Q75'),
+            pl.col(metric_col).quantile(0.1).alias('P10'),
+            pl.col(metric_col).quantile(0.9).alias('P90'),
+            pl.col(metric_col).min().alias('Min'),
+            pl.col(metric_col).max().alias('Max'),
+            pl.col(metric_col).count().alias('Count')
+        ]).sort(segment_col)
+        
+        segments = segment_stats[segment_col].to_list()
+        
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                f'{metric_col} - Central Tendency',
+                f'{metric_col} - Distribution Spread', 
+                f'{metric_col} - Percentile Bands',
+                f'{metric_col} - Extreme Values'
+            ),
+            vertical_spacing=0.12,
+            horizontal_spacing=0.1
+        )
+        
+        # Plot 1: Mean and Median
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['Mean'].to_list(),
+                mode='lines+markers', name='Mean',
+                line=dict(color='blue', width=3), marker=dict(size=8)
+            ), row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['Median'].to_list(),
+                mode='lines+markers', name='Median',
+                line=dict(color='red', width=2, dash='dash'), marker=dict(size=6)
+            ), row=1, col=1
+        )
+        
+        # Plot 2: Standard deviation and IQR
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['Std_Dev'].to_list(),
+                mode='lines+markers', name='Std Dev',
+                line=dict(color='orange', width=3), marker=dict(size=8)
+            ), row=1, col=2
+        )
+        iqr = (segment_stats['Q75'] - segment_stats['Q25']).to_list()
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=iqr,
+                mode='lines+markers', name='IQR (Q75-Q25)',
+                line=dict(color='purple', width=2, dash='dot'), marker=dict(size=6)
+            ), row=1, col=2
+        )
+        
+        # Plot 3: Percentile bands (10th-90th percentile)
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['P90'].to_list(),
+                mode='lines', name='90th Percentile',
+                line=dict(color='lightgreen', width=1),
+                showlegend=False
+            ), row=2, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['P10'].to_list(),
+                mode='lines', name='10th Percentile',
+                line=dict(color='lightgreen', width=1),
+                fill='tonexty', fillcolor='rgba(144,238,144,0.3)',
+                showlegend=False
+            ), row=2, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['Median'].to_list(),
+                mode='lines+markers', name='Median',
+                line=dict(color='green', width=2), marker=dict(size=6)
+            ), row=2, col=1
+        )
+        
+        # Plot 4: Min/Max range
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['Max'].to_list(),
+                mode='markers', name='Max',
+                marker=dict(color='red', size=10, symbol='triangle-up')
+            ), row=2, col=2
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['Min'].to_list(),
+                mode='markers', name='Min',
+                marker=dict(color='blue', size=10, symbol='triangle-down')
+            ), row=2, col=2
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=segments, y=segment_stats['Mean'].to_list(),
+                mode='lines', name='Mean',
+                line=dict(color='black', width=2, dash='dash')
+            ), row=2, col=2
+        )
+        
+        # Update layout
+        fig.update_layout(
+            height=800,
+            width=1200,
+            title_text=f"Lifecycle Analysis: {metric_col} Distribution Statistics",
+            showlegend=True,
+            legend=dict(x=1.05, y=1)
+        )
+        
+        # Update axes
+        fig.update_xaxes(title_text="Lifecycle Segment")
+        fig.update_yaxes(title_text=metric_col)
+        
+        return fig
+    
+    def plot_lifecycle_token_ranking(self, lifecycle_df: pl.DataFrame, metric_col: str, segment_col: str = 'Lifecycle_Segment', top_n: int = 20) -> go.Figure:
+        """
+        Show top/bottom performing tokens for a specific metric across lifecycle segments
+        Much more useful than an unreadable 1000-token heatmap
+        """
+        if metric_col not in lifecycle_df.columns:
+            fig = go.Figure()
+            fig.add_annotation(text=f"Metric '{metric_col}' not found in data", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        # Calculate average performance per token across all segments
+        token_performance = lifecycle_df.group_by('Token').agg([
+            pl.col(metric_col).mean().alias('Avg_Performance'),
+            pl.col(metric_col).std().alias('Volatility'),
+            pl.col(metric_col).count().alias('Segments_Count')
+        ]).sort('Avg_Performance', descending=True)
+        
+        # Get top and bottom performers
+        top_performers = token_performance.head(top_n)
+        bottom_performers = token_performance.tail(top_n)
+        
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                f'Top {top_n} Performers - {metric_col}',
+                f'Bottom {top_n} Performers - {metric_col}',
+                f'Top {top_n} - Performance vs Volatility',
+                f'Performance Distribution (All Tokens)'
+            ),
+            specs=[[{"type": "bar"}, {"type": "bar"}],
+                   [{"type": "scatter"}, {"type": "histogram"}]],
+            vertical_spacing=0.12,
+            horizontal_spacing=0.1
+        )
+        
+        # Top performers bar chart
+        fig.add_trace(
+            go.Bar(
+                x=top_performers['Token'].to_list(),
+                y=top_performers['Avg_Performance'].to_list(),
+                name='Top Performers',
+                marker_color='green',
+                text=[f"{v:.2f}" for v in top_performers['Avg_Performance'].to_list()],
+                textposition='outside'
+            ), row=1, col=1
+        )
+        
+        # Bottom performers bar chart
+        fig.add_trace(
+            go.Bar(
+                x=bottom_performers['Token'].to_list(),
+                y=bottom_performers['Avg_Performance'].to_list(),
+                name='Bottom Performers',
+                marker_color='red',
+                text=[f"{v:.2f}" for v in bottom_performers['Avg_Performance'].to_list()],
+                textposition='outside'
+            ), row=1, col=2
+        )
+        
+        # Performance vs Volatility scatter
+        fig.add_trace(
+            go.Scatter(
+                x=top_performers['Volatility'].to_list(),
+                y=top_performers['Avg_Performance'].to_list(),
+                mode='markers+text',
+                text=top_performers['Token'].to_list(),
+                textposition='top center',
+                name='Top Performers',
+                marker=dict(size=12, color='green', opacity=0.7),
+                hovertemplate='<b>%{text}</b><br>Performance: %{y:.2f}<br>Volatility: %{x:.2f}<extra></extra>'
+            ), row=2, col=1
+        )
+        
+        # Distribution histogram
+        fig.add_trace(
+            go.Histogram(
+                x=token_performance['Avg_Performance'].to_list(),
+                nbinsx=30,
+                name='Distribution',
+                marker_color='blue',
+                opacity=0.7
+            ), row=2, col=2
+        )
+        
+        # Update layout
+        fig.update_layout(
+            height=900,
+            width=1400,
+            title_text=f"Token Performance Ranking: {metric_col}",
+            showlegend=False
+        )
+        
+        # Rotate x-axis labels for token names
+        fig.update_xaxes(tickangle=45, row=1, col=1)
+        fig.update_xaxes(tickangle=45, row=1, col=2)
+        fig.update_xaxes(title_text="Volatility", row=2, col=1)
+        fig.update_xaxes(title_text="Average Performance", row=2, col=2)
+        fig.update_yaxes(title_text=metric_col, row=1, col=1)
+        fig.update_yaxes(title_text=metric_col, row=1, col=2)
+        fig.update_yaxes(title_text="Average Performance", row=2, col=1)
+        fig.update_yaxes(title_text="Count", row=2, col=2)
+        
+        return fig
+
+    def plot_lifecycle_heatmap(self, lifecycle_df: pl.DataFrame, metric_col: str, segment_col: str = 'Lifecycle_Segment') -> go.Figure:
+        """
+        DEPRECATED: This function creates unreadable heatmaps with many tokens.
+        Use plot_lifecycle_aggregated_analysis() or plot_lifecycle_token_ranking() instead.
+        
+        Kept for backward compatibility but shows a warning message.
+        """
+        n_tokens = lifecycle_df['Token'].n_unique()
+        
+        if n_tokens > 50:
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"⚠️ Heatmap with {n_tokens} tokens is not readable!<br><br>"
+                     f"Use 'Aggregated Analysis' or 'Token Ranking' visualizations instead.<br>"
+                     f"These provide much better insights for large datasets.",
+                xref="paper", yref="paper", 
+                x=0.5, y=0.5, 
+                showarrow=False,
+                font=dict(size=16, color="red"),
+                bgcolor="lightyellow",
+                bordercolor="orange",
+                borderwidth=2
+            )
+            fig.update_layout(
+                title=f"Heatmap Not Suitable for {n_tokens} Tokens",
+                height=400,
+                width=800
+            )
+            return fig
+        
+        # Original heatmap logic for small datasets (≤50 tokens)
+        if metric_col not in lifecycle_df.columns:
+            fig = go.Figure()
+            fig.add_annotation(text=f"Metric '{metric_col}' not found in data", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        # Pivot data for heatmap
+        pivot_data = lifecycle_df.pivot(
+            index='Token', 
+            columns=segment_col, 
+            values=metric_col
+        ).fill_null(0)
+        
+        # Get data for heatmap
+        tokens = pivot_data.get_column('Token').to_list() if 'Token' in pivot_data.columns else pivot_data.select(pl.col('*').exclude(segment_col)).columns
+        segments = [col for col in pivot_data.columns if col != 'Token']
+        
+        # Create matrix
+        z_data = []
+        for token in tokens:
+            if token in pivot_data.get_column('Token').to_list():
+                row_data = pivot_data.filter(pl.col('Token') == token).select(segments).to_numpy()[0]
+            else:
+                row_data = [0] * len(segments)
+            z_data.append(row_data)
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=z_data,
+            x=segments,
+            y=tokens,
+            colorscale='RdBu',
+            zmid=0,
+            colorbar=dict(title=metric_col),
+            hoverongaps=False,
+            text=np.round(np.array(z_data), 2),
+            texttemplate='%{text}',
+            textfont={"size": 8}
+        ))
+        
+        fig.update_layout(
+            title=f"Lifecycle Heatmap: {metric_col} (Small Dataset)",
+            xaxis_title="Lifecycle Segment",
+            yaxis_title="Token",
+            height=max(400, len(tokens) * 20),
+            width=800
+        )
+        
+        return fig
+
+    def plot_lifecycle_comparison(self, lifecycle_df: pl.DataFrame, comparison_type: str = "early_vs_late") -> go.Figure:
+        """
+        Create comparison plots for different lifecycle phases
+        """
+        if comparison_type == "early_vs_late":
+            # Compare first 25% vs last 25% of segments
+            segments = sorted(lifecycle_df['Lifecycle_Segment'].unique().to_list())
+            n_segments = len(segments)
+            
+            early_segments = segments[:max(1, n_segments // 4)]
+            late_segments = segments[-max(1, n_segments // 4):]
+            
+            early_data = lifecycle_df.filter(pl.col('Lifecycle_Segment').is_in(early_segments))
+            late_data = lifecycle_df.filter(pl.col('Lifecycle_Segment').is_in(late_segments))
+            
+            # Calculate averages for comparison
+            metrics_to_compare = [col for col in lifecycle_df.columns if col.endswith('_Pct')]
+            
+            comparison_data = []
+            for metric in metrics_to_compare:
+                if metric in early_data.columns and metric in late_data.columns:
+                    early_avg = early_data[metric].mean()
+                    late_avg = late_data[metric].mean()
+                    
+                    comparison_data.append({
+                        'Metric': metric.replace('_Pct', '').replace('_', ' ').title(),
+                        'Early Phase': early_avg,
+                        'Late Phase': late_avg,
+                        'Difference': late_avg - early_avg
+                    })
+            
+            if not comparison_data:
+                fig = go.Figure()
+                fig.add_annotation(text="No comparison data available", 
+                                 xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+                return fig
+            
+            comparison_df = pl.DataFrame(comparison_data)
+            
+            fig = go.Figure()
+            
+            # Add bars for early and late phases
+            fig.add_trace(go.Bar(
+                name='Early Phase',
+                x=comparison_df['Metric'].to_list(),
+                y=comparison_df['Early Phase'].to_list(),
+                marker_color='lightblue'
+            ))
+            
+            fig.add_trace(go.Bar(
+                name='Late Phase',
+                x=comparison_df['Metric'].to_list(),
+                y=comparison_df['Late Phase'].to_list(),
+                marker_color='darkblue'
+            ))
+            
+            fig.update_layout(
+                title='Early vs Late Lifecycle Phase Comparison',
+                xaxis_title='Metrics',
+                yaxis_title='Average Value',
+                barmode='group',
+                height=600,
+                width=1000
+            )
+            
+            return fig
+        
+        else:
+            # Default empty figure for other comparison types
+            fig = go.Figure()
+            fig.add_annotation(text=f"Comparison type '{comparison_type}' not implemented", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+
+    def plot_multi_token_risk_metrics(self, combined_results: pl.DataFrame) -> go.Figure:
+        """
+        Create comprehensive visualizations for Multi-Token Risk Metrics Analysis
+        Shows average win rate, Sharpe ratio, and risk/reward ratio per time horizon
+        """
+        if combined_results.is_empty():
+            fig = go.Figure()
+            fig.add_annotation(text="No data available for visualization", 
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        # Calculate summary statistics by horizon
+        summary_stats = combined_results.group_by('horizon_minutes').agg([
+            pl.col('sharpe_ratio').mean().alias('Avg_Sharpe'),
+            pl.col('win_rate').mean().alias('Avg_Win_Rate'),
+            pl.col('risk_reward_ratio').mean().alias('Avg_Risk_Reward'),
+            pl.col('sharpe_ratio').std().alias('Sharpe_Std'),
+            pl.col('win_rate').std().alias('Win_Rate_Std'),
+            pl.col('risk_reward_ratio').std().alias('Risk_Reward_Std'),
+            pl.col('Token').count().alias('Token_Count')
+        ]).sort('horizon_minutes')
+        
+        horizons = summary_stats['horizon_minutes'].to_list()
+        
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                'Average Win Rate by Time Horizon',
+                'Average Sharpe Ratio by Time Horizon',
+                'Average Risk/Reward Ratio by Time Horizon',
+                'Metrics Distribution Comparison'
+            ),
+            specs=[[{"type": "scatter"}, {"type": "scatter"}],
+                   [{"type": "scatter"}, {"type": "bar"}]],
+            vertical_spacing=0.12,
+            horizontal_spacing=0.1
+        )
+        
+        # Plot 1: Win Rate with error bars
+        win_rates = summary_stats['Avg_Win_Rate'].to_list()
+        win_rate_stds = summary_stats['Win_Rate_Std'].to_list()
+        
+        fig.add_trace(
+            go.Scatter(
+                x=horizons, y=win_rates,
+                mode='lines+markers',
+                name='Avg Win Rate',
+                line=dict(color='green', width=3),
+                marker=dict(size=10),
+                error_y=dict(type='data', array=win_rate_stds, visible=True),
+                text=[f"{wr:.1f}%" for wr in win_rates],
+                textposition='top center',
+                hovertemplate='Horizon: %{x} min<br>Win Rate: %{y:.1f}%<br>Std: %{error_y.array:.1f}%<extra></extra>'
+            ), row=1, col=1
+        )
+        
+        # Plot 2: Sharpe Ratio with error bars
+        sharpe_ratios = summary_stats['Avg_Sharpe'].to_list()
+        sharpe_stds = summary_stats['Sharpe_Std'].to_list()
+        
+        fig.add_trace(
+            go.Scatter(
+                x=horizons, y=sharpe_ratios,
+                mode='lines+markers',
+                name='Avg Sharpe Ratio',
+                line=dict(color='blue', width=3),
+                marker=dict(size=10),
+                error_y=dict(type='data', array=sharpe_stds, visible=True),
+                text=[f"{sr:.2f}" for sr in sharpe_ratios],
+                textposition='top center',
+                hovertemplate='Horizon: %{x} min<br>Sharpe: %{y:.2f}<br>Std: %{error_y.array:.2f}<extra></extra>'
+            ), row=1, col=2
+        )
+        
+        # Plot 3: Risk/Reward Ratio with error bars
+        risk_rewards = summary_stats['Avg_Risk_Reward'].to_list()
+        risk_reward_stds = summary_stats['Risk_Reward_Std'].to_list()
+        
+        fig.add_trace(
+            go.Scatter(
+                x=horizons, y=risk_rewards,
+                mode='lines+markers',
+                name='Avg Risk/Reward',
+                line=dict(color='purple', width=3),
+                marker=dict(size=10),
+                error_y=dict(type='data', array=risk_reward_stds, visible=True),
+                text=[f"{rr:.2f}" for rr in risk_rewards],
+                textposition='top center',
+                hovertemplate='Horizon: %{x} min<br>Risk/Reward: %{y:.2f}<br>Std: %{error_y.array:.2f}<extra></extra>'
+            ), row=2, col=1
+        )
+        
+        # Plot 4: Comparative bar chart showing all metrics normalized
+        # Normalize metrics to 0-1 scale for comparison
+        max_win_rate = max(win_rates) if win_rates else 1
+        max_sharpe = max([abs(s) for s in sharpe_ratios]) if sharpe_ratios else 1
+        max_risk_reward = max(risk_rewards) if risk_rewards else 1
+        
+        normalized_win_rates = [wr / max_win_rate for wr in win_rates]
+        normalized_sharpe = [sr / max_sharpe for sr in sharpe_ratios]
+        normalized_risk_reward = [rr / max_risk_reward for rr in risk_rewards]
+        
+        x_pos = np.arange(len(horizons))
+        width = 0.25
+        
+        fig.add_trace(
+            go.Bar(
+                x=[f"{h}min" for h in horizons],
+                y=normalized_win_rates,
+                name='Win Rate (norm)',
+                marker_color='green',
+                opacity=0.7,
+                text=[f"{wr:.1f}%" for wr in win_rates],
+                textposition='outside'
+            ), row=2, col=2
+        )
+        
+        fig.add_trace(
+            go.Bar(
+                x=[f"{h}min" for h in horizons],
+                y=normalized_sharpe,
+                name='Sharpe (norm)',
+                marker_color='blue',
+                opacity=0.7,
+                text=[f"{sr:.2f}" for sr in sharpe_ratios],
+                textposition='outside'
+            ), row=2, col=2
+        )
+        
+        fig.add_trace(
+            go.Bar(
+                x=[f"{h}min" for h in horizons],
+                y=normalized_risk_reward,
+                name='Risk/Reward (norm)',
+                marker_color='purple',
+                opacity=0.7,
+                text=[f"{rr:.2f}" for rr in risk_rewards],
+                textposition='outside'
+            ), row=2, col=2
+        )
+        
+        # Update layout
+        fig.update_layout(
+            height=800,
+            width=1200,
+            title_text=f"Multi-Token Risk Metrics Analysis - {summary_stats['Token_Count'].sum()} Total Observations",
+            showlegend=True,
+            barmode='group'
+        )
+        
+        # Update axes
+        fig.update_xaxes(title_text="Time Horizon (minutes)", row=1, col=1)
+        fig.update_xaxes(title_text="Time Horizon (minutes)", row=1, col=2)
+        fig.update_xaxes(title_text="Time Horizon (minutes)", row=2, col=1)
+        fig.update_xaxes(title_text="Time Horizon", row=2, col=2)
+        
+        fig.update_yaxes(title_text="Win Rate (%)", row=1, col=1)
+        fig.update_yaxes(title_text="Sharpe Ratio", row=1, col=2)
+        fig.update_yaxes(title_text="Risk/Reward Ratio", row=2, col=1)
+        fig.update_yaxes(title_text="Normalized Value", row=2, col=2)
+        
         return fig
