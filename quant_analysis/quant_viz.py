@@ -1556,6 +1556,319 @@ class QuantVisualizations:
         
         return fig
     
+    def plot_multi_token_distribution_evolution(self, token_data: List[tuple], 
+                                               n_periods: int = 6) -> tuple:
+        """
+        Multi-token aggregated distribution evolution analysis
+        
+        Args:
+            token_data: List of (token_name, df) tuples
+            n_periods: Number of periods to divide each token's lifecycle
+            
+        Returns:
+            tuple: (figure, aggregated_period_stats)
+        """
+        if len(token_data) < 2:
+            raise ValueError("Need at least 2 tokens for multi-token analysis")
+        
+        # Collect all period statistics from all tokens
+        all_period_stats = []
+        token_period_data = {}
+        
+        for token_name, df in token_data:
+            try:
+                if df.height < n_periods * 10:  # Skip tokens with insufficient data
+                    continue
+                
+                # Calculate period statistics for this token
+                period_size = df.height // n_periods
+                token_stats = []
+                
+                for i in range(n_periods):
+                    start_idx = i * period_size
+                    end_idx = (i + 1) * period_size if i < n_periods - 1 else df.height
+                    
+                    period_df = df.slice(start_idx, end_idx - start_idx)
+                    period_returns_df = period_df.select([
+                        pl.col('price').pct_change().drop_nulls().alias('returns')
+                    ])
+                    period_returns = period_returns_df['returns'] * 100
+                    
+                    if period_returns.len() > 5:
+                        # Calculate statistics
+                        stats = period_returns_df.select([
+                            pl.mean('returns').alias('mean'),
+                            pl.std('returns').alias('std'),
+                            pl.median('returns').alias('median'),
+                            pl.min('returns').alias('min'),
+                            pl.max('returns').alias('max'),
+                            pl.quantile('returns', 0.25).alias('q25'),
+                            pl.quantile('returns', 0.75).alias('q75'),
+                            pl.len().alias('count')
+                        ]).row(0, named=True)
+                        
+                        # Apply percentage conversion
+                        for key in ['mean', 'std', 'median', 'min', 'max', 'q25', 'q75']:
+                            if key in stats:
+                                stats[key] = stats[key] * 100
+                        
+                        # Calculate skewness and kurtosis
+                        returns_array = period_returns.to_numpy()
+                        mean_val = stats['mean']
+                        std_val = stats['std']
+                        
+                        if std_val > 1e-10:
+                            skewness = np.mean(((returns_array - mean_val) / std_val) ** 3)
+                            kurtosis = np.mean(((returns_array - mean_val) / std_val) ** 4) - 3
+                            
+                            # Normality tests
+                            from scipy import stats as scipy_stats
+                            n = len(returns_array)
+                            jb_stat = (n / 6) * (skewness**2 + (kurtosis**2) / 4)
+                            
+                            if n >= 3 and n <= 5000:
+                                _, shapiro_p = scipy_stats.shapiro(returns_array)
+                            else:
+                                shapiro_p = 0.0
+                        else:
+                            skewness = kurtosis = jb_stat = shapiro_p = 0
+                        
+                        period_stat = {
+                            'token': token_name,
+                            'period': i + 1,
+                            'period_label': f"Period {i + 1}",
+                            **stats,
+                            'skewness': skewness,
+                            'kurtosis': kurtosis,
+                            'jb_statistic': jb_stat,
+                            'shapiro_p_value': shapiro_p,
+                            'is_normal': shapiro_p > 0.05 if shapiro_p > 0 else False
+                        }
+                        
+                        all_period_stats.append(period_stat)
+                        token_stats.append(period_stat)
+                        
+                token_period_data[token_name] = token_stats
+                
+            except Exception as e:
+                continue  # Skip problematic tokens
+        
+        if not all_period_stats:
+            raise ValueError("No valid period statistics calculated from any token")
+        
+        # Convert to DataFrame for easier analysis
+        stats_df = pl.DataFrame(all_period_stats)
+        
+        # Calculate aggregated statistics by period
+        aggregated_stats = stats_df.group_by('period').agg([
+            pl.col('mean').mean().alias('avg_mean_return'),
+            pl.col('mean').std().alias('std_mean_return'),
+            pl.col('std').mean().alias('avg_volatility'),
+            pl.col('std').std().alias('std_volatility'),
+            pl.col('skewness').mean().alias('avg_skewness'),
+            pl.col('skewness').std().alias('std_skewness'),
+            pl.col('kurtosis').mean().alias('avg_kurtosis'),
+            pl.col('kurtosis').std().alias('std_kurtosis'),
+            pl.col('is_normal').sum().alias('normal_count'),
+            pl.col('token').count().alias('total_tokens'),
+            pl.col('median').mean().alias('avg_median'),
+            pl.col('q25').mean().alias('avg_q25'),
+            pl.col('q75').mean().alias('avg_q75')
+        ]).sort('period')
+        
+        # Calculate normality percentage
+        aggregated_stats = aggregated_stats.with_columns([
+            (pl.col('normal_count') / pl.col('total_tokens') * 100).alias('normality_percentage')
+        ])
+        
+        # Create comprehensive visualization
+        fig = make_subplots(
+            rows=3, cols=2,
+            subplot_titles=[
+                'Average Return Evolution Across Tokens',
+                'Volatility Evolution Across Tokens', 
+                'Distribution Shape Evolution (Skewness)',
+                'Distribution Shape Evolution (Kurtosis)',
+                'Normality Percentage by Period',
+                'Statistical Dispersion Across Tokens'
+            ],
+            vertical_spacing=0.12,
+            horizontal_spacing=0.10
+        )
+        
+        periods = aggregated_stats['period'].to_list()
+        
+        # 1. Average Return Evolution
+        fig.add_trace(
+            go.Scatter(
+                x=periods,
+                y=aggregated_stats['avg_mean_return'].to_list(),
+                mode='lines+markers',
+                name='Avg Return',
+                line=dict(color='blue', width=3),
+                marker=dict(size=8),
+                error_y=dict(
+                    type='data',
+                    array=aggregated_stats['std_mean_return'].to_list(),
+                    visible=True,
+                    color='lightblue',
+                    width=2
+                )
+            ),
+            row=1, col=1
+        )
+        
+        # Add zero line for reference
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=1, col=1)
+        
+        # 2. Volatility Evolution
+        fig.add_trace(
+            go.Scatter(
+                x=periods,
+                y=aggregated_stats['avg_volatility'].to_list(),
+                mode='lines+markers',
+                name='Avg Volatility',
+                line=dict(color='red', width=3),
+                marker=dict(size=8),
+                error_y=dict(
+                    type='data',
+                    array=aggregated_stats['std_volatility'].to_list(),
+                    visible=True,
+                    color='lightcoral',
+                    width=2
+                )
+            ),
+            row=1, col=2
+        )
+        
+        # 3. Skewness Evolution
+        fig.add_trace(
+            go.Scatter(
+                x=periods,
+                y=aggregated_stats['avg_skewness'].to_list(),
+                mode='lines+markers',
+                name='Avg Skewness',
+                line=dict(color='green', width=3),
+                marker=dict(size=8),
+                error_y=dict(
+                    type='data',
+                    array=aggregated_stats['std_skewness'].to_list(),
+                    visible=True,
+                    color='lightgreen',
+                    width=2
+                )
+            ),
+            row=2, col=1
+        )
+        
+        # Add zero line for skewness reference
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+        
+        # 4. Kurtosis Evolution
+        fig.add_trace(
+            go.Scatter(
+                x=periods,
+                y=aggregated_stats['avg_kurtosis'].to_list(),
+                mode='lines+markers',
+                name='Avg Excess Kurtosis',
+                line=dict(color='purple', width=3),
+                marker=dict(size=8),
+                error_y=dict(
+                    type='data',
+                    array=aggregated_stats['std_kurtosis'].to_list(),
+                    visible=True,
+                    color='plum',
+                    width=2
+                )
+            ),
+            row=2, col=2
+        )
+        
+        # Add zero line for kurtosis reference
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=2)
+        
+        # 5. Normality Percentage
+        fig.add_trace(
+            go.Bar(
+                x=periods,
+                y=aggregated_stats['normality_percentage'].to_list(),
+                name='% Normal Distributions',
+                marker_color='orange',
+                text=[f"{val:.1f}%" for val in aggregated_stats['normality_percentage'].to_list()],
+                textposition='auto'
+            ),
+            row=3, col=1
+        )
+        
+        # Add reference lines for normality interpretation
+        fig.add_hline(y=70, line_dash="dot", line_color="green", 
+                     annotation_text="Good (>70%)", row=3, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="red", 
+                     annotation_text="Poor (<30%)", row=3, col=1)
+        
+        # 6. Token Count and Statistical Dispersion
+        fig.add_trace(
+            go.Scatter(
+                x=periods,
+                y=aggregated_stats['total_tokens'].to_list(),
+                mode='lines+markers',
+                name='Token Count',
+                line=dict(color='brown', width=3),
+                marker=dict(size=8),
+                yaxis='y2'
+            ),
+            row=3, col=2
+        )
+        
+        # Add dispersion measure (coefficient of variation for returns)
+        cv_returns = []
+        for i, avg_ret in enumerate(aggregated_stats['avg_mean_return'].to_list()):
+            std_ret = aggregated_stats['std_mean_return'].to_list()[i]
+            if abs(avg_ret) > 1e-10:
+                cv_returns.append(std_ret / abs(avg_ret))
+            else:
+                cv_returns.append(0)
+        
+        fig.add_trace(
+            go.Scatter(
+                x=periods,
+                y=cv_returns,
+                mode='lines+markers',
+                name='Return Dispersion (CV)',
+                line=dict(color='darkred', width=2, dash='dash'),
+                marker=dict(size=6)
+            ),
+            row=3, col=2
+        )
+        
+        # Update layout
+        fig.update_xaxes(title_text="Period", row=3, col=1)
+        fig.update_xaxes(title_text="Period", row=3, col=2)
+        
+        fig.update_yaxes(title_text="Return (%)", row=1, col=1)
+        fig.update_yaxes(title_text="Volatility (%)", row=1, col=2)
+        fig.update_yaxes(title_text="Skewness", row=2, col=1)
+        fig.update_yaxes(title_text="Excess Kurtosis", row=2, col=2)
+        fig.update_yaxes(title_text="% Normal", row=3, col=1)
+        fig.update_yaxes(title_text="Dispersion / Token Count", row=3, col=2)
+        
+        fig.update_layout(
+            height=900,
+            title_text=f"Multi-Token Distribution Evolution Analysis ({len(token_data)} tokens, {n_periods} periods)",
+            title_x=0.5,
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="center",
+                x=0.5
+            )
+        )
+        
+        # Return both figure and aggregated statistics for further analysis
+        return fig, aggregated_stats.to_dicts()
+    
     def plot_optimal_holding_period(self, df: pl.DataFrame,
                                    max_period: int = 240,
                                    step: int = 5) -> go.Figure:
@@ -2940,5 +3253,218 @@ class QuantVisualizations:
         fig.update_yaxes(title_text="Sharpe Ratio", row=1, col=2)
         fig.update_yaxes(title_text="Risk/Reward Ratio", row=2, col=1)
         fig.update_yaxes(title_text="Normalized Value", row=2, col=2)
+        
+        return fig
+    
+    def plot_multi_token_optimal_holding_period(self, all_results_df: pl.DataFrame, aggregated_stats: pl.DataFrame) -> go.Figure:
+        """
+        Multi-token optimal holding period visualization
+        
+        Args:
+            all_results_df: Individual token results for all periods
+            aggregated_stats: Aggregated statistics by holding period
+            
+        Returns:
+            Plotly figure with comprehensive multi-token analysis
+        """
+        # Create 2x2 subplot figure with clearer titles
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=[
+                "📈 Risk-Adjusted Performance (Higher = Better)",
+                "⚖️ Return vs Risk Trade-off (Top-Left = Best)", 
+                "🎯 Success Rate by Holding Time",
+                "🔥 Top Tokens Performance Heatmap"
+            ],
+            specs=[[{"secondary_y": False}, {"secondary_y": False}],
+                   [{"secondary_y": False}, {"secondary_y": False}]]
+        )
+        
+        # Panel 1: Average Sharpe Ratio Evolution
+        fig.add_trace(
+            go.Scatter(
+                x=aggregated_stats['Holding Period (min)'],
+                y=aggregated_stats['Avg Sharpe Ratio'],
+                mode='lines+markers',
+                name='Avg Sharpe Ratio',
+                line=dict(color='#1f77b4', width=3),
+                marker=dict(size=8),
+                hovertemplate='<b>Hold for %{x} minutes</b><br>' +
+                             'Risk-Adjusted Return: %{y:.3f}<br>' +
+                             '(Higher = Better Performance)<br>' +
+                             '<extra></extra>'
+            ),
+            row=1, col=1
+        )
+        
+        # Add error bars for Sharpe ratio
+        fig.add_trace(
+            go.Scatter(
+                x=aggregated_stats['Holding Period (min)'],
+                y=aggregated_stats['Avg Sharpe Ratio'] + aggregated_stats['Sharpe Std'],
+                mode='lines',
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=1, col=1
+        )
+        
+        fig.add_trace(
+            go.Scatter(
+                x=aggregated_stats['Holding Period (min)'],
+                y=aggregated_stats['Avg Sharpe Ratio'] - aggregated_stats['Sharpe Std'],
+                mode='lines',
+                line=dict(width=0),
+                fill='tonexty',
+                fillcolor='rgba(31, 119, 180, 0.2)',
+                name='±1 Std Dev',
+                showlegend=True,
+                hoverinfo='skip'
+            ),
+            row=1, col=1
+        )
+        
+        # Panel 2: Risk vs Return Scatter
+        fig.add_trace(
+            go.Scatter(
+                x=aggregated_stats['Avg Volatility (%)'],
+                y=aggregated_stats['Avg Return (%)'],
+                mode='markers+text',
+                text=[f"{int(p)}min" for p in aggregated_stats['Holding Period (min)']],
+                textposition='top center',
+                marker=dict(
+                    size=aggregated_stats['Avg Sharpe Ratio'] * 20 + 10,  # Size by Sharpe ratio
+                    color=aggregated_stats['Avg Sharpe Ratio'],
+                    colorscale='RdYlGn',
+                    showscale=True,
+                    colorbar=dict(title="Sharpe Ratio", x=0.48)
+                ),
+                name='Risk vs Return',
+                hovertemplate='<b>Hold for %{text}</b><br>' +
+                             'Risk (Volatility): %{x:.2f}%<br>' +
+                             'Average Return: %{y:.2f}%<br>' +
+                             'Risk-Adjusted Score: %{marker.color:.3f}<br>' +
+                             '💡 Best = High Return + Low Risk<br>' +
+                             '<extra></extra>'
+            ),
+            row=1, col=2
+        )
+        
+        # Panel 3: Win Rate Distribution
+        fig.add_trace(
+            go.Bar(
+                x=aggregated_stats['Holding Period (min)'],
+                y=aggregated_stats['Avg Win Rate (%)'],
+                name='Avg Win Rate',
+                marker=dict(
+                    color=aggregated_stats['Avg Win Rate (%)'],
+                    colorscale='RdYlGn',
+                    showscale=False
+                ),
+                hovertemplate='<b>Hold for %{x} minutes</b><br>' +
+                             'Success Rate: %{y:.1f}%<br>' +
+                             '(% of profitable trades)<br>' +
+                             '<extra></extra>'
+            ),
+            row=2, col=1
+        )
+        
+        # Panel 4: Individual Token Performance Heatmap
+        # Create pivot table for heatmap
+        try:
+            # Get unique tokens and periods
+            tokens = sorted(all_results_df['Token'].unique())
+            periods = sorted(all_results_df['Holding Period (min)'].unique())
+            
+            # Create matrix for heatmap
+            heatmap_data = []
+            hover_text = []
+            
+            for token in tokens:
+                token_data = all_results_df.filter(pl.col('Token') == token)
+                row_data = []
+                row_hover = []
+                
+                for period in periods:
+                    period_data = token_data.filter(pl.col('Holding Period (min)') == period)
+                    if len(period_data) > 0:
+                        sharpe = period_data['Sharpe Ratio'][0]
+                        ret = period_data['Mean Return (%)'][0]
+                        vol = period_data['Volatility (%)'][0]
+                        row_data.append(sharpe)
+                        row_hover.append(f'Token: {token}<br>Hold for: {period} minutes<br>Risk-Adjusted Score: {sharpe:.3f}<br>Avg Return: {ret:.2f}%<br>Risk Level: {vol:.2f}%')
+                    else:
+                        row_data.append(None)
+                        row_hover.append(f'Token: {token}<br>Period: {period}min<br>No data')
+                
+                heatmap_data.append(row_data)
+                hover_text.append(row_hover)
+            
+            # Limit to top 20 tokens for readability
+            if len(tokens) > 20:
+                # Get top 20 tokens by best Sharpe ratio
+                token_best_sharpe = all_results_df.group_by('Token').agg([
+                    pl.col('Sharpe Ratio').max().alias('Best_Sharpe')
+                ]).sort('Best_Sharpe', descending=True).head(20)
+                
+                top_tokens = token_best_sharpe['Token'].to_list()
+                
+                # Filter data to top tokens
+                top_indices = [i for i, token in enumerate(tokens) if token in top_tokens]
+                heatmap_data = [heatmap_data[i] for i in top_indices]
+                hover_text = [hover_text[i] for i in top_indices]
+                tokens = top_tokens
+            
+            fig.add_trace(
+                go.Heatmap(
+                    z=heatmap_data,
+                    x=[f"{p}min" for p in periods],
+                    y=[token[:12] + "..." if len(token) > 12 else token for token in tokens],  # Truncate long names
+                    colorscale='RdYlGn',
+                    text=hover_text,
+                    hovertemplate='%{text}<extra></extra>',
+                    showscale=True,
+                    colorbar=dict(title="Sharpe Ratio", x=1.02)
+                ),
+                row=2, col=2
+            )
+            
+        except Exception as e:
+            # Fallback if heatmap creation fails
+            fig.add_annotation(
+                text=f"Heatmap unavailable<br>({str(e)[:50]}...)",
+                x=0.5, y=0.5,
+                xref="x4", yref="y4",
+                showarrow=False,
+                font=dict(size=12, color="gray")
+            )
+        
+        # Update layout with explanatory title
+        fig.update_layout(
+            title=dict(
+                text="<b>🕐 Optimal Holding Period Analysis: How Long Should You Hold Positions?</b><br>" +
+                     "<sub>Analysis shows performance for different holding times across all selected tokens</sub>",
+                x=0.5,
+                font=dict(size=16)
+            ),
+            height=800,
+            showlegend=True,
+            legend=dict(x=0.02, y=0.98),
+            template='plotly_white'
+        )
+        
+        # Update axes with clearer labels
+        fig.update_xaxes(title_text="⏰ How Long to Hold (minutes)", row=1, col=1)
+        fig.update_yaxes(title_text="📊 Risk-Adjusted Score (Higher = Better)", row=1, col=1)
+        
+        fig.update_xaxes(title_text="📉 Risk Level (Volatility %)", row=1, col=2)
+        fig.update_yaxes(title_text="📈 Average Return (%)", row=1, col=2)
+        
+        fig.update_xaxes(title_text="⏰ How Long to Hold (minutes)", row=2, col=1)
+        fig.update_yaxes(title_text="🎯 Success Rate (%)", row=2, col=1)
+        
+        fig.update_xaxes(title_text="⏰ Holding Time", row=2, col=2)
+        fig.update_yaxes(title_text="🪙 Token", row=2, col=2)
         
         return fig

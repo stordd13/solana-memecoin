@@ -1915,313 +1915,692 @@ def show_price_distribution_evolution(selected_tokens, selection_mode):
         st.warning("Please select at least one token.")
         return
     
+    # Analysis mode selection
+    analysis_mode = st.selectbox(
+        "Analysis Mode",
+        ["Single Token Analysis", "Multi-Token Aggregated Analysis"],
+        help="Choose between detailed single token analysis or aggregated multi-token analysis"
+    )
+    
     # Configuration options
     col1, col2, col3 = st.columns(3)
     with col1:
-        selected_token = st.selectbox("Select Token for Analysis", selected_tokens)
+        if analysis_mode == "Single Token Analysis":
+            selected_token = st.selectbox("Select Token for Analysis", selected_tokens)
+        else:
+            st.info(f"Analyzing {len(selected_tokens)} selected tokens")
+            selected_token = None
     with col2:
         n_periods = st.selectbox("Number of Periods", [4, 6, 8, 12], index=1)
     with col3:
         show_summary = st.checkbox("Show Summary Dashboard", value=True)
     
-    if selected_token:
+    # Analysis execution
+    period_stats = None  # Initialize variable
+    
+    if (analysis_mode == "Single Token Analysis" and selected_token) or (analysis_mode == "Multi-Token Aggregated Analysis" and selected_tokens):
         if st.button("📊 Analyze Distribution Evolution", type="primary"):
+            
+            if analysis_mode == "Single Token Analysis":
+                # Single token analysis
+                df = st.session_state.data_loader.get_token_data(selected_token)
+                
+                if df is None or df.is_empty():
+                    st.error(f"No data available for {selected_token}")
+                    return
+                
+                if df.height < n_periods * 20:
+                    st.warning(f"Insufficient data points ({df.height}) for {n_periods} periods. Need at least {n_periods * 20} points.")
+                    return
+                
+                with st.spinner("Performing comprehensive distribution analysis..."):
+                    try:
+                        qv = st.session_state.quant_viz
+                        fig, period_stats = qv.plot_price_distribution_evolution(df, n_periods=n_periods)
+                        
+                        st.subheader(f"📈 Distribution Evolution Analysis - {selected_token}")
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    except Exception as e:
+                        st.error(f"Error during single token analysis: {str(e)}")
+                        return
+            
+            else:
+                # Multi-token aggregated analysis
+                with st.spinner(f"Performing aggregated distribution analysis for {len(selected_tokens)} tokens..."):
+                    try:
+                        # Load data for all selected tokens
+                        token_data = []
+                        progress_bar = st.progress(0)
+                        
+                        for i, token_name in enumerate(selected_tokens):
+                            try:
+                                df = st.session_state.data_loader.get_token_data(token_name)
+                                if df is not None and not df.is_empty() and df.height >= n_periods * 20:
+                                    token_data.append((token_name, df))
+                                progress_bar.progress((i + 1) / len(selected_tokens))
+                            except Exception:
+                                continue
+                        
+                        progress_bar.empty()
+                        
+                        if len(token_data) < 2:
+                            st.error(f"Need at least 2 valid tokens for aggregated analysis. Only {len(token_data)} tokens have sufficient data.")
+                            return
+                        
+                        st.info(f"Successfully loaded {len(token_data)} tokens with sufficient data")
+                        
+                        # Perform multi-token aggregated analysis
+                        qv = st.session_state.quant_viz
+                        fig, period_stats = qv.plot_multi_token_distribution_evolution(token_data, n_periods=n_periods)
+                        
+                        st.subheader(f"📈 Aggregated Distribution Evolution Analysis - {len(token_data)} Tokens")
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Display aggregated statistics table
+                        st.subheader("📊 Aggregated Period Statistics")
+                        
+                        # Convert period_stats to DataFrame for display
+                        aggregated_df = pl.DataFrame(period_stats)
+                        
+                        # Format for better display
+                        display_df = aggregated_df.select([
+                            pl.col('period').alias('Period'),
+                            pl.col('total_tokens').alias('Tokens'),
+                            pl.col('avg_mean_return').round(3).alias('Avg Return (%)'),
+                            pl.col('std_mean_return').round(3).alias('Return Std (%)'),
+                            pl.col('avg_volatility').round(3).alias('Avg Volatility (%)'),
+                            pl.col('avg_skewness').round(3).alias('Avg Skewness'),
+                            pl.col('avg_kurtosis').round(3).alias('Avg Kurtosis'),
+                            pl.col('normality_percentage').round(1).alias('Normal %')
+                        ])
+                        
+                        st.dataframe(display_df, use_container_width=True)
+                        
+                        # Key insights for aggregated analysis
+                        st.subheader("🔍 Aggregated Key Insights")
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            avg_normal_pct = aggregated_df['normality_percentage'].mean()
+                            st.metric("Avg Normal %", f"{avg_normal_pct:.1f}%")
+                        with col2:
+                            best_period = aggregated_df.sort('avg_mean_return', descending=True).limit(1)
+                            if len(best_period) > 0:
+                                period_num = best_period['period'][0]
+                                return_val = best_period['avg_mean_return'][0]
+                                st.metric("Best Period", f"Period {period_num}", f"{return_val:.2f}%")
+                        with col3:
+                            most_stable = aggregated_df.sort('std_mean_return').limit(1)
+                            if len(most_stable) > 0:
+                                period_num = most_stable['period'][0]
+                                std_val = most_stable['std_mean_return'][0]
+                                st.metric("Most Stable", f"Period {period_num}", f"±{std_val:.2f}%")
+                        with col4:
+                            total_observations = aggregated_df['total_tokens'].sum()
+                            st.metric("Total Observations", f"{total_observations}")
+                        
+                        # Interpretation for aggregated analysis
+                        st.markdown("#### 📖 **Aggregated Analysis Interpretation:**")
+                        
+                        if avg_normal_pct >= 70:
+                            st.success("🎯 **Strong Distributional Consistency**: Most tokens show normal distributions across periods")
+                        elif avg_normal_pct >= 30:
+                            st.warning("⚠️ **Mixed Distributional Behavior**: Some periods/tokens deviate from normality")
+                        else:
+                            st.error("🚨 **Non-Normal Behavior Dominant**: Most periods show non-normal distributions")
+                        
+                        # Trading implications for aggregated analysis
+                        st.markdown("#### 💡 **Multi-Token Trading Implications:**")
+                        
+                        implications = []
+                        
+                        # Check for consistent patterns
+                        return_trend = aggregated_df['avg_mean_return'].to_list()
+                        if len(return_trend) > 1:
+                            if return_trend[-1] < return_trend[0]:
+                                implications.append("📉 **Declining Returns Pattern**: Consider shorter holding periods across token portfolio")
+                        
+                        # Check volatility patterns
+                        vol_trend = aggregated_df['avg_volatility'].to_list()
+                        if len(vol_trend) > 1:
+                            if vol_trend[-1] > vol_trend[0]:
+                                implications.append("📊 **Rising Volatility Pattern**: Increase caution in later periods")
+                        
+                        # Check consistency
+                        return_dispersion = aggregated_df['std_mean_return'].mean()
+                        if return_dispersion > 2.0:
+                            implications.append("🎯 **High Token Variability**: Individual token selection critical - not all tokens follow pattern")
+                        
+                        if avg_normal_pct < 50:
+                            implications.append("⚠️ **Non-Normal Risk**: Use robust risk management across entire portfolio")
+                        
+                        if implications:
+                            for implication in implications:
+                                st.markdown(f"- {implication}")
+                        else:
+                            st.success("✅ **Stable Multi-Token Patterns**: Consistent behavior across token portfolio")
+                        
+                        # Set period_stats for the shared display code
+                        # Note: period_stats is now aggregated stats, not individual token stats
+                    
+                    except Exception as e:
+                        st.error(f"Error during aggregated analysis: {str(e)}")
+                        return
+            
+            # Shared display code for results (only runs for single token analysis)
+            if period_stats is not None and analysis_mode == "Single Token Analysis":
+                # Show summary dashboard if requested
+                if show_summary:
+                    st.subheader("📊 Evolution Summary Dashboard")
+                    try:
+                        qv = st.session_state.quant_viz
+                        summary_fig = qv.plot_distribution_evolution_summary(period_stats)
+                        st.plotly_chart(summary_fig, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not generate summary dashboard: {str(e)}")
+                
+                # Display detailed statistics table
+                st.subheader("📋 Detailed Period Statistics")
+                
+                stats_data = []
+                for stat in period_stats:
+                    stats_data.append({
+                        'Period': stat['period'],
+                        'Start Time': stat['start_time'].strftime('%H:%M') if stat['start_time'] else 'N/A',
+                        'End Time': stat['end_time'].strftime('%H:%M') if stat['end_time'] else 'N/A',
+                        'Sample Size': stat['count'],
+                        'Mean Return (%)': f"{stat['mean']:.3f}",
+                        'Volatility (%)': f"{stat['std']:.3f}",
+                        'Median (%)': f"{stat['median']:.3f}",
+                        'Skewness': f"{stat['skewness']:.3f}",
+                        'Excess Kurtosis': f"{stat['kurtosis']:.3f}",
+                        'Min Return (%)': f"{stat['min']:.3f}",
+                        'Max Return (%)': f"{stat['max']:.3f}",
+                        'IQR (%)': f"{stat['q75'] - stat['q25']:.3f}",
+                        'Shapiro p-value': f"{stat['shapiro_p_value']:.4f}" if stat['shapiro_p_value'] > 0 else 'N/A',
+                        'Is Normal?': '✅ Yes' if stat['is_normal'] else '❌ No',
+                        'JB Statistic': f"{stat['jb_statistic']:.2f}"
+                    })
+                
+                stats_df = pl.DataFrame(stats_data)
+                st.dataframe(stats_df, use_container_width=True)
+                
+                # Key insights and interpretation
+                st.subheader("🔍 Key Insights & Interpretation")
+                
+                mean_trend = "increasing" if period_stats[-1]['mean'] > period_stats[0]['mean'] else "decreasing"
+                vol_trend = "increasing" if period_stats[-1]['std'] > period_stats[0]['std'] else "decreasing"
+                normal_periods = sum(1 for stat in period_stats if stat['is_normal'])
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Normal Periods", f"{normal_periods}/{len(period_stats)}")
+                with col2:
+                    avg_skew = np.mean([stat['skewness'] for stat in period_stats])
+                    st.metric("Avg Skewness", f"{avg_skew:.3f}")
+                with col3:
+                    avg_kurtosis = np.mean([stat['kurtosis'] for stat in period_stats])
+                    st.metric("Avg Excess Kurtosis", f"{avg_kurtosis:.3f}")
+                with col4:
+                    volatility_stability = np.std([stat['std'] for stat in period_stats])
+                    st.metric("Volatility Stability", f"{volatility_stability:.3f}")
+                
+                # Interpretation guide
+                st.markdown("#### 📖 **Interpretation Guide:**")
+                
+                if normal_periods >= len(period_stats) * 0.7:
+                    st.success("🎯 **Mostly Normal Distributions**: Returns follow normal distribution in most periods - suitable for standard risk models")
+                elif normal_periods >= len(period_stats) * 0.3:
+                    st.warning("⚠️ **Mixed Distribution Behavior**: Some periods deviate from normality - use robust risk measures")
+                else:
+                    st.error("🚨 **Non-Normal Distributions**: Most periods show non-normal behavior - standard risk models may be inadequate")
+                
+                if abs(avg_skew) > 0.5:
+                    skew_direction = "positive" if avg_skew > 0 else "negative"
+                    st.info(f"📊 **Significant {skew_direction.title()} Skewness**: Returns show {skew_direction} asymmetry - tail risk considerations important")
+                
+                if avg_kurtosis > 1:
+                    st.warning("📈 **Heavy Tails Detected**: Higher probability of extreme returns - increase risk buffer")
+                elif avg_kurtosis < -0.5:
+                    st.info("📉 **Light Tails**: Lower probability of extreme returns than normal distribution")
+                
+                # Trading implications
+                st.markdown("#### 💡 **Trading Implications:**")
+                
+                implications = []
+                if mean_trend == "decreasing":
+                    implications.append("📉 **Declining Returns**: Consider shorter holding periods or exit strategies")
+                if vol_trend == "increasing":
+                    implications.append("📊 **Rising Volatility**: Increase position sizing caution and stop-loss levels")
+                if normal_periods < len(period_stats) * 0.5:
+                    implications.append("🎯 **Non-Normal Risk**: Use Value-at-Risk models designed for non-normal distributions")
+                if avg_kurtosis > 2:
+                    implications.append("⚠️ **Extreme Events**: High probability of large moves - consider wider stop-losses")
+                
+                if implications:
+                    for implication in implications:
+                        st.markdown(f"- {implication}")
+                else:
+                    st.success("✅ **Stable Distribution Characteristics**: Standard risk management approaches should be effective")
+    
+    # Educational content
+    with st.expander("📚 Learn More About Distribution Analysis"):
+        st.markdown("""
+        **Key Concepts:**
+        
+        **Skewness**: Measures asymmetry of the distribution
+        - **Positive skewness**: More extreme positive returns (right tail)
+        - **Negative skewness**: More extreme negative returns (left tail)
+        - **Zero skewness**: Symmetric distribution
+        
+        **Kurtosis**: Measures tail heaviness compared to normal distribution
+        - **Positive excess kurtosis**: Heavier tails, more extreme events
+        - **Negative excess kurtosis**: Lighter tails, fewer extreme events
+        - **Zero excess kurtosis**: Normal distribution tails
+        
+        **Normality Tests:**
+        - **Shapiro-Wilk**: Tests if data comes from normal distribution (p > 0.05 = normal)
+        - **Jarque-Bera**: Tests normality based on skewness and kurtosis
+        
+        **Q-Q Plots**: Visual test for normality
+        - Points on diagonal line = normal distribution
+        - Deviations show non-normal behavior
+        
+        **Distribution Evolution**: How these characteristics change over time
+        - Early periods often show different behavior than later periods
+        - Important for risk management and strategy adaptation
+        """)
+
+def show_optimal_holding_period(selected_tokens, selection_mode):
+    """Enhanced Optimal Holding Period Analysis"""
+    st.header("⏰ Optimal Holding Period Analysis")
+    st.markdown("""
+    **Find the optimal holding period based on risk-adjusted returns**
+    
+    🎯 **How it works**: Tests different holding times (5min, 10min, 30min, etc.) by simulating:
+    - Buying at EVERY possible moment in each token's lifecycle
+    - Holding for the exact time period being tested
+    - Selling automatically after that time
+    - Measuring which holding time gives the best risk-adjusted returns
+    
+    💡 **Key insight**: Finds the sweet spot between:
+    - **Return potential**: Longer holds may capture bigger moves
+    - **Risk management**: Shorter holds reduce exposure to volatility
+    - **Practical execution**: Realistic monitoring requirements
+    """)
+    
+    # Add explanation box
+    with st.expander("🤔 How does this analysis work? (Click to expand)"):
+        st.markdown("""
+        **Step-by-step process:**
+        
+        1. **Choose a holding period** (e.g., 30 minutes)
+        2. **Simulate thousands of trades**:
+           - Buy at minute 1 → Hold 30min → Sell at minute 31
+           - Buy at minute 2 → Hold 30min → Sell at minute 32
+           - Buy at minute 3 → Hold 30min → Sell at minute 33
+           - ...continue for entire token lifecycle
+        3. **Calculate performance metrics** for all these simulated trades
+        4. **Repeat for all holding periods** (5min, 10min, 15min, etc.)
+        5. **Find the optimal period** with best risk-adjusted returns
+        
+        **Important**: This is NOT about entry timing - it tests EVERY possible entry point!
+        
+        **Analysis Granularity** controls how many holding periods to test:
+        - **1-2 min intervals**: Tests 1min, 2min, 3min, 4min... (very detailed)
+        - **5 min intervals**: Tests 5min, 10min, 15min, 20min... (faster)
+        - **10 min intervals**: Tests 10min, 20min, 30min... (quickest overview)
+        """)
+    
+    if not selected_tokens:
+        st.warning("Please select at least one token.")
+        return
+    
+    # Analysis mode selection
+    analysis_mode = st.selectbox(
+        "Analysis Mode",
+        ["Single Token Analysis", "Multi-Token Aggregated Analysis"],
+        help="Choose between detailed single token analysis or aggregated multi-token analysis"
+    )
+    
+    # Parameters with better explanations
+    col1, col2 = st.columns(2)
+    with col1:
+        max_period = st.slider("Max Holding Period (minutes)", min_value=30, max_value=480, value=240, step=30,
+                              help="Maximum time to hold positions in the analysis")
+    with col2:
+        step_size = st.selectbox("Analysis Granularity", [1, 2, 5, 10], index=2, 
+                                format_func=lambda x: f"{x} min intervals" + (" (detailed)" if x <= 2 else " (fast)" if x >= 5 else ""),
+                                help="How finely to test holding periods:\n• 1-2 min: Very detailed but slower\n• 5-10 min: Faster analysis, good for patterns")
+    
+    if analysis_mode == "Single Token Analysis":
+        # Single token detailed analysis
+        selected_token = st.selectbox("Select Token for Analysis", selected_tokens)
+        
+        if selected_token and st.button("⏰ Find Optimal Holding Period", type="primary"):
             df = st.session_state.data_loader.get_token_data(selected_token)
             
             if df is None or df.is_empty():
                 st.error(f"No data available for {selected_token}")
                 return
             
-            if df.height < n_periods * 20:
-                st.warning(f"Insufficient data points ({df.height}) for {n_periods} periods. Need at least {n_periods * 20} points.")
-                return
-            
-            with st.spinner("Performing comprehensive distribution analysis..."):
-                try:
-                    # Get enhanced visualization and statistics
-                    qv = st.session_state.quant_viz
-                    fig, period_stats = qv.plot_price_distribution_evolution(df, n_periods=n_periods)
-                    
-                    # Display main analysis
-                    st.subheader("📈 Distribution Evolution Analysis")
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Show summary dashboard if requested
-                    if show_summary and period_stats:
-                        st.subheader("📊 Evolution Summary Dashboard")
-                        summary_fig = qv.plot_distribution_evolution_summary(period_stats)
-                        st.plotly_chart(summary_fig, use_container_width=True)
-                        
-                        # Add interpretation guide for the summary dashboard
-                        with st.expander("📖 Summary Dashboard Interpretation Guide"):
-                            st.markdown("""
-                            **How to Read the Summary Dashboard:**
-                            
-                            **📈 Mean & Volatility Evolution** (Top Left):
-                            - **Blue line**: Average return per period - upward trend indicates improving performance
-                            - **Red dashed line**: Volatility per period - upward trend indicates increasing risk
-                            - **Ideal pattern**: Stable or increasing returns with stable volatility
-                            
-                            **📊 Distribution Shape** (Top Center):
-                            - **Green line**: Skewness - measures return asymmetry
-                              - Positive = more upside potential, Negative = more downside risk
-                              - Values near 0 (gray line) = symmetric returns
-                            - **Orange dashed line**: Excess kurtosis - measures tail heaviness
-                              - Positive = more extreme events, Negative = fewer extreme events
-                              - Values near 0 (gray line) = normal distribution tails
-                            
-                            **✅ Normality Test Results** (Top Right):
-                            - **Green bars**: Periods with normal distributions (reliable for standard risk models)
-                            - **Red bars**: Periods with non-normal distributions (need robust risk measures)
-                            - **Target**: More green bars = more predictable behavior
-                            
-                            **📏 Return Range Evolution** (Bottom Left):
-                            - **Light green area**: Range between max and min returns
-                            - **Purple dotted line**: Interquartile range (IQR) - middle 50% of returns
-                            - **Narrowing range**: Decreasing volatility, **Widening range**: Increasing volatility
-                            
-                            **🔬 Statistical Significance** (Bottom Center):
-                            - **Jarque-Bera test statistic** for each period
-                            - **Green bars**: Below critical value (normal distribution)
-                            - **Red bars**: Above critical value (non-normal distribution)
-                            - **Red dashed line**: Critical value threshold
-                            
-                            **⭐ Distribution Quality Score** (Bottom Right):
-                            - **Composite score (0-100)** based on normality, shape, and sample size
-                            - **Higher scores**: More reliable distributions for risk modeling
-                            - **Color gradient**: Red (poor) → Yellow (fair) → Green (excellent)
-                            - **Target**: Scores above 70 indicate high-quality distributions
-                            
-                            **🎯 Trading Insights:**
-                            - **Consistent high scores**: Standard risk models work well
-                            - **Declining scores**: Adapt risk management as market behavior changes
-                            - **High skewness**: Adjust position sizing for asymmetric risk
-                            - **High kurtosis**: Increase stop-loss buffers for extreme events
-                            """)
-                        
-                    
-                    # Display detailed statistics table
-                    st.subheader("📋 Detailed Period Statistics")
-                    
-                    # Create comprehensive statistics DataFrame
-                    stats_data = []
-                    for stat in period_stats:
-                        stats_data.append({
-                            'Period': stat['period'],
-                            'Start Time': stat['start_time'].strftime('%H:%M') if stat['start_time'] else 'N/A',
-                            'End Time': stat['end_time'].strftime('%H:%M') if stat['end_time'] else 'N/A',
-                            'Sample Size': stat['count'],
-                            'Mean Return (%)': f"{stat['mean']:.3f}",
-                            'Volatility (%)': f"{stat['std']:.3f}",
-                            'Median (%)': f"{stat['median']:.3f}",
-                            'Skewness': f"{stat['skewness']:.3f}",
-                            'Excess Kurtosis': f"{stat['kurtosis']:.3f}",
-                            'Min Return (%)': f"{stat['min']:.3f}",
-                            'Max Return (%)': f"{stat['max']:.3f}",
-                            'IQR (%)': f"{stat['q75'] - stat['q25']:.3f}",
-                            'Shapiro p-value': f"{stat['shapiro_p_value']:.4f}" if stat['shapiro_p_value'] > 0 else 'N/A',
-                            'Is Normal?': '✅ Yes' if stat['is_normal'] else '❌ No',
-                            'JB Statistic': f"{stat['jb_statistic']:.2f}"
-                        })
-                    
-                    stats_df = pl.DataFrame(stats_data)
-                    st.dataframe(stats_df, use_container_width=True)
-                    
-                    # Key insights and interpretation
-                    st.subheader("🔍 Key Insights & Interpretation")
-                    
-                    # Calculate evolution trends
-                    mean_trend = "increasing" if period_stats[-1]['mean'] > period_stats[0]['mean'] else "decreasing"
-                    vol_trend = "increasing" if period_stats[-1]['std'] > period_stats[0]['std'] else "decreasing"
-                    normal_periods = sum(1 for stat in period_stats if stat['is_normal'])
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Normal Periods", f"{normal_periods}/{len(period_stats)}")
-                    with col2:
-                        avg_skew = np.mean([stat['skewness'] for stat in period_stats])
-                        st.metric("Avg Skewness", f"{avg_skew:.3f}")
-                    with col3:
-                        avg_kurtosis = np.mean([stat['kurtosis'] for stat in period_stats])
-                        st.metric("Avg Excess Kurtosis", f"{avg_kurtosis:.3f}")
-                    with col4:
-                        volatility_stability = np.std([stat['std'] for stat in period_stats])
-                        st.metric("Volatility Stability", f"{volatility_stability:.3f}")
-                    
-                    # Interpretation guide
-                    st.markdown("#### 📖 **Interpretation Guide:**")
-                    
-                    if normal_periods >= len(period_stats) * 0.7:
-                        st.success("🎯 **Mostly Normal Distributions**: Returns follow normal distribution in most periods - suitable for standard risk models")
-                    elif normal_periods >= len(period_stats) * 0.3:
-                        st.warning("⚠️ **Mixed Distribution Behavior**: Some periods deviate from normality - use robust risk measures")
-                    else:
-                        st.error("🚨 **Non-Normal Distributions**: Most periods show non-normal behavior - standard risk models may be inadequate")
-                    
-                    if abs(avg_skew) > 0.5:
-                        skew_direction = "positive" if avg_skew > 0 else "negative"
-                        st.info(f"📊 **Significant {skew_direction.title()} Skewness**: Returns show {skew_direction} asymmetry - tail risk considerations important")
-                    
-                    if avg_kurtosis > 1:
-                        st.warning("📈 **Heavy Tails Detected**: Higher probability of extreme returns - increase risk buffer")
-                    elif avg_kurtosis < -0.5:
-                        st.info("📉 **Light Tails**: Lower probability of extreme returns than normal distribution")
-                    
-                    # Trading implications
-                    st.markdown("#### 💡 **Trading Implications:**")
-                    
-                    implications = []
-                    if mean_trend == "decreasing":
-                        implications.append("📉 **Declining Returns**: Consider shorter holding periods or exit strategies")
-                    if vol_trend == "increasing":
-                        implications.append("📊 **Rising Volatility**: Increase position sizing caution and stop-loss levels")
-                    if normal_periods < len(period_stats) * 0.5:
-                        implications.append("🎯 **Non-Normal Risk**: Use Value-at-Risk models designed for non-normal distributions")
-                    if avg_kurtosis > 2:
-                        implications.append("⚠️ **Extreme Events**: High probability of large moves - consider wider stop-losses")
-                    
-                    if implications:
-                        for implication in implications:
-                            st.markdown(f"- {implication}")
-                    else:
-                        st.success("✅ **Stable Distribution Characteristics**: Standard risk management approaches should be effective")
-                    
-                except Exception as e:
-                    st.error(f"Error during analysis: {str(e)}")
-                    st.info("This might be due to insufficient data or calculation issues. Try with a different token or fewer periods.")
-        
-        # Educational content
-        with st.expander("📚 Learn More About Distribution Analysis"):
-            st.markdown("""
-            **Key Concepts:**
-            
-            **Skewness**: Measures asymmetry of the distribution
-            - **Positive skewness**: More extreme positive returns (right tail)
-            - **Negative skewness**: More extreme negative returns (left tail)
-            - **Zero skewness**: Symmetric distribution
-            
-            **Kurtosis**: Measures tail heaviness compared to normal distribution
-            - **Positive excess kurtosis**: Heavier tails, more extreme events
-            - **Negative excess kurtosis**: Lighter tails, fewer extreme events
-            - **Zero excess kurtosis**: Normal distribution tails
-            
-            **Normality Tests:**
-            - **Shapiro-Wilk**: Tests if data comes from normal distribution (p > 0.05 = normal)
-            - **Jarque-Bera**: Tests normality based on skewness and kurtosis
-            
-            **Q-Q Plots**: Visual test for normality
-            - Points on diagonal line = normal distribution
-            - Deviations show non-normal behavior
-            
-            **Distribution Evolution**: How these characteristics change over time
-            - Early periods often show different behavior than later periods
-            - Important for risk management and strategy adaptation
-            """)
-
-def show_optimal_holding_period(selected_tokens, selection_mode):
-    """Optimal Holding Period Analysis"""
-    st.header("⏰ Optimal Holding Period Analysis")
-    st.markdown("Find the optimal holding period based on risk-adjusted returns")
-    
-    if not selected_tokens:
-        st.warning("Please select at least one token.")
-        return
-    
-    selected_token = st.selectbox("Select Token for Analysis", selected_tokens)
-    
-    if selected_token:
-        if st.button("⏰ Find Optimal Holding Period"):
-            df = st.session_state.data_loader.get_token_data(selected_token)
-            
             with st.spinner("Calculating optimal holding periods..."):
                 # Test different holding periods
-                periods = list(range(1, min(241, len(df)//2), 5))
+                periods = list(range(step_size, min(max_period + 1, len(df)//2), step_size))
                 results = []
                 
                 for period in periods:
                     returns = df['price'].pct_change(period).drop_nulls()
                     
                     if len(returns) > 0:
+                        mean_return = returns.mean() * 100
+                        volatility = returns.std() * 100
+                        sharpe = returns.mean() / (returns.std() + 1e-10) * np.sqrt(525600 / period)
+                        
+                        # Calculate win rate
+                        win_rate = (returns > 0).mean() * 100
+                        
+                        # Calculate max drawdown for this period
+                        cumulative = (1 + returns).cumprod()
+                        running_max = cumulative.expanding().max()
+                        drawdown = (cumulative - running_max) / running_max
+                        max_drawdown = drawdown.min() * 100
+                        
                         results.append({
                             'Holding Period (min)': period,
-                            'Mean Return (%)': returns.mean() * 100,
-                            'Volatility (%)': returns.std() * 100,
-                            'Sharpe Ratio': returns.mean() / (returns.std() + 1e-10) * np.sqrt(525600 / period),
+                            'Mean Return (%)': mean_return,
+                            'Volatility (%)': volatility,
+                            'Sharpe Ratio': sharpe,
+                            'Win Rate (%)': win_rate,
+                            'Max Drawdown (%)': max_drawdown,
                             'Sample Size': len(returns)
                         })
                 
                 if results:
                     results_df = pl.DataFrame(results)
+                    
+                    # Display results
+                    st.subheader("📊 Holding Period Analysis Results")
                     st.dataframe(results_df.sort('Sharpe Ratio', descending=True), use_container_width=True)
                     
-                    # Find optimal
-                    optimal_idx = results_df['Sharpe Ratio'].arg_max()
-                    if optimal_idx is not None:
-                        optimal_stats = results_df[optimal_idx]
-                        st.success(f"Optimal Holding Period: {optimal_stats['Holding Period (min)'][0]} minutes")
-                        
-                        # Add interpretation guide for optimal holding period
-                        with st.expander("📖 Optimal Holding Period Interpretation Guide"):
-                            st.markdown("""
-                            **How to Read the Optimal Holding Period Analysis:**
-                            
-                            **📊 Results Table**:
-                            - **Holding Period**: Time to hold position (in minutes)
-                            - **Mean Return**: Average profit/loss per trade
-                            - **Volatility**: Risk level for each holding period
-                            - **Sharpe Ratio**: Risk-adjusted return (higher = better)
-                            - **Sample Size**: Number of observations (higher = more reliable)
-                            
-                            **🎯 Optimal Period Selection:**
-                            - **Best Sharpe Ratio**: Highest risk-adjusted returns
-                            - **Balancing act**: Consider both return and risk
-                            - **Sample size**: Ensure sufficient data for reliability
-                            - **Practical constraints**: Account for execution and monitoring
-                            
-                            **📈 Pattern Analysis:**
-                            
-                            **Short Periods (1-15 minutes)**:
-                            - **High frequency trading**: Quick in/out strategies
-                            - **Noise sensitivity**: More affected by market microstructure
-                            - **High monitoring**: Requires constant attention
-                            - **Strategy**: Scalping, arbitrage, momentum capture
-                            
-                            **Medium Periods (15-60 minutes)**:
-                            - **Swing trading**: Balance between noise and signal
-                            - **Manageable monitoring**: Reasonable attention requirements
-                            - **Good risk/reward**: Often optimal for most traders
-                            - **Strategy**: Trend following, breakout trading
-                            
-                            **Long Periods (60+ minutes)**:
-                            - **Position trading**: Lower frequency, higher conviction
-                            - **Trend dependence**: Relies on sustained price movements
-                            - **Lower monitoring**: Less hands-on management
-                            - **Strategy**: Trend riding, fundamental-based trades
-                            
-                            **🎯 Strategy Implementation:**
-                            
-                            **Risk Management:**
-                            - **Stop-loss placement**: Set based on optimal period volatility
-                            - **Position sizing**: Inverse to volatility of optimal period
-                            - **Time stops**: Exit if not profitable within optimal window
-                            
-                            **Entry/Exit Timing:**
-                            - **Entry confirmation**: Wait for signal strength appropriate to period
-                            - **Exit discipline**: Close positions at optimal time regardless of P&L
-                            - **Rolling optimization**: Periodically update optimal periods
-                            
-                            **Portfolio Application:**
-                            - **Multiple timeframes**: Use different optimal periods for different strategies
-                            - **Token-specific**: Each token may have different optimal periods
-                            - **Market adaptation**: Optimal periods may change with market conditions
-                            
-                            **⚠️ Important Considerations:**
-                            - **Sample size bias**: Longer periods have fewer observations
-                            - **Market regime changes**: Optimal periods may shift over time
-                            - **Transaction costs**: Consider execution costs for shorter periods
-                            - **Survivorship bias**: Analysis only includes completed token lifecycle
-                            """)
+                    # Find optimal periods
+                    optimal_sharpe_idx = results_df['Sharpe Ratio'].arg_max()
+                    optimal_return_idx = results_df['Mean Return (%)'].arg_max()
+                    optimal_winrate_idx = results_df['Win Rate (%)'].arg_max()
+                    
+                    # Key insights
+                    st.subheader("🎯 Key Insights")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        if optimal_sharpe_idx is not None:
+                            optimal_stats = results_df[optimal_sharpe_idx]
+                            period = optimal_stats['Holding Period (min)'][0]
+                            sharpe = optimal_stats['Sharpe Ratio'][0]
+                            st.success(f"🏆 **Best Sharpe Ratio**\n\n{period} min period\nSharpe: {sharpe:.3f}")
+                    
+                    with col2:
+                        if optimal_return_idx is not None:
+                            return_stats = results_df[optimal_return_idx]
+                            period = return_stats['Holding Period (min)'][0]
+                            ret = return_stats['Mean Return (%)'][0]
+                            st.info(f"📈 **Highest Return**\n\n{period} min period\nReturn: {ret:.2f}%")
+                    
+                    with col3:
+                        if optimal_winrate_idx is not None:
+                            winrate_stats = results_df[optimal_winrate_idx]
+                            period = winrate_stats['Holding Period (min)'][0]
+                            wr = winrate_stats['Win Rate (%)'][0]
+                            st.info(f"🎯 **Best Win Rate**\n\n{period} min period\nWin Rate: {wr:.1f}%")
+                    
+                    # Visualization with explanation
+                    st.subheader("📈 Performance Visualization")
+                    
+                    st.info("""
+                    **📊 How to read the chart:**
+                    - **X-axis**: How long to hold positions (in minutes)
+                    - **Y-axis**: Performance metrics (return, risk, success rate)
+                    - **Peak points**: Optimal holding periods for each metric
+                    - **Look for**: High Sharpe ratio (best risk-adjusted returns)
+                    """)
+                    
+                    try:
+                        qv = st.session_state.quant_viz
+                        fig = qv.plot_optimal_holding_period(df, max_period=max_period, step=step_size)
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not generate visualization: {str(e)}")
+                else:
+                    st.error("No valid holding periods could be analyzed.")
+    
+    else:
+        # Multi-token aggregated analysis
+        if len(selected_tokens) < 2:
+            st.warning("Please select at least 2 tokens for multi-token analysis.")
+            return
+        
+        # Limit tokens for performance
+        max_tokens = st.slider("Max tokens to analyze", min_value=2, max_value=min(50, len(selected_tokens)), value=min(20, len(selected_tokens)))
+        tokens_to_analyze = selected_tokens[:max_tokens]
+        
+        if st.button("⏰ Analyze Optimal Periods Across Tokens", type="primary"):
+            with st.spinner(f"Analyzing optimal holding periods for {len(tokens_to_analyze)} tokens..."):
+                # Load data for all selected tokens
+                token_results = []
+                progress_bar = st.progress(0)
                 
+                for i, token_name in enumerate(tokens_to_analyze):
+                    try:
+                        df = st.session_state.data_loader.get_token_data(token_name)
+                        if df is not None and not df.is_empty() and len(df) > max_period:
+                            
+                            # Test different holding periods for this token
+                            periods = list(range(step_size, min(max_period + 1, len(df)//2), step_size))
+                            
+                            for period in periods:
+                                returns = df['price'].pct_change(period).drop_nulls()
+                                
+                                if len(returns) > 10:  # Minimum sample size
+                                    mean_return = returns.mean() * 100
+                                    volatility = returns.std() * 100
+                                    sharpe = returns.mean() / (returns.std() + 1e-10) * np.sqrt(525600 / period)
+                                    win_rate = (returns > 0).mean() * 100
+                                    
+                                    token_results.append({
+                                        'Token': token_name,
+                                        'Holding Period (min)': period,
+                                        'Mean Return (%)': mean_return,
+                                        'Volatility (%)': volatility,
+                                        'Sharpe Ratio': sharpe,
+                                        'Win Rate (%)': win_rate,
+                                        'Sample Size': len(returns)
+                                    })
+                        
+                        progress_bar.progress((i + 1) / len(tokens_to_analyze))
+                    except Exception as e:
+                        continue
+                
+                progress_bar.empty()
+                
+                if token_results:
+                    # Convert to DataFrame for analysis
+                    all_results_df = pl.DataFrame(token_results)
+                    
+                    # Calculate aggregated statistics by holding period
+                    aggregated_stats = all_results_df.group_by('Holding Period (min)').agg([
+                        pl.col('Mean Return (%)').mean().alias('Avg Return (%)'),
+                        pl.col('Mean Return (%)').std().alias('Return Std (%)'),
+                        pl.col('Volatility (%)').mean().alias('Avg Volatility (%)'),
+                        pl.col('Sharpe Ratio').mean().alias('Avg Sharpe Ratio'),
+                        pl.col('Sharpe Ratio').std().alias('Sharpe Std'),
+                        pl.col('Win Rate (%)').mean().alias('Avg Win Rate (%)'),
+                        pl.col('Token').count().alias('Token Count'),
+                        pl.col('Sample Size').mean().alias('Avg Sample Size')
+                    ]).sort('Holding Period (min)')
+                    
+                    # Display aggregated results
+                    st.subheader(f"📊 Aggregated Optimal Holding Period Analysis ({len(tokens_to_analyze)} tokens)")
+                    st.dataframe(aggregated_stats.sort('Avg Sharpe Ratio', descending=True), use_container_width=True)
+                    
+                    # Find optimal periods across all tokens
+                    best_sharpe_period = aggregated_stats.sort('Avg Sharpe Ratio', descending=True).limit(1)
+                    best_return_period = aggregated_stats.sort('Avg Return (%)', descending=True).limit(1)
+                    best_winrate_period = aggregated_stats.sort('Avg Win Rate (%)', descending=True).limit(1)
+                    
+                    # Key insights for multi-token analysis
+                    st.subheader("🔍 Multi-Token Key Insights")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        if len(best_sharpe_period) > 0:
+                            period = best_sharpe_period['Holding Period (min)'][0]
+                            sharpe = best_sharpe_period['Avg Sharpe Ratio'][0]
+                            st.success(f"🏆 **Best Avg Sharpe**\n\n{period} min period\nSharpe: {sharpe:.3f}")
+                    
+                    with col2:
+                        if len(best_return_period) > 0:
+                            period = best_return_period['Holding Period (min)'][0]
+                            ret = best_return_period['Avg Return (%)'][0]
+                            st.info(f"📈 **Highest Avg Return**\n\n{period} min period\nReturn: {ret:.2f}%")
+                    
+                    with col3:
+                        if len(best_winrate_period) > 0:
+                            period = best_winrate_period['Holding Period (min)'][0]
+                            wr = best_winrate_period['Avg Win Rate (%)'][0]
+                            st.info(f"🎯 **Best Avg Win Rate**\n\n{period} min period\nWin Rate: {wr:.1f}%")
+                    
+                    with col4:
+                        total_observations = aggregated_stats['Token Count'].sum()
+                        st.metric("Total Observations", f"{total_observations}")
+                    
+                    # Multi-token visualization with explanation
+                    st.subheader("📈 Multi-Token Performance Visualization")
+                    
+                    # Add plot explanation
+                    st.info("""
+                    **📊 How to read these charts:**
+                    
+                    **Top Left** - Risk-Adjusted Performance: Higher line = better holding periods
+                    **Top Right** - Risk vs Return: Look for points in top-left (high return, low risk)  
+                    **Bottom Left** - Success Rate: Higher bars = more profitable trades
+                    **Bottom Right** - Token Heatmap: Green = good performance, Red = poor performance
+                    """)
+                    
+                    try:
+                        qv = st.session_state.quant_viz
+                        fig = qv.plot_multi_token_optimal_holding_period(all_results_df, aggregated_stats)
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not generate multi-token visualization: {str(e)}")
+                    
+                    # Detailed token-by-token results
+                    with st.expander("📋 Detailed Token-by-Token Results"):
+                        # Find best period for each token
+                        token_optimal = all_results_df.group_by('Token').agg([
+                            pl.col('Sharpe Ratio').max().alias('Best Sharpe'),
+                            pl.col('Holding Period (min)').filter(pl.col('Sharpe Ratio') == pl.col('Sharpe Ratio').max()).first().alias('Optimal Period (min)'),
+                            pl.col('Mean Return (%)').filter(pl.col('Sharpe Ratio') == pl.col('Sharpe Ratio').max()).first().alias('Optimal Return (%)'),
+                            pl.col('Win Rate (%)').filter(pl.col('Sharpe Ratio') == pl.col('Sharpe Ratio').max()).first().alias('Optimal Win Rate (%)')
+                        ]).sort('Best Sharpe', descending=True)
+                        
+                        st.dataframe(token_optimal, use_container_width=True)
+                    
+                    # Multi-token interpretation
+                    st.subheader("🎯 Multi-Token Trading Implications")
+                    
+                    # Analyze consistency across tokens
+                    period_consistency = aggregated_stats['Sharpe Std'].mean()
+                    optimal_period_range = aggregated_stats.filter(pl.col('Avg Sharpe Ratio') > aggregated_stats['Avg Sharpe Ratio'].max() * 0.9)
+                    
+                    implications = []
+                    
+                    if period_consistency < 0.5:
+                        implications.append("✅ **High Consistency**: Most tokens show similar optimal periods - good for systematic strategies")
+                    else:
+                        implications.append("⚠️ **High Variability**: Tokens have different optimal periods - individual optimization recommended")
+                    
+                    if len(optimal_period_range) > 1:
+                        min_period = optimal_period_range['Holding Period (min)'].min()
+                        max_period = optimal_period_range['Holding Period (min)'].max()
+                        implications.append(f"🎯 **Optimal Range**: {min_period}-{max_period} minutes shows consistently good performance")
+                    
+                    # Check for clear patterns
+                    best_periods = aggregated_stats.sort('Avg Sharpe Ratio', descending=True).head(3)['Holding Period (min)'].to_list()
+                    if all(p <= 30 for p in best_periods):
+                        implications.append("⚡ **Short-Term Advantage**: Quick scalping strategies (≤30 min) show best risk-adjusted returns")
+                    elif all(p >= 60 for p in best_periods):
+                        implications.append("🕐 **Long-Term Advantage**: Position trading (≥60 min) shows best risk-adjusted returns")
+                    else:
+                        implications.append("⚖️ **Mixed Strategies**: Both short and long holding periods can be effective")
+                    
+                    for implication in implications:
+                        st.markdown(f"- {implication}")
+                
+                else:
+                    st.error("No valid data to analyze across the selected tokens.")
+    
+    # Add interpretation guide for optimal holding period
+    with st.expander("📖 Optimal Holding Period Interpretation Guide"):
+        st.markdown("""
+        **How to Read the Optimal Holding Period Analysis:**
+        
+        **📊 Results Table**:
+        - **Holding Period**: Time to hold position (in minutes)
+        - **Mean Return**: Average profit/loss per trade
+        - **Volatility**: Risk level for each holding period
+        - **Sharpe Ratio**: Risk-adjusted return (higher = better)
+        - **Sample Size**: Number of observations (higher = more reliable)
+        
+        **🎯 Optimal Period Selection:**
+        - **Best Sharpe Ratio**: Highest risk-adjusted returns
+        - **Balancing act**: Consider both return and risk
+        - **Sample size**: Ensure sufficient data for reliability
+        - **Practical constraints**: Account for execution and monitoring
+        
+        **📈 Pattern Analysis:**
+        
+        **Short Periods (1-15 minutes)**:
+        - **High frequency trading**: Quick in/out strategies
+        - **Noise sensitivity**: More affected by market microstructure
+        - **High monitoring**: Requires constant attention
+        - **Strategy**: Scalping, arbitrage, momentum capture
+        
+        **Medium Periods (15-60 minutes)**:
+        - **Swing trading**: Balance between noise and signal
+        - **Manageable monitoring**: Reasonable attention requirements
+        - **Good risk/reward**: Often optimal for most traders
+        - **Strategy**: Trend following, breakout trading
+        
+        **Long Periods (60+ minutes)**:
+        - **Position trading**: Lower frequency, higher conviction
+        - **Trend dependence**: Relies on sustained price movements
+        - **Lower monitoring**: Less hands-on management
+        - **Strategy**: Trend riding, fundamental-based trades
+        
+        **🎯 Strategy Implementation:**
+        
+        **Risk Management:**
+        - **Stop-loss placement**: Set based on optimal period volatility
+        - **Position sizing**: Inverse to volatility of optimal period
+        - **Time stops**: Exit if not profitable within optimal window
+        
+        **Entry/Exit Timing:**
+        - **Entry confirmation**: Wait for signal strength appropriate to period
+        - **Exit discipline**: Close positions at optimal time regardless of P&L
+        - **Rolling optimization**: Periodically update optimal periods
+        
+        **Portfolio Application:**
+        - **Multiple timeframes**: Use different optimal periods for different strategies
+        - **Token-specific**: Each token may have different optimal periods
+        - **Market adaptation**: Optimal periods may change with market conditions
+        
+        **⚠️ Important Considerations:**
+        - **Sample size bias**: Longer periods have fewer observations
+        - **Market regime changes**: Optimal periods may shift over time
+        - **Transaction costs**: Consider execution costs for shorter periods
+        - **Survivorship bias**: Analysis only includes completed token lifecycle
+        """)
 
 def show_market_regime_analysis(selected_tokens, selection_mode):
     """Market Regime Analysis"""

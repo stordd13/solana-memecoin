@@ -162,6 +162,7 @@ Professional web interface providing intuitive access to all quantitative analys
 - **Comprehensive interpretation guide** with trading implications
 
 **8. Price Distribution Evolution** ⭐ **ENHANCED**
+- **Dual analysis modes**: Single-token detailed analysis OR multi-token aggregated analysis
 - **Comprehensive statistical analysis** of return distribution evolution over time
 - **Pure Polars implementation** for maximum performance on large datasets
 - **Advanced distribution testing**: Shapiro-Wilk normality tests, Jarque-Bera statistics
@@ -173,6 +174,7 @@ Professional web interface providing intuitive access to all quantitative analys
 - **Trading implications**: Risk management guidance based on distribution characteristics
 - **Statistical significance testing** with confidence intervals and critical values
 - **Distribution quality scoring** system for risk assessment
+- **Consistent with token selection**: Now properly respects multi-token selection modes
 
 **9. Optimal Holding Period**
 - Statistical analysis to determine best holding durations
