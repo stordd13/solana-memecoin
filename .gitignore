@@ -48,10 +48,13 @@ Thumbs.db
 
 # Data files (too large for Git)
 data/
+results/
 *.parquet
 *.csv
 *.json
-
+*.joblib
+*.html
+*.txt
 # Logs
 *.log
 logs/

@@ -1,11 +1,10 @@
 """
 LSTM Training Script for Memecoin Price Prediction
-This is the MAIN script you run to train your model
+Designed for category-aware cleaned data using Polars
 """
 
 import os
 import numpy as np
-import pandas as pd
 import polars as pl
 import torch
 import torch.nn as nn
@@ -25,7 +24,7 @@ warnings.filterwarnings('ignore')
 
 # ================== DATASET CLASS ==================
 class MemecoinDataset(Dataset):
-    """Dataset for loading and preprocessing memecoin price data"""
+    """Dataset for loading category-aware cleaned memecoin data"""
     
     def __init__(self, 
                  data_paths: List[Path], 
@@ -47,44 +46,87 @@ class MemecoinDataset(Dataset):
     def _load_data(self, data_paths: List[Path]):
         """Load all parquet files and create sequences"""
         all_prices = []
+        valid_files = []
         
         print(f"Loading {len(data_paths)} files...")
-        for path in tqdm(data_paths):
+        
+        # First pass: collect all prices for scaler fitting
+        if self.fit_scaler:
+            for path in tqdm(data_paths, desc="Collecting prices for scaler"):
+                try:
+                    df = pl.read_parquet(path)
+                    
+                    if 'price' not in df.columns:
+                        continue
+                    
+                    prices = df['price'].to_numpy()
+                    
+                    # Drop tokens with NaN values for cleaner baseline
+                    if np.isnan(prices).any():
+                        print(f"Dropping {path.name}: has {np.isnan(prices).sum()} NaN values")
+                        continue
+                    
+                    if len(prices) < self.lookback + self.forecast_horizon:
+                        continue
+                    
+                    all_prices.extend(prices)
+                    valid_files.append(path)
+                    
+                except Exception as e:
+                    print(f"Error loading {path.name}: {e}")
+            
+            # Fit scaler on all collected prices
+            if all_prices:
+                print(f"Fitting scaler on {len(all_prices)} price points...")
+                self.scaler.fit(np.array(all_prices).reshape(-1, 1))
+            else:
+                raise ValueError("No valid price data found for scaler fitting!")
+        else:
+            # If scaler is provided, all files are potentially valid
+            valid_files = data_paths
+        
+        # Second pass: create sequences with fitted scaler
+        for path in tqdm(valid_files, desc="Creating sequences"):
             try:
                 df = pl.read_parquet(path)
+                
+                if 'datetime' in df.columns:
+                    df = df.sort('datetime')
+                
                 prices = df['price'].to_numpy()
+                
+                # Drop tokens with NaN values for cleaner baseline
+                if np.isnan(prices).any():
+                    print(f"Dropping {path.name}: has {np.isnan(prices).sum()} NaN values")
+                    continue
                 
                 if len(prices) < self.lookback + self.forecast_horizon:
                     continue
                 
-                if self.fit_scaler:
-                    all_prices.extend(prices)
-                
                 # Extract metadata
                 token_name = path.stem
-                launch_date = self._get_launch_date(path)
+                category = path.parent.name
                 
-                # Create sequences with sliding window
-                self._create_sequences(prices, token_name, launch_date)
+                # Create sequences
+                self._create_sequences(prices, token_name, category)
                 
             except Exception as e:
-                print(f"Error loading {path.name}: {e}")
-        
-        # Fit scaler on all data
-        if self.fit_scaler and all_prices:
-            self.scaler.fit(np.array(all_prices).reshape(-1, 1))
+                print(f"Error processing {path.name}: {e}")
         
         # Convert to tensors
-        self.sequences = torch.FloatTensor(self.sequences)
-        self.labels = torch.FloatTensor(self.labels)
-        
-        print(f"Created {len(self.sequences)} training sequences")
+        if len(self.sequences) > 0:
+            self.sequences = torch.FloatTensor(self.sequences)
+            self.labels = torch.FloatTensor(self.labels)
+            print(f"Created {len(self.sequences)} training sequences")
+        else:
+            raise ValueError("No sequences created! Check your data.")
     
-    def _create_sequences(self, prices: np.ndarray, token_name: str, launch_date: datetime):
+    def _create_sequences(self, prices: np.ndarray, token_name: str, category: str):
         """Create overlapping sequences from price data"""
         prices_norm = self.scaler.transform(prices.reshape(-1, 1)).flatten()
         
-        stride = max(1, self.forecast_horizon // 3)  # Reduce overlap
+        # Less overlap for longer horizons
+        stride = max(1, self.forecast_horizon // 3)
         
         for i in range(0, len(prices_norm) - self.lookback - self.forecast_horizon + 1, stride):
             seq = prices_norm[i:i + self.lookback]
@@ -94,34 +136,9 @@ class MemecoinDataset(Dataset):
             self.labels.append(target)
             self.metadata.append({
                 'token': token_name,
-                'date': launch_date,
+                'category': category,
                 'start_idx': i
             })
-    
-    def _get_launch_date(self, path: Path) -> datetime:
-        """Extract launch date from file or metadata"""
-        # Try JSON metadata first
-        json_path = path.with_suffix('.json')
-        if json_path.exists():
-            try:
-                with open(json_path, 'r') as f:
-                    meta = json.load(f)
-                    if 'launch_date' in meta:
-                        return datetime.fromisoformat(meta['launch_date'])
-            except:
-                pass
-        
-        # Try filename
-        parts = path.stem.split('_')
-        for part in parts:
-            if len(part) == 8 and part.isdigit():
-                try:
-                    return datetime.strptime(part, '%Y%m%d')
-                except:
-                    pass
-        
-        # Fallback to file modification time
-        return datetime.fromtimestamp(path.stat().st_mtime)
     
     def __len__(self):
         return len(self.sequences)
@@ -183,58 +200,51 @@ class LSTMPredictor(nn.Module):
 # ================== DATA SPLITTING ==================
 def smart_data_split(all_paths: List[Path]) -> Tuple[List[Path], List[Path], List[Path]]:
     """
-    Split data intelligently based on temporal distribution
-    Since 80-90% of tokens are from 2025, use stratified weekly split
+    Split data intelligently - since most tokens are from 2025,
+    use random split with stratification by category
     """
     
     print("\nAnalyzing data distribution...")
     
-    # Extract dates from all files
-    file_dates = []
+    # Group paths by category
+    category_paths = {}
     for path in all_paths:
-        try:
-            # Try to get date from filename
-            parts = path.stem.split('_')
-            for part in parts:
-                if len(part) == 8 and part.isdigit():
-                    date = datetime.strptime(part, '%Y%m%d')
-                    file_dates.append((path, date))
-                    break
-            else:
-                # Use file modification time as fallback
-                date = datetime.fromtimestamp(path.stat().st_mtime)
-                file_dates.append((path, date))
-        except:
-            continue
+        category = path.parent.name
+        if category not in category_paths:
+            category_paths[category] = []
+        category_paths[category].append(path)
     
-    # Create DataFrame for analysis
-    df = pd.DataFrame(file_dates, columns=['path', 'date'])
-    df['year'] = df['date'].dt.year
-    df['week'] = df['date'].dt.isocalendar().week
-    df['year_week'] = df['year'].astype(str) + '_W' + df['week'].astype(str).str.zfill(2)
+    # Display distribution
+    print("\nFiles per category:")
+    for cat, paths in category_paths.items():
+        print(f"  {cat}: {len(paths)} files")
     
-    # Check distribution
-    year_counts = df['year'].value_counts()
-    print(f"\nYear distribution:")
-    for year, count in year_counts.items():
-        print(f"  {year}: {count} files ({count/len(df)*100:.1f}%)")
-    
-    # Stratified split by week
+    # Stratified split by category
     train_paths, val_paths, test_paths = [], [], []
     
-    for year_week, group in df.groupby('year_week'):
-        paths = group['path'].tolist()
+    for category, paths in category_paths.items():
+        # Shuffle paths
         np.random.shuffle(paths)
         
+        # Calculate splits
         n = len(paths)
         n_train = int(n * 0.7)
         n_val = int(n * 0.15)
         
+        # Assign to splits
         train_paths.extend(paths[:n_train])
         val_paths.extend(paths[n_train:n_train + n_val])
         test_paths.extend(paths[n_train + n_val:])
+        
+        print(f"\n{category}:")
+        print(f"  Train: {n_train}, Val: {n_val}, Test: {n - n_train - n_val}")
     
-    print(f"\nData split (stratified by week):")
+    # Shuffle final lists
+    np.random.shuffle(train_paths)
+    np.random.shuffle(val_paths)
+    np.random.shuffle(test_paths)
+    
+    print(f"\nTotal split:")
     print(f"  Train: {len(train_paths)} files")
     print(f"  Val: {len(val_paths)} files")
     print(f"  Test: {len(test_paths)} files")
@@ -258,6 +268,7 @@ def train_model(model: nn.Module,
     
     train_losses = []
     val_losses = []
+    best_val_loss = float('inf')
     
     print(f"\nTraining on {device}...")
     
@@ -292,10 +303,18 @@ def train_model(model: nn.Module,
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
         
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), 'best_model_checkpoint.pth')
+        
         scheduler.step(avg_val_loss)
         
         if (epoch + 1) % 10 == 0:
             print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
+    
+    # Load best model
+    model.load_state_dict(torch.load('best_model_checkpoint.pth'))
     
     return train_losses, val_losses
 
@@ -343,12 +362,20 @@ def evaluate_model(model: nn.Module,
     pred_returns = (pred_prices[:, -1] - entry_prices) / entry_prices
     true_returns = (target_prices[:, -1] - entry_prices) / entry_prices
     
-    pump_threshold = 1.0  # 100% gain
-    pred_pumps = pred_returns > pump_threshold
-    true_pumps = true_returns > pump_threshold
-    
-    metrics['pump_precision'] = np.sum(pred_pumps & true_pumps) / np.sum(pred_pumps) if np.sum(pred_pumps) > 0 else 0
-    metrics['pump_recall'] = np.sum(pred_pumps & true_pumps) / np.sum(true_pumps) if np.sum(true_pumps) > 0 else 0
+    # Multiple pump thresholds
+    for threshold, name in [(0.5, '50%'), (1.0, '2x'), (4.0, '5x')]:
+        pred_pumps = pred_returns > threshold
+        true_pumps = true_returns > threshold
+        
+        if np.sum(pred_pumps) > 0:
+            metrics[f'pump_{name}_precision'] = np.sum(pred_pumps & true_pumps) / np.sum(pred_pumps)
+        else:
+            metrics[f'pump_{name}_precision'] = 0
+            
+        if np.sum(true_pumps) > 0:
+            metrics[f'pump_{name}_recall'] = np.sum(pred_pumps & true_pumps) / np.sum(true_pumps)
+        else:
+            metrics[f'pump_{name}_recall'] = 0
     
     return metrics, predictions, targets
 
@@ -387,35 +414,68 @@ def plot_training_history(train_losses: List[float], val_losses: List[float]) ->
 
 
 def plot_evaluation_metrics(metrics: Dict) -> go.Figure:
-    """Plot evaluation metrics as bar chart"""
+    """Plot evaluation metrics as grouped bar chart"""
     
-    fig = go.Figure()
+    # Create subplots
+    fig = sp.make_subplots(
+        rows=1, cols=2,
+        subplot_titles=('Detection Performance', 'Pump Detection by Threshold'),
+        column_widths=[0.4, 0.6]
+    )
     
-    # Prepare data
-    metric_names = ['Direction\nAccuracy', 'Pump\nPrecision', 'Pump\nRecall']
-    metric_values = [
-        metrics['direction_accuracy'],
-        metrics['pump_precision'],
-        metrics['pump_recall']
-    ]
+    # Basic metrics
+    basic_metrics = ['direction_accuracy']
+    basic_values = [metrics.get(m, 0) for m in basic_metrics]
     
-    colors = ['green' if v > 0.5 else 'orange' if v > 0.3 else 'red' for v in metric_values]
+    fig.add_trace(
+        go.Bar(
+            x=['Direction\nAccuracy'],
+            y=basic_values,
+            text=[f'{v:.1%}' for v in basic_values],
+            textposition='auto',
+            marker_color='green' if basic_values[0] > 0.5 else 'orange'
+        ),
+        row=1, col=1
+    )
     
-    fig.add_trace(go.Bar(
-        x=metric_names,
-        y=metric_values,
-        text=[f'{v:.1%}' for v in metric_values],
-        textposition='auto',
-        marker_color=colors
-    ))
+    # Pump detection metrics
+    thresholds = ['50%', '2x', '5x']
+    precisions = [metrics.get(f'pump_{t}_precision', 0) for t in thresholds]
+    recalls = [metrics.get(f'pump_{t}_recall', 0) for t in thresholds]
+    
+    fig.add_trace(
+        go.Bar(
+            name='Precision',
+            x=thresholds,
+            y=precisions,
+            text=[f'{v:.1%}' for v in precisions],
+            textposition='auto',
+            marker_color='blue'
+        ),
+        row=1, col=2
+    )
+    
+    fig.add_trace(
+        go.Bar(
+            name='Recall',
+            x=thresholds,
+            y=recalls,
+            text=[f'{v:.1%}' for v in recalls],
+            textposition='auto',
+            marker_color='red'
+        ),
+        row=1, col=2
+    )
     
     fig.update_layout(
         title='Model Performance Metrics',
-        yaxis_title='Score',
-        yaxis=dict(range=[0, 1]),
+        showlegend=True,
         template='plotly_white',
-        showlegend=False
+        barmode='group'
     )
+    
+    fig.update_yaxes(range=[0, 1], row=1, col=1)
+    fig.update_yaxes(range=[0, 1], row=1, col=2)
     
     return fig
 
@@ -426,8 +486,16 @@ def main():
     
     # Configuration
     CONFIG = {
-        'base_dir': Path("data/processed"),
-        'categories': ["cleaned_normal_behavior_tokens", "cleaned_tokens_with_gaps"],
+        'base_dir': Path("data/cleaned"),  # Corrected path
+        'results_dir': Path("ML/results/lstm"),
+        'categories': [
+            "normal_behavior_tokens",      # Best quality
+            "tokens_with_gaps",           # Gaps filled during cleaning
+            "tokens_with_extremes",       # Extremes preserved!
+            # "dead_tokens",              # See smart sampling below
+        ],
+        'include_smart_dead_tokens': True,  # Smart sampling of dead tokens
+        'scaler_type': 'robust',  # 'standard', 'robust', 'log', 'percentile'
         'lookback': 60,
         'forecast_horizon': 15,
         'batch_size': 32,
@@ -440,7 +508,12 @@ def main():
     
     print("="*50)
     print("LSTM Training for Memecoin Price Prediction")
+    print("Using Category-Aware Cleaned Data")
     print("="*50)
+    
+    # Create results directory
+    CONFIG['results_dir'].mkdir(parents=True, exist_ok=True)
+    print(f"Results will be saved to: {CONFIG['results_dir']}")
     
     # 1. Load data paths
     all_paths = []
@@ -450,6 +523,13 @@ def main():
             paths = list(cat_dir.glob("*.parquet"))
             all_paths.extend(paths)
             print(f"Found {len(paths)} files in {category}")
+        else:
+            print(f"Warning: Directory not found: {cat_dir}")
+    
+    if len(all_paths) == 0:
+        print("\nERROR: No files found!")
+        print(f"Please check that cleaned data exists in: {CONFIG['base_dir']}")
+        return None, None, None
     
     print(f"\nTotal files: {len(all_paths)}")
     
@@ -458,7 +538,25 @@ def main():
     
     # 3. Create datasets
     print("\nCreating datasets...")
-    train_dataset = MemecoinDataset(train_paths, CONFIG['lookback'], CONFIG['forecast_horizon'])
+    print(f"Using scaler type: {CONFIG['scaler_type']}")
+    
+    # IMPORTANT: Create train dataset first to fit the scaler
+    train_dataset = MemecoinDataset(
+        train_paths, 
+        CONFIG['lookback'], 
+        CONFIG['forecast_horizon']
+    )
+    
+    # Check if train dataset is valid
+    if len(train_dataset) == 0:
+        print("\nERROR: Train dataset is empty!")
+        print("Possible causes:")
+        print("1. Files don't have enough data points (need at least 75 minutes)")
+        print("2. Files are missing 'price' column")
+        print("3. Data loading errors")
+        return None, None, None
+    
+    # Now create val and test datasets with the fitted scaler
     val_dataset = MemecoinDataset(val_paths, CONFIG['lookback'], CONFIG['forecast_horizon'], 
                                   scaler=train_dataset.scaler)
     test_dataset = MemecoinDataset(test_paths, CONFIG['lookback'], CONFIG['forecast_horizon'], 
@@ -468,6 +566,11 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], shuffle=False)
+    
+    print(f"\nDataset sizes:")
+    print(f"  Train: {len(train_dataset)} sequences")
+    print(f"  Val: {len(val_dataset)} sequences")
+    print(f"  Test: {len(test_dataset)} sequences")
     
     # 5. Initialize model
     model = LSTMPredictor(
@@ -488,35 +591,53 @@ def main():
     
     # 7. Evaluate on test set
     print("\nEvaluating on test set...")
-    metrics, predictions, targets = evaluate_model(model, test_loader, train_dataset.scaler)
+    metrics, predictions, targets = evaluate_model(
+        model, test_loader, train_dataset.scaler,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
     
     print("\nTest Set Metrics:")
     print(f"  MSE: {metrics['mse']:.4f}")
     print(f"  MAE: {metrics['mae']:.4f}")
     print(f"  Direction Accuracy: {metrics['direction_accuracy']:.2%}")
-    print(f"  Pump Detection Precision: {metrics['pump_precision']:.2%}")
-    print(f"  Pump Detection Recall: {metrics['pump_recall']:.2%}")
+    print(f"  50% Pump Detection - Precision: {metrics['pump_50%_precision']:.2%}, Recall: {metrics['pump_50%_recall']:.2%}")
+    print(f"  2x Pump Detection - Precision: {metrics['pump_2x_precision']:.2%}, Recall: {metrics['pump_2x_recall']:.2%}")
+    print(f"  5x Pump Detection - Precision: {metrics['pump_5x_precision']:.2%}, Recall: {metrics['pump_5x_recall']:.2%}")
     
     # 8. Save model
+    model_path = CONFIG['results_dir'] / 'lstm_model.pth'
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': CONFIG,
         'scaler': train_dataset.scaler,
         'metrics': metrics
-    }, 'lstm_model.pth')
+    }, model_path)
     
-    print("\nModel saved to 'lstm_model.pth'")
+    print(f"\nModel saved to: {model_path}")
     
     # 9. Create plots
     fig1 = plot_training_history(train_losses, val_losses)
-    fig1.write_html('training_history.html')
+    training_plot_path = CONFIG['results_dir'] / 'training_history.html'
+    fig1.write_html(training_plot_path)
     
     fig2 = plot_evaluation_metrics(metrics)
-    fig2.write_html('evaluation_metrics.html')
+    metrics_plot_path = CONFIG['results_dir'] / 'evaluation_metrics.html'
+    fig2.write_html(metrics_plot_path)
     
-    print("\nPlots saved:")
-    print("  - training_history.html")
-    print("  - evaluation_metrics.html")
+    # Save metrics as JSON
+    metrics_json_path = CONFIG['results_dir'] / 'metrics.json'
+    with open(metrics_json_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    print(f"\nResults saved:")
+    print(f"  - Model: {model_path}")
+    print(f"  - Training history: {training_plot_path}")
+    print(f"  - Evaluation metrics: {metrics_plot_path}")
+    print(f"  - Metrics JSON: {metrics_json_path}")
+    
+    # Clean up checkpoint
+    if os.path.exists('best_model_checkpoint.pth'):
+        os.remove('best_model_checkpoint.pth')
     
     return model, train_dataset.scaler, metrics
 
