@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import logging
 from datetime import datetime, timedelta
+from tqdm import tqdm
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -636,6 +637,149 @@ def clean_all_categories(limit_per_category: Optional[int] = None) -> Dict:
     logger.info(f"Cleaned files saved to: {CLEANED_BASE}")
     
     return overall_summary
+
+def clean_category_with_gap_investigation(category: str, 
+                                        investigation_results: Optional[Dict] = None,
+                                        limit: Optional[int] = None) -> Dict:
+    """
+    Clean a category with optional gap investigation results to exclude problematic tokens
+    
+    Args:
+        category: Category to clean
+        investigation_results: Results from gap investigation (optional)
+        limit: Limit number of tokens to process
+        
+    Returns:
+        Dictionary with cleaning results
+    """
+    try:
+        # Get tokens to exclude based on investigation
+        tokens_to_exclude = set()
+        if investigation_results:
+            tokens_to_exclude.update(investigation_results.get('recommendations', {}).get('remove_completely', []))
+            print(f"Excluding {len(tokens_to_exclude)} tokens based on gap investigation")
+        
+        # Get source directory
+        source_dir = PROCESSED_BASE / category
+        if not source_dir.exists():
+            return {
+                'category': category,
+                'status': 'source_directory_not_found',
+                'source_dir': str(source_dir)
+            }
+        
+        # Get all parquet files
+        token_files = list(source_dir.glob("*.parquet"))
+        
+        if limit:
+            token_files = token_files[:limit]
+        
+        # Filter out excluded tokens
+        if tokens_to_exclude:
+            original_count = len(token_files)
+            token_files = [f for f in token_files if f.stem not in tokens_to_exclude]
+            excluded_count = original_count - len(token_files)
+            print(f"Filtered out {excluded_count} tokens from {category} based on gap investigation")
+        
+        if not token_files:
+            return {
+                'category': category,
+                'status': 'no_files_found_after_filtering',
+                'tokens_excluded': len(tokens_to_exclude)
+            }
+        
+        # Initialize cleaner and process files
+        cleaner = CategoryAwareTokenCleaner()
+        
+        results = {
+            'category': category,
+            'total_files': len(token_files),
+            'tokens_excluded_by_investigation': len(tokens_to_exclude),
+            'successful_cleanings': 0,
+            'failed_cleanings': 0,
+            'excluded_due_to_issues': 0,
+            'cleaning_logs': [],
+            'status': 'processing'
+        }
+        
+        print(f"\nCleaning {category} category...")
+        print(f"Processing {len(token_files)} files (excluded {len(tokens_to_exclude)} based on investigation)")
+        
+        for token_file in tqdm(token_files, desc=f"Cleaning {category}"):
+            log = cleaner.clean_token_file(token_file, category)
+            results['cleaning_logs'].append(log)
+            
+            if log['status'] == 'cleaned_successfully':
+                results['successful_cleanings'] += 1
+            elif log['status'] == 'excluded_due_to_severe_issues':
+                results['excluded_due_to_issues'] += 1
+            else:
+                results['failed_cleanings'] += 1
+        
+        results['status'] = 'completed'
+        
+        # Print summary
+        print(f"\n{category.upper()} CLEANING SUMMARY:")
+        print(f"  Total files processed: {results['total_files']}")
+        print(f"  Excluded by investigation: {results['tokens_excluded_by_investigation']}")
+        print(f"  Successfully cleaned: {results['successful_cleanings']}")
+        print(f"  Excluded due to issues: {results['excluded_due_to_issues']}")
+        print(f"  Failed: {results['failed_cleanings']}")
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Error cleaning category {category}: {e}")
+        return {
+            'category': category,
+            'status': 'error',
+            'error': str(e)
+        }
+
+def clean_all_categories_with_investigation(investigation_results: Optional[Dict] = None,
+                                          limit_per_category: Optional[int] = None) -> Dict:
+    """
+    Clean all categories with gap investigation results
+    
+    Args:
+        investigation_results: Results from gap investigation
+        limit_per_category: Limit tokens per category
+        
+    Returns:
+        Dictionary with all cleaning results
+    """
+    print("="*60)
+    print("CATEGORY-AWARE TOKEN CLEANING WITH GAP INVESTIGATION")
+    print("="*60)
+    
+    if investigation_results:
+        print(f"Using gap investigation results:")
+        for action, tokens in investigation_results.get('recommendations', {}).items():
+            print(f"  {action}: {len(tokens)} tokens")
+    
+    all_results = {}
+    
+    for category in CATEGORIES.keys():
+        print(f"\n{'='*20} {category.upper()} {'='*20}")
+        results = clean_category_with_gap_investigation(category, investigation_results, limit_per_category)
+        all_results[category] = results
+    
+    # Overall summary
+    total_processed = sum(r.get('total_files', 0) for r in all_results.values())
+    total_successful = sum(r.get('successful_cleanings', 0) for r in all_results.values())
+    total_excluded_investigation = sum(r.get('tokens_excluded_by_investigation', 0) for r in all_results.values())
+    total_excluded_issues = sum(r.get('excluded_due_to_issues', 0) for r in all_results.values())
+    
+    print(f"\n{'='*60}")
+    print("OVERALL CLEANING SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total files processed: {total_processed}")
+    print(f"Excluded by gap investigation: {total_excluded_investigation}")
+    print(f"Successfully cleaned: {total_successful}")
+    print(f"Excluded due to cleaning issues: {total_excluded_issues}")
+    print(f"Success rate: {total_successful/max(total_processed,1)*100:.1f}%")
+    
+    return all_results
 
 if __name__ == '__main__':
     # Example usage - clean all categories

@@ -252,14 +252,27 @@ def smart_data_split(all_paths: List[Path]) -> Tuple[List[Path], List[Path], Lis
     return train_paths, val_paths, test_paths
 
 
+# ================== DEVICE SELECTION ==================
+def get_device():
+    """Get best available device: MPS (Apple Silicon) > CUDA > CPU"""
+    if torch.backends.mps.is_available():
+        return 'mps'
+    elif torch.cuda.is_available():
+        return 'cuda'
+    else:
+        return 'cpu'
+
 # ================== TRAINING FUNCTIONS ==================
 def train_model(model: nn.Module,
                 train_loader: DataLoader,
                 val_loader: DataLoader,
                 num_epochs: int = 50,
                 learning_rate: float = 0.001,
-                device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+                device: str = None):
     """Train the LSTM model"""
+    
+    if device is None:
+        device = get_device()
     
     model = model.to(device)
     criterion = nn.MSELoss()
@@ -323,8 +336,11 @@ def train_model(model: nn.Module,
 def evaluate_model(model: nn.Module, 
                    test_loader: DataLoader,
                    scaler: StandardScaler,
-                   device: str = 'cuda'):
+                   device: str = None):
     """Calculate trading-specific metrics"""
+    
+    if device is None:
+        device = get_device()
     
     model.eval()
     all_predictions = []
@@ -593,7 +609,7 @@ def main():
     print("\nEvaluating on test set...")
     metrics, predictions, targets = evaluate_model(
         model, test_loader, train_dataset.scaler,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
+        device=get_device()
     )
     
     print("\nTest Set Metrics:")

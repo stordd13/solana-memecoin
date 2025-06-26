@@ -416,7 +416,8 @@ class DataQualityAnalyzer:
         
         for i, pf in enumerate(files_to_analyze):
             try:
-                df = pl.scan_parquet(pf)
+                # Use read_parquet instead of scan_parquet to get DataFrame instead of LazyFrame
+                df = pl.read_parquet(pf)
                 token_name = pf.name.split('_')[0]
                 report = self.analyze_single_file(df, token_name)
                 quality_reports.append(report)
@@ -490,7 +491,8 @@ class DataQualityAnalyzer:
     
     def identify_extreme_tokens(self, quality_reports: Dict) -> Dict[str, Dict]:
         """
-        Identify tokens with extreme price movements
+        Identify tokens with extreme price movements (third priority after gaps and normal)
+        Priority: gaps > normal > extremes > dead
         
         Args:
             quality_reports: Dictionary of quality reports from analyze_multiple_files
@@ -501,7 +503,22 @@ class DataQualityAnalyzer:
         extreme_tokens = {}
         
         for token, report in quality_reports.items():
-            if report.get('is_extreme_token', False):
+            # HIERARCHICAL EXCLUSION: Gaps and normal behavior tokens take priority over extreme classification
+            # UPDATED: Check for significant gaps (many gaps OR large gaps)
+            total_gaps = report.get('gaps', {}).get('total_gaps', 0)
+            max_gap = report.get('gaps', {}).get('max_gap', 0)
+            has_many_gaps = total_gaps > 5  # More than 5 gaps
+            has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+            has_significant_gaps = has_many_gaps or has_large_gap
+            
+            is_extreme = report.get('is_extreme_token', False)
+            is_dead = report.get('is_dead', False)
+            
+            # Check if token qualifies as normal behavior (second priority)
+            is_normal_behavior = not (has_significant_gaps or is_extreme or is_dead)
+            
+            # Only classify as extreme if NOT gaps and NOT normal behavior
+            if is_extreme and not (has_significant_gaps or is_normal_behavior):
                 extreme_tokens[token] = {
                     'token': token,
                     'max_minute_return': report.get('max_minute_return', 0),
@@ -513,7 +530,9 @@ class DataQualityAnalyzer:
                     'has_extreme_return': report.get('has_extreme_return', False),
                     'has_extreme_range': report.get('has_extreme_range', False),
                     'quality_score': report.get('quality_score', 0),
-                    'total_rows': report.get('total_rows', 0)
+                    'total_rows': report.get('total_rows', 0),
+                    'is_also_dead': report.get('is_dead', False),  # Track if also dead
+                    'note': 'Third priority: gaps > normal > extremes > dead (VALUABLE patterns)'
                 }
         
         return extreme_tokens
@@ -545,7 +564,8 @@ class DataQualityAnalyzer:
     
     def identify_normal_behavior_tokens(self, quality_reports: Dict) -> Dict[str, Dict]:
         """
-        Identify tokens with normal behavior (not in dead, gaps, or extremes categories)
+        Identify tokens with normal behavior (second priority after gaps)
+        Priority: gaps > normal > extremes > dead
         
         Args:
             quality_reports: Dictionary of quality reports from analyze_multiple_files
@@ -556,24 +576,28 @@ class DataQualityAnalyzer:
         normal_tokens = {}
         
         for token, report in quality_reports.items():
-            # Exclude tokens that are:
-            # - Dead (constant price for 4+ hours)
-            # - Have extreme movements
-            # - Have significant gaps
-            is_dead = report.get('is_dead', False)
-            is_extreme = report.get('is_extreme_token', False)
-            has_significant_gaps = report.get('gaps', {}).get('total_gaps', 0) > 5  # More than 5 gaps
+            # Check characteristics - UPDATED LOGIC
+            total_gaps = report.get('gaps', {}).get('total_gaps', 0)
+            max_gap = report.get('gaps', {}).get('max_gap', 0)
+            has_many_gaps = total_gaps > 5  # More than 5 gaps
+            has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+            has_significant_gaps = has_many_gaps or has_large_gap
             
-            # Only include tokens with normal behavior
-            if not (is_dead or is_extreme or has_significant_gaps):
+            is_extreme = report.get('is_extreme_token', False)
+            is_dead = report.get('is_dead', False)  
+            
+            # SECOND PRIORITY: Normal behavior tokens (after gaps are excluded)
+            # A token is normal if it has no gaps and none of the other problematic characteristics
+            if not (has_significant_gaps or is_extreme or is_dead):
                 normal_tokens[token] = {
                     'token': token,
                     'quality_score': report.get('quality_score', 0),
                     'total_rows': report.get('total_rows', 0),
                     'gaps': report.get('gaps', {}).get('total_gaps', 0),
-                    'is_dead': is_dead,
                     'is_extreme': is_extreme,
-                    'has_significant_gaps': has_significant_gaps
+                    'is_dead': is_dead,
+                    'has_significant_gaps': has_significant_gaps,
+                    'note': 'Second priority - normal behavior tokens (BEST for training)'
                 }
         
         return normal_tokens
@@ -601,6 +625,71 @@ class DataQualityAnalyzer:
             return exported
         except Exception as e:
             self.logger.error(f"Error exporting normal behavior tokens: {e}")
+            raise
+    
+    def identify_dead_tokens(self, quality_reports: Dict) -> Dict[str, Dict]:
+        """
+        Identify dead tokens (lowest priority after gaps, normal, and extreme)
+        Priority: gaps > normal > extremes > dead
+        
+        Args:
+            quality_reports: Dictionary of quality reports from analyze_multiple_files
+            
+        Returns:
+            Dictionary of dead tokens with their metrics
+        """
+        dead_tokens = {}
+        
+        for token, report in quality_reports.items():
+            # Check characteristics - UPDATED LOGIC
+            total_gaps = report.get('gaps', {}).get('total_gaps', 0)
+            max_gap = report.get('gaps', {}).get('max_gap', 0)
+            has_many_gaps = total_gaps > 5  # More than 5 gaps
+            has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+            has_significant_gaps = has_many_gaps or has_large_gap
+            
+            is_extreme = report.get('is_extreme_token', False)
+            is_dead = report.get('is_dead', False)
+            
+            # Check if token qualifies as normal behavior (second priority)
+            is_normal_behavior = not (has_significant_gaps or is_extreme or is_dead)
+            
+            # Only classify as dead if NOT gaps, normal, or extreme (lowest priority)
+            if is_dead and not (has_significant_gaps or is_normal_behavior or is_extreme):
+                dead_tokens[token] = {
+                    'token': token,
+                    'death_duration_hours': report.get('death_duration_hours', 0),
+                    'quality_score': report.get('quality_score', 0),
+                    'total_rows': report.get('total_rows', 0),
+                    'extreme_movements': report.get('extreme_movements', {}),
+                    'note': 'Lowest priority: gaps > normal > extremes > dead (COMPLETION data)'
+                }
+        
+        return dead_tokens
+
+    def export_dead_tokens(self, quality_reports: Dict) -> List[str]:
+        """
+        Export dead tokens to parquet files in data/processed/dead_tokens/
+        
+        Args:
+            quality_reports: Dictionary of quality reports
+            
+        Returns:
+            List of exported token names
+        """
+        dead_tokens = self.identify_dead_tokens(quality_reports)
+        
+        if not dead_tokens:
+            raise ValueError("No dead tokens found to export.")
+        
+        token_list = list(dead_tokens.keys())
+        
+        try:
+            exported = export_parquet_files(token_list, "Dead Tokens")
+            self.logger.info(f"Exported {len(exported)} dead tokens to data/processed/dead_tokens/")
+            return exported
+        except Exception as e:
+            self.logger.error(f"Error exporting dead tokens: {e}")
             raise
     
     def recommend_tokens_for_analysis(self, quality_df: pl.DataFrame, 
@@ -919,3 +1008,486 @@ class DataQualityAnalyzer:
         # Convert minutes to whole hours
         constant_hours = constant_minutes // 60
         return int(constant_hours)
+
+    def debug_gap_detection(self, quality_reports: Dict, min_gap_size: float = 10.0) -> Dict:
+        """
+        Debug function to help identify tokens with large gaps that might not be getting detected
+        
+        Args:
+            quality_reports: Dictionary of quality reports
+            min_gap_size: Minimum gap size in minutes to report
+            
+        Returns:
+            Dictionary of debug information
+        """
+        print(f"\n🔍 DEBUG: Gap Detection Analysis (gaps >= {min_gap_size} minutes)")
+        print("=" * 70)
+        
+        tokens_with_large_gaps = {}
+        gap_size_distribution = []
+        
+        for token, report in quality_reports.items():
+            gaps_info = report.get('gaps', {})
+            total_gaps = gaps_info.get('total_gaps', 0)
+            max_gap = gaps_info.get('max_gap', 0)
+            gap_details = gaps_info.get('gap_details', [])
+            
+            # Find gaps larger than threshold
+            large_gaps = [g for g in gap_details if g.get('size_minutes', 0) >= min_gap_size]
+            
+            if large_gaps:
+                tokens_with_large_gaps[token] = {
+                    'total_gaps': total_gaps,
+                    'large_gaps_count': len(large_gaps),
+                    'max_gap_minutes': max_gap,
+                    'large_gap_sizes': [g.get('size_minutes', 0) for g in large_gaps],
+                    'quality_score': report.get('quality_score', 0),
+                    'total_rows': report.get('total_rows', 0)
+                }
+                
+                # Collect all gap sizes for distribution analysis
+                gap_size_distribution.extend([g.get('size_minutes', 0) for g in gap_details])
+        
+        # Print summary
+        print(f"📊 SUMMARY:")
+        print(f"  Tokens with gaps >= {min_gap_size} minutes: {len(tokens_with_large_gaps)}")
+        print(f"  NEW threshold for 'significant gaps': >5 total gaps OR >30 minute gap")
+        print(f"  Tokens meeting old threshold (>5 gaps only): {len([t for t, r in quality_reports.items() if r.get('gaps', {}).get('total_gaps', 0) > 5])}")
+        print(f"  Tokens meeting NEW threshold (>5 gaps OR >30min gap): {len([t for t, r in quality_reports.items() if (r.get('gaps', {}).get('total_gaps', 0) > 5) or (r.get('gaps', {}).get('max_gap', 0) > 30)])}")
+        
+        if tokens_with_large_gaps:
+            print(f"\n📈 TOP TOKENS WITH LARGE GAPS:")
+            sorted_tokens = sorted(tokens_with_large_gaps.items(), 
+                                 key=lambda x: x[1]['max_gap_minutes'], reverse=True)
+            
+            for i, (token, info) in enumerate(sorted_tokens[:10]):  # Show top 10
+                print(f"  {i+1:2}. {token[:20]:20} | Max gap: {info['max_gap_minutes']:6.1f}m | Total gaps: {info['total_gaps']:2} | Large gaps: {info['large_gaps_count']}")
+        
+        if gap_size_distribution:
+            import numpy as np
+            gaps_array = np.array(gap_size_distribution)
+            print(f"\n📏 GAP SIZE DISTRIBUTION:")
+            print(f"  Total gaps found: {len(gaps_array)}")
+            print(f"  Min gap size: {gaps_array.min():.1f} minutes")
+            print(f"  Max gap size: {gaps_array.max():.1f} minutes")
+            print(f"  Mean gap size: {gaps_array.mean():.1f} minutes")
+            print(f"  Median gap size: {np.median(gaps_array):.1f} minutes")
+            print(f"  Gaps >= 60 minutes: {len(gaps_array[gaps_array >= 60])}")
+            print(f"  Gaps >= 30 minutes: {len(gaps_array[gaps_array >= 30])}")
+            print(f"  Gaps >= 10 minutes: {len(gaps_array[gaps_array >= 10])}")
+        
+        return {
+            'tokens_with_large_gaps': tokens_with_large_gaps,
+            'gap_size_distribution': gap_size_distribution,
+            'current_threshold_count': len([t for t, r in quality_reports.items() if r.get('gaps', {}).get('total_gaps', 0) > 5])
+        }
+
+    def identify_tokens_with_gaps(self, quality_reports: Dict, debug: bool = False) -> Dict[str, Dict]:
+        """
+        Identify tokens with significant gaps (highest priority - exclude from training)
+        Priority: gaps > normal > extremes > dead
+        
+        Uses EITHER condition:
+        - More than 5 total gaps, OR
+        - Any single gap larger than 30 minutes
+        
+        Args:
+            quality_reports: Dictionary of quality reports from analyze_multiple_files
+            
+        Returns:
+            Dictionary of tokens with gaps and their metrics
+        """
+        gap_tokens = {}
+        
+        for token, report in quality_reports.items():
+            # Check characteristics - UPDATED LOGIC
+            total_gaps = report.get('gaps', {}).get('total_gaps', 0)
+            max_gap = report.get('gaps', {}).get('max_gap', 0)
+            
+            # NEW: Significant gaps = many small gaps OR one large gap
+            has_many_gaps = total_gaps > 5  # More than 5 gaps
+            has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+            has_significant_gaps = has_many_gaps or has_large_gap
+            
+            # Classify as gap token if it has significant gaps (highest priority)
+            if has_significant_gaps:
+                gap_tokens[token] = {
+                    'token': token,
+                    'total_gaps': total_gaps,
+                    'max_gap': max_gap,
+                    'avg_gap': report.get('gaps', {}).get('avg_gap', 0),
+                    'quality_score': report.get('quality_score', 0),
+                    'total_rows': report.get('total_rows', 0),
+                    'gap_type': 'many_gaps' if has_many_gaps else 'large_gap',
+                    'note': 'Highest priority: gaps > normal > extremes > dead (EXCLUDE from training)'
+                }
+        
+        return gap_tokens
+
+    def export_tokens_with_gaps(self, quality_reports: Dict) -> List[str]:
+        """
+        Export tokens with gaps to parquet files in data/processed/tokens_with_gaps/
+        
+        Args:
+            quality_reports: Dictionary of quality reports
+            
+        Returns:
+            List of exported token names
+        """
+        gap_tokens = self.identify_tokens_with_gaps(quality_reports)
+        
+        if not gap_tokens:
+            raise ValueError("No tokens with gaps found to export.")
+        
+        token_list = list(gap_tokens.keys())
+        
+        try:
+            exported = export_parquet_files(token_list, "Tokens with Gaps")
+            self.logger.info(f"Exported {len(exported)} tokens with gaps to data/processed/tokens_with_gaps/")
+            return exported
+        except Exception as e:
+            self.logger.error(f"Error exporting tokens with gaps: {e}")
+            raise
+
+    def export_all_categories_mutually_exclusive(self, quality_reports: Dict) -> Dict[str, List[str]]:
+        """
+        Export ALL categories with strict mutual exclusivity enforcement.
+        Each token appears in EXACTLY ONE category based on hierarchy: gaps > normal > extremes > dead
+        
+        Args:
+            quality_reports: Dictionary of quality reports
+            
+        Returns:
+            Dictionary with category names as keys and token lists as values
+        """
+        print("\n🔄 EXPORTING MUTUALLY EXCLUSIVE CATEGORIES")
+        print("=" * 60)
+        print("📊 Hierarchy: gaps > normal > extremes > dead")
+        
+        # Step 1: Categorize all tokens with strict hierarchy
+        categorized_tokens = {
+            'normal_behavior_tokens': [],
+            'tokens_with_extremes': [],
+            'dead_tokens': [],
+            'tokens_with_gaps': []
+        }
+        
+        overlap_stats = {
+            'normal_also_extreme': 0,
+            'normal_also_dead': 0,
+            'normal_also_gaps': 0,
+            'extreme_also_dead': 0,
+            'extreme_also_gaps': 0,
+            'dead_also_gaps': 0,
+            'total_overlaps_resolved': 0
+        }
+        
+        for token, report in quality_reports.items():
+            # Check all characteristics
+            is_extreme = report.get('is_extreme_token', False)
+            is_dead = report.get('is_dead', False)
+            
+            # UPDATED: Check for significant gaps (many gaps OR large gaps)
+            total_gaps = report.get('gaps', {}).get('total_gaps', 0)
+            max_gap = report.get('gaps', {}).get('max_gap', 0)
+            has_many_gaps = total_gaps > 5  # More than 5 gaps
+            has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+            has_significant_gaps = has_many_gaps or has_large_gap
+            
+            # Check if token qualifies as normal behavior
+            is_normal_behavior = not (is_extreme or is_dead or has_significant_gaps)
+            
+            # Track overlaps for statistics
+            if is_normal_behavior and is_extreme:
+                overlap_stats['normal_also_extreme'] += 1
+            if is_normal_behavior and is_dead:
+                overlap_stats['normal_also_dead'] += 1
+            if is_normal_behavior and has_significant_gaps:
+                overlap_stats['normal_also_gaps'] += 1
+            if is_extreme and is_dead:
+                overlap_stats['extreme_also_dead'] += 1
+            if is_extreme and has_significant_gaps:
+                overlap_stats['extreme_also_gaps'] += 1
+            if is_dead and has_significant_gaps:
+                overlap_stats['dead_also_gaps'] += 1
+            
+            # STRICT HIERARCHICAL ASSIGNMENT (each token goes to EXACTLY ONE category)
+            # Priority: gaps > normal > extremes > dead
+            if has_significant_gaps:
+                categorized_tokens['tokens_with_gaps'].append(token)
+                if is_normal_behavior or is_extreme or is_dead:
+                    overlap_stats['total_overlaps_resolved'] += 1
+            elif is_normal_behavior:
+                categorized_tokens['normal_behavior_tokens'].append(token)
+                if is_extreme or is_dead:
+                    overlap_stats['total_overlaps_resolved'] += 1
+            elif is_extreme:
+                categorized_tokens['tokens_with_extremes'].append(token)
+                if is_dead:
+                    overlap_stats['total_overlaps_resolved'] += 1
+            elif is_dead:
+                categorized_tokens['dead_tokens'].append(token)
+        
+        # Step 2: Display categorization summary
+        print(f"\n📈 CATEGORIZATION RESULTS:")
+        total_tokens = len(quality_reports)
+        for category, tokens in categorized_tokens.items():
+            pct = (len(tokens) / total_tokens) * 100 if total_tokens > 0 else 0
+            print(f"  {category:25}: {len(tokens):,} tokens ({pct:.1f}%)")
+        
+        print(f"\n🔍 OVERLAP RESOLUTION:")
+        print(f"  Normal tokens that were also extreme:   {overlap_stats['normal_also_extreme']:,}")
+        print(f"  Normal tokens that were also dead:      {overlap_stats['normal_also_dead']:,}")
+        print(f"  Normal tokens that also had gaps:       {overlap_stats['normal_also_gaps']:,}")
+        print(f"  Extreme tokens that were also dead:     {overlap_stats['extreme_also_dead']:,}")
+        print(f"  Extreme tokens that also had gaps:      {overlap_stats['extreme_also_gaps']:,}")
+        print(f"  Dead tokens that also had gaps:         {overlap_stats['dead_also_gaps']:,}")
+        print(f"  Total overlaps resolved:                {overlap_stats['total_overlaps_resolved']:,}")
+        
+        # Step 3: Export each category
+        exported_results = {}
+        
+        for category, tokens in categorized_tokens.items():
+            if tokens:
+                try:
+                    # Map category names to export group names
+                    group_name_map = {
+                        'normal_behavior_tokens': 'Normal Behavior Tokens',
+                        'tokens_with_extremes': 'Tokens with Extremes',
+                        'dead_tokens': 'Dead Tokens',
+                        'tokens_with_gaps': 'Tokens with Gaps'
+                    }
+                    
+                    group_name = group_name_map[category]
+                    exported = export_parquet_files(tokens, group_name)
+                    exported_results[category] = exported
+                    
+                    print(f"✅ Exported {len(exported):,} tokens to {category}/")
+                    
+                except Exception as e:
+                    print(f"❌ Error exporting {category}: {e}")
+                    exported_results[category] = []
+            else:
+                print(f"⚠️  No tokens found for {category}")
+                exported_results[category] = []
+        
+        print(f"\n✅ EXPORT COMPLETE - All categories are now mutually exclusive!")
+        print(f"   Total tokens processed: {total_tokens:,}")
+        print(f"   Total tokens exported: {sum(len(tokens) for tokens in exported_results.values()):,}")
+        
+        return exported_results
+
+    def investigate_tokens_with_gaps(self, quality_reports: Dict) -> Dict:
+        """
+        Comprehensive investigation of tokens with gaps to help decide whether to keep or remove them
+        
+        Returns:
+            Dictionary with detailed analysis of each token with gaps
+        """
+        print(f"\n🔍 INVESTIGATING TOKENS WITH GAPS")
+        print("=" * 70)
+        
+        # Get tokens with gaps
+        total_gaps = quality_reports.get('gaps', {}).get('total_gaps', 0)
+        max_gap = quality_reports.get('gaps', {}).get('max_gap', 0)
+        has_many_gaps = total_gaps > 5  # More than 5 gaps
+        has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+        
+        tokens_with_gaps = {}
+        investigation_results = {
+            'tokens_analyzed': 0,
+            'recommendations': {
+                'keep_and_clean': [],
+                'remove_completely': [],
+                'needs_manual_review': []
+            },
+            'gap_analysis': {
+                'small_gaps_only': [],      # <5 min gaps, easy to fill
+                'medium_gaps': [],          # 5-30 min gaps, fillable
+                'large_gaps': [],           # >30 min gaps, problematic
+                'excessive_gaps': []        # >10 gaps total, very problematic
+            },
+            'detailed_analysis': {}
+        }
+        
+        for token, report in quality_reports.items():
+            gaps_info = report.get('gaps', {})
+            total_gaps = gaps_info.get('total_gaps', 0)
+            max_gap = gaps_info.get('max_gap', 0)
+            
+            # Check if token has significant gaps
+            has_many_gaps = total_gaps > 5
+            has_large_gap = max_gap > 30
+            
+            if has_many_gaps or has_large_gap:
+                investigation_results['tokens_analyzed'] += 1
+                
+                # Detailed analysis of this token
+                token_analysis = self._analyze_gap_token_detailed(token, report)
+                investigation_results['detailed_analysis'][token] = token_analysis
+                
+                # Categorize by gap severity
+                if total_gaps > 10:
+                    investigation_results['gap_analysis']['excessive_gaps'].append(token)
+                elif max_gap > 30:
+                    investigation_results['gap_analysis']['large_gaps'].append(token)
+                elif max_gap > 5:
+                    investigation_results['gap_analysis']['medium_gaps'].append(token)
+                else:
+                    investigation_results['gap_analysis']['small_gaps_only'].append(token)
+                
+                # Make recommendation
+                recommendation = self._recommend_gap_token_action(token_analysis)
+                investigation_results['recommendations'][recommendation].append(token)
+        
+        # Print summary
+        self._print_gap_investigation_summary(investigation_results)
+        
+        return investigation_results
+    
+    def _analyze_gap_token_detailed(self, token: str, report: Dict) -> Dict:
+        """Detailed analysis of a single token with gaps"""
+        gaps_info = report.get('gaps', {})
+        
+        analysis = {
+            'token': token,
+            'total_gaps': gaps_info.get('total_gaps', 0),
+            'max_gap_minutes': gaps_info.get('max_gap', 0),
+            'avg_gap_minutes': gaps_info.get('avg_gap', 0),
+            'total_data_points': report.get('total_rows', 0),
+            'quality_score': report.get('quality_score', 0),
+            'completeness_pct': report.get('completeness_pct', 0),
+            'time_span_hours': report.get('time_span_hours', 0),
+            'data_density': 0,  # data points per hour
+            'gap_severity': 'unknown',
+            'data_quality': 'unknown',
+            'trading_activity': 'unknown',
+            'recommendation_factors': []
+        }
+        
+        # Calculate data density
+        if analysis['time_span_hours'] > 0:
+            analysis['data_density'] = analysis['total_data_points'] / analysis['time_span_hours']
+        
+        # Assess gap severity
+        if analysis['total_gaps'] > 10:
+            analysis['gap_severity'] = 'excessive'
+            analysis['recommendation_factors'].append('Too many gaps (>10)')
+        elif analysis['max_gap_minutes'] > 60:
+            analysis['gap_severity'] = 'severe'
+            analysis['recommendation_factors'].append('Very large gaps (>1 hour)')
+        elif analysis['max_gap_minutes'] > 30:
+            analysis['gap_severity'] = 'moderate'
+            analysis['recommendation_factors'].append('Large gaps (>30 min)')
+        else:
+            analysis['gap_severity'] = 'minor'
+            analysis['recommendation_factors'].append('Small gaps (<30 min)')
+        
+        # Assess overall data quality
+        if analysis['quality_score'] > 80:
+            analysis['data_quality'] = 'high'
+            analysis['recommendation_factors'].append('High quality score')
+        elif analysis['quality_score'] > 60:
+            analysis['data_quality'] = 'medium'
+            analysis['recommendation_factors'].append('Medium quality score')
+        else:
+            analysis['data_quality'] = 'low'
+            analysis['recommendation_factors'].append('Low quality score')
+        
+        # Assess trading activity
+        if analysis['data_density'] > 50:  # >50 data points per hour
+            analysis['trading_activity'] = 'high'
+            analysis['recommendation_factors'].append('High trading activity')
+        elif analysis['data_density'] > 20:
+            analysis['trading_activity'] = 'medium'
+            analysis['recommendation_factors'].append('Medium trading activity')
+        else:
+            analysis['trading_activity'] = 'low'
+            analysis['recommendation_factors'].append('Low trading activity')
+        
+        return analysis
+    
+    def _recommend_gap_token_action(self, analysis: Dict) -> str:
+        """Recommend action for a token with gaps based on analysis"""
+        
+        # Automatic removal criteria
+        if (analysis['total_gaps'] > 15 or 
+            analysis['max_gap_minutes'] > 120 or 
+            analysis['quality_score'] < 40):
+            return 'remove_completely'
+        
+        # Automatic keep and clean criteria
+        if (analysis['total_gaps'] <= 3 and 
+            analysis['max_gap_minutes'] <= 10 and 
+            analysis['quality_score'] > 70):
+            return 'keep_and_clean'
+        
+        # Manual review criteria (borderline cases)
+        if (analysis['total_gaps'] <= 8 and 
+            analysis['max_gap_minutes'] <= 60 and 
+            analysis['quality_score'] > 50):
+            return 'needs_manual_review'
+        
+        # Default to removal for problematic cases
+        return 'remove_completely'
+    
+    def _print_gap_investigation_summary(self, results: Dict):
+        """Print comprehensive summary of gap investigation"""
+        
+        print(f"\n📊 GAP INVESTIGATION SUMMARY")
+        print(f"Tokens analyzed: {results['tokens_analyzed']}")
+        print(f"=" * 50)
+        
+        # Recommendations summary
+        print(f"\n🎯 RECOMMENDATIONS:")
+        for action, tokens in results['recommendations'].items():
+            action_name = action.replace('_', ' ').title()
+            print(f"  {action_name}: {len(tokens)} tokens")
+            if tokens:
+                print(f"    Examples: {', '.join(tokens[:3])}")
+                if len(tokens) > 3:
+                    print(f"    ... and {len(tokens) - 3} more")
+        
+        # Gap severity breakdown
+        print(f"\n🔍 GAP SEVERITY BREAKDOWN:")
+        for severity, tokens in results['gap_analysis'].items():
+            severity_name = severity.replace('_', ' ').title()
+            print(f"  {severity_name}: {len(tokens)} tokens")
+        
+        # Detailed recommendations
+        print(f"\n💡 DETAILED RECOMMENDATIONS:")
+        
+        keep_tokens = results['recommendations']['keep_and_clean']
+        if keep_tokens:
+            print(f"\n✅ KEEP AND CLEAN ({len(keep_tokens)} tokens):")
+            print(f"   These tokens have minor gaps that can be filled effectively")
+            print(f"   → Run data cleaning with 'aggressive' strategy")
+            
+        remove_tokens = results['recommendations']['remove_completely']
+        if remove_tokens:
+            print(f"\n❌ REMOVE COMPLETELY ({len(remove_tokens)} tokens):")
+            print(f"   These tokens have too many/large gaps for reliable analysis")
+            print(f"   → Exclude from training data entirely")
+            
+        review_tokens = results['recommendations']['needs_manual_review']
+        if review_tokens:
+            print(f"\n🤔 NEEDS MANUAL REVIEW ({len(review_tokens)} tokens):")
+            print(f"   These tokens are borderline cases")
+            print(f"   → Examine individual tokens to make final decision")
+            
+            # Show details for manual review tokens
+            for token in review_tokens[:5]:  # Show first 5
+                if token in results['detailed_analysis']:
+                    analysis = results['detailed_analysis'][token]
+                    print(f"\n   📋 {token}:")
+                    print(f"      Gaps: {analysis['total_gaps']} (max: {analysis['max_gap_minutes']:.1f} min)")
+                    print(f"      Quality: {analysis['quality_score']:.1f}/100")
+                    print(f"      Activity: {analysis['data_density']:.1f} points/hour")
+                    print(f"      Factors: {', '.join(analysis['recommendation_factors'][:2])}")
+        
+        print(f"\n🔧 NEXT STEPS:")
+        print(f"1. Review the recommendations above")
+        print(f"2. For 'keep_and_clean' tokens: Run data cleaning")
+        print(f"3. For 'remove_completely' tokens: Exclude from analysis")
+        print(f"4. For 'needs_manual_review' tokens: Examine individually")
+        print(f"5. Update your token categorization accordingly")

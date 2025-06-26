@@ -1,6 +1,10 @@
 """
 Directional Prediction with LightGBM for Memecoin Price Movement
-This model uses engineered features to predict UP/DOWN movement.
+This model loads pre-engineered features from the feature_engineering module.
+
+IMPORTANT WORKFLOW:
+1. Run feature_engineering/advanced_feature_engineering.py FIRST
+2. Then run this script to train on pre-engineered features
 
 IMPORTANT NOTES ON DATA LEAKAGE AND RESULTS:
 - Fixed temporal data leakage by splitting each token temporally before feature engineering
@@ -12,7 +16,6 @@ IMPORTANT NOTES ON DATA LEAKAGE AND RESULTS:
 
 import polars as pl
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -22,19 +25,18 @@ import joblib
 import json
 import numpy as np
 
-# Use local smart_data_split function for consistency
-
 # --- Configuration ---
 CONFIG = {
     'base_dir': Path("data/cleaned"),
+    'features_dir': Path("data/features"),  # NEW: Pre-engineered features directory
     'results_dir': Path("ML/results/lightgbm_short_term"),
     'categories': [
-        "normal_behavior_tokens",
-        "tokens_with_gaps",
-        "tokens_with_extremes",
-        "dead_tokens",  # Include dead tokens for learning death patterns
+        "normal_behavior_tokens",      # Highest quality for training
+        "tokens_with_extremes",        # Valuable volatile patterns  
+        "dead_tokens",                 # Complete token lifecycles
+        # "tokens_with_gaps",          # EXCLUDED: Data quality issues
     ],
-    'lookback': 60,  # 1 hour lookback for short-term patterns
+    'min_lookback': 3,   # Start predicting at minute 3
     'horizons': [15, 30, 60],  # 15min, 30min, 1h - short-term trading
     'n_estimators': 500,
     'random_state': 42,
@@ -48,107 +50,76 @@ CONFIG = {
         'bagging_fraction': 0.8,
         'verbosity': -1,
         'seed': 42,
-    }
+    },
+    # Note: deduplicate_tokens removed - handled upstream in data_analysis
 }
 
 
-# --- Feature Engineering with Polars ---
-def create_features(df: pl.DataFrame, lookback: int) -> pl.DataFrame:
-    """
-    Engineers a rich set of features from raw price data using Polars.
-    """
-    if 'datetime' not in df.columns:
-        df = df.with_columns(
-            pl.from_epoch("timestamp", time_unit="ms").alias("datetime")
-        )
-    else:
-        # Fix datetime precision inconsistency across files
-        df = df.with_columns(
-            pl.col('datetime').dt.cast_time_unit('ns').alias('datetime')
-        )
-
-    df = df.sort('datetime')
-    
-    # Handle NaN values in price column by forward filling
-    prices = df['price'].to_numpy()
-    
-    # Check for NaN values - if found, drop this token entirely for cleaner data
-    if np.isnan(prices).any():
-        nan_count = np.isnan(prices).sum()
-        print(f"Dropping token with {nan_count} NaN values for cleaner baseline")
+# --- NEW: Load Pre-Engineered Features ---
+def load_features_from_file(features_path: Path) -> pl.DataFrame:
+    """Load pre-engineered features from feature engineering output"""
+    try:
+        # Assume features are saved as parquet files by feature engineering module
+        if features_path.exists():
+            return pl.read_parquet(features_path)
+        else:
+            print(f"Features file not found: {features_path}")
+            return None
+    except Exception as e:
+        print(f"Error loading features from {features_path}: {e}")
         return None
-    
-    # Update the dataframe with filled prices
-    df = df.with_columns(pl.Series(prices).alias('price'))
-    
-    # --- Time-based Features ---
-    df = df.with_columns([
-        pl.col('datetime').dt.hour().alias('hour'),
-        pl.col('datetime').dt.weekday().alias('weekday'),
-    ])
 
-    # --- Lag Features ---
-    lags = [1, 2, 3, 5, 10, 15, 30, 60]
-    df = df.with_columns(
-        [pl.col('price').shift(i).alias(f'price_lag_{i}') for i in lags]
-    )
 
-    # --- Rolling Window Features ---
-    windows = [5, 15, 30, 60]
-    df = df.with_columns(
-        [pl.col('price').rolling_mean(w).alias(f'price_rolling_mean_{w}') for w in windows] +
-        [pl.col('price').rolling_std(w).alias(f'price_rolling_std_{w}') for w in windows]
-    )
-
-    # --- Momentum Indicators (RSI) ---
-    delta = df.get_column('price').diff()
-    gain = delta.clip(lower_bound=0).fill_null(0)
-    loss = (-delta).clip(lower_bound=0).fill_null(0)
+def create_labels_for_horizons(df: pl.DataFrame, horizons: List[int]) -> pl.DataFrame:
+    """Create directional labels for multiple horizons"""
+    if 'price' not in df.columns:
+        return df
+        
+    # Add labels for each horizon
+    for h in horizons:
+        df = df.with_columns([
+            (pl.col('price').shift(-h) > pl.col('price')).alias(f'label_{h}m')
+        ])
     
-    avg_gain = gain.ewm_mean(span=14, adjust=False)
-    avg_loss = loss.ewm_mean(span=14, adjust=False)
-    
-    rs = avg_gain / avg_loss.replace(0, 1e-8) # Avoid division by zero
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    df = df.with_columns(rsi.alias('rsi_14'))
-    
-    # Price compared to rolling means
-    df = df.with_columns(
-        [(pl.col('price') / pl.col(f'price_rolling_mean_{w}') - 1).alias(f'price_pct_from_mean_{w}') for w in windows]
-    )
-    
-    # Create labels for each horizon BEFORE dropping nulls
-    for h in CONFIG['horizons']:
-        df = df.with_columns(
-            (pl.col('price').shift(-h) > pl.col('price')).cast(pl.Int8).alias(f'label_{h}m')
-        )
-    
-    return df.drop_nulls()
+    return df
 
 
 # --- Data Preparation ---
-def prepare_data_fixed(data_paths: List[Path], lookback: int, horizons: List[int], split_type: str = 'all') -> pl.DataFrame:
+def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: str = 'all') -> pl.DataFrame:
     """
-    FIXED: Temporal splitting within each token to prevent data leakage
-    Each token contributes to train/val/test based on TIME, not randomness
+    FIXED: Load pre-engineered features and apply temporal splitting
     """
-    max_horizon = max(horizons)
-    min_required = lookback + max_horizon + 20
-    
     all_samples = []
     processed_tokens = 0
     
-    print(f"Processing {len(data_paths)} tokens with temporal splitting (split_type: {split_type})...")
+    print(f"Loading pre-engineered features for {len(data_paths)} tokens ({split_type} split)...")
     
-    for path in tqdm(data_paths, desc=f"Creating {split_type} split"):
+    for path in tqdm(data_paths, desc=f"Loading {split_type} features"):
         try:
-            df = pl.read_parquet(path)
+            # Check if pre-engineered features exist
+            token_name = path.stem
+            features_path = CONFIG['features_dir'] / f"{token_name}_features.parquet"
             
-            if len(df) < min_required:
+            if not features_path.exists():
+                print(f"No pre-engineered features found for {token_name}, skipping...")
                 continue
-                
-            # CRITICAL FIX: Split FIRST, then create features to prevent future leakage
-            n_rows = df.height
+            
+            # Load pre-engineered features
+            features_df = load_features_from_file(features_path)
+            if features_df is None or len(features_df) == 0:
+                continue
+            
+            # Create directional labels
+            features_df = create_labels_for_horizons(features_df, horizons)
+            
+            # CRITICAL FIX: Split FIRST, then use features to prevent future leakage
+            # Handle both DataFrame and LazyFrame
+            if hasattr(features_df, 'height'):
+                n_rows = features_df.height
+            else:
+                # If it's a LazyFrame, collect it first
+                features_df = features_df.collect()
+                n_rows = features_df.height
             
             if split_type == 'train':
                 start_idx = 0
@@ -164,21 +135,16 @@ def prepare_data_fixed(data_paths: List[Path], lookback: int, horizons: List[int
                 end_idx = n_rows
             
             # Only include if we have enough samples for this split
-            if end_idx - start_idx < min_required:
+            if end_idx - start_idx < 20:  # Need at least 20 samples
                 continue
                 
-            # Split the raw data first
-            token_split = df.slice(start_idx, end_idx - start_idx)
-            
-            # Now create features ONLY on this temporal split
-            featured_df = create_features(token_split, lookback)
-            if featured_df is None or featured_df.height == 0:
-                continue
+            # Split the features temporally
+            token_split = features_df.slice(start_idx, end_idx - start_idx)
             
             # Add token identifier
-            featured_df = featured_df.with_columns(pl.lit(path.stem).alias('token_id'))
+            token_split = token_split.with_columns(pl.lit(path.stem).alias('token_id'))
             
-            all_samples.append(featured_df)
+            all_samples.append(token_split)
             processed_tokens += 1
                 
         except Exception as e:
@@ -188,7 +154,7 @@ def prepare_data_fixed(data_paths: List[Path], lookback: int, horizons: List[int
     print(f"Successfully processed {processed_tokens} tokens")
     
     if not all_samples:
-        print("ERROR: No valid token splits created!")
+        print("ERROR: No valid feature splits created!")
         return pl.DataFrame()
     
     # Concatenate all splits
@@ -207,7 +173,12 @@ def prepare_data_fixed(data_paths: List[Path], lookback: int, horizons: List[int
 def train_and_evaluate(train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl.DataFrame, horizon: int, params: dict):
     """Trains a LightGBM model for a specific horizon and evaluates it."""
     label_col = f'label_{horizon}m'
-    feature_cols = [col for col in train_df.columns if col.startswith(('price_', 'hour', 'weekday', 'rsi'))]
+    
+    # Select feature columns (exclude metadata and labels)
+    exclude_cols = ['token_id', 'datetime', 'price'] + [f'label_{h}m' for h in CONFIG['horizons']]
+    feature_cols = [col for col in train_df.columns if col not in exclude_cols]
+    
+    print(f"Using {len(feature_cols)} pre-engineered features for {horizon}m prediction")
 
     # Convert to pandas/numpy for scikit-learn API
     X_train = train_df[feature_cols].to_pandas()
@@ -270,7 +241,7 @@ def plot_metrics(metrics: Dict):
     
     fig.update_layout(
         barmode='group',
-        title='Short-Term LightGBM: Performance Metrics (Balanced Data ~50/50)',
+        title='Short-Term LightGBM: Performance Metrics (Pre-Engineered Features)',
         xaxis_title='Prediction Horizon',
         yaxis_title='Score',
         yaxis_range=[0.0, 1.0],
@@ -278,11 +249,11 @@ def plot_metrics(metrics: Dict):
         template='plotly_white'
     )
     
-    # Add annotation explaining the balanced nature
+    # Add annotation explaining the pre-engineered features
     fig.add_annotation(
         x=0.02, y=0.98,
         xref="paper", yref="paper",
-        text="<b>Balanced Dataset (49% UP, 51% DOWN):</b><br>• Accuracy is the primary metric<br>• 85-90% accuracy is genuinely impressive<br>• All metrics are meaningful and valid",
+        text="<b>Using Pre-Engineered Features:</b><br>• Log-returns, technical indicators<br>• FFT analysis, statistical moments<br>• MACD, Bollinger Bands, RSI+<br>• No in-script feature engineering",
         showarrow=False,
         font=dict(size=10),
         bgcolor="rgba(255,255,255,0.8)",
@@ -299,8 +270,17 @@ def main():
     """Main training pipeline for the short-term LightGBM model."""
     print("="*50)
     print("Training Short-Term LightGBM Directional Model")
+    print("USING PRE-ENGINEERED FEATURES")
     print("Horizons: 15min, 30min, 1h")
     print("="*50)
+    
+    # Check if feature engineering has been run
+    if not CONFIG['features_dir'].exists():
+        print(f"\n❌ ERROR: Features directory not found: {CONFIG['features_dir']}")
+        print("\n🔧 REQUIRED STEP: Run feature engineering first!")
+        print("   python feature_engineering/advanced_feature_engineering.py")
+        print("\nThis will create the pre-engineered features needed for training.")
+        return
     
     # Create results directory
     CONFIG['results_dir'].mkdir(parents=True, exist_ok=True)
@@ -317,16 +297,19 @@ def main():
         print(f"ERROR: No files found in {CONFIG['base_dir']}. Exiting.")
         return
 
+    # Note: Token deduplication is now handled upstream in data_analysis
+    # Each token should appear in exactly one category folder
+
     # FIXED: Use temporal splitting within tokens instead of random token splits
-    print("\n🔧 APPLYING DATA LEAKAGE FIX: Temporal splitting within tokens")
+    print("\n🔧 LOADING PRE-ENGINEERED FEATURES with temporal splitting")
     
     # Use all paths for temporal splitting within each token
-    train_df = prepare_data_fixed(all_paths, CONFIG['lookback'], CONFIG['horizons'], 'train')
-    val_df = prepare_data_fixed(all_paths, CONFIG['lookback'], CONFIG['horizons'], 'val')
-    test_df = prepare_data_fixed(all_paths, CONFIG['lookback'], CONFIG['horizons'], 'test')
+    train_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'train')
+    val_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'val')
+    test_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'test')
 
     if train_df.is_empty() or val_df.is_empty() or test_df.is_empty():
-        print("ERROR: One or more data splits are empty. Exiting.")
+        print("ERROR: One or more data splits are empty. Check feature engineering output.")
         return
 
     # Train a model for each horizon
@@ -360,52 +343,6 @@ def main():
     fig.write_html(plot_path)
     print(f"Metrics plot saved to: {plot_path}")
 
-def smart_data_split(data_paths: List[Path], 
-                    test_size: float = 0.2, 
-                    val_size: float = 0.2, 
-                    random_state: int = 42) -> Tuple[List[Path], List[Path], List[Path]]:
-    """Split data ensuring no leakage between train/val/test sets"""
-    total_files = len(data_paths)
-    
-    np.random.seed(random_state)
-    np.random.shuffle(data_paths)
-    
-    test_count = int(total_files * test_size)
-    val_count = int(total_files * val_size)
-    train_count = total_files - test_count - val_count
-    
-    train_paths = data_paths[:train_count]
-    val_paths = data_paths[train_count:train_count + val_count]
-    test_paths = data_paths[train_count + val_count:]
-    
-    print(f"Data split: {len(train_paths)} train, {len(val_paths)} val, {len(test_paths)} test")
-    return train_paths, val_paths, test_paths
-
-def forward_fill_nan(prices: np.ndarray) -> np.ndarray:
-    """Forward fill NaN values in price array"""
-    mask = np.isnan(prices)
-    if not mask.any():
-        return prices
-        
-    prices = prices.copy()
-    indices = np.where(~mask)[0]
-    
-    if len(indices) == 0:
-        return prices  # All NaN, can't fill
-    
-    for i in range(len(prices)):
-        if mask[i]:
-            # Find the last valid value before this point
-            prev_valid = indices[indices < i]
-            if len(prev_valid) > 0:
-                prices[i] = prices[prev_valid[-1]]
-            else:
-                # If no previous valid value, use next valid value
-                next_valid = indices[indices > i]
-                if len(next_valid) > 0:
-                    prices[i] = prices[next_valid[0]]
-    
-    return prices
 
 if __name__ == "__main__":
     main() 

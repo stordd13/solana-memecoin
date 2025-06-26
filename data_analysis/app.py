@@ -211,10 +211,142 @@ def show_data_quality(selected_tokens, selection_mode):
                 st.info('Export button clicked! (Dead Tokens)')
                 export_parquet_files(dead_tokens, "Dead Tokens")
         
-        # List of tokens with gaps
+        # Add new "Export All Categories" button at the top
+        st.subheader("🚀 Smart Category Export (Mutually Exclusive)")
+        st.info("📊 **NEW**: Export all categories with strict hierarchy - each token appears in EXACTLY ONE category!")
+        
+        # Debug gap detection button
+        if st.button("🔍 Debug Gap Detection", key="debug_gaps", help="Analyze why tokens with gaps might not be detected"):
+            debug_results = st.session_state.quality_analyzer.debug_gap_detection(quality_reports, min_gap_size=10.0)
+            
+            # Show debug results in the app
+            if debug_results['tokens_with_large_gaps']:
+                st.subheader("Debug Results: Tokens with Large Gaps")
+                debug_df_data = []
+                for token, info in debug_results['tokens_with_large_gaps'].items():
+                    debug_df_data.append({
+                        'Token': token,
+                        'Max Gap (min)': f"{info['max_gap_minutes']:.1f}",
+                        'Total Gaps': info['total_gaps'],
+                        'Large Gaps (≥10min)': info['large_gaps_count'],
+                        'Quality Score': f"{info['quality_score']:.1f}",
+                        'Meets Current Threshold (>5 gaps)': '✅' if info['total_gaps'] > 5 else '❌'
+                    })
+                
+                debug_df = pl.DataFrame(debug_df_data)
+                st.dataframe(debug_df, use_container_width=True)
+                
+                # Show threshold analysis
+                current_threshold_count = debug_results['current_threshold_count']
+                large_gaps_count = len(debug_results['tokens_with_large_gaps'])
+                
+                st.info(f"""
+                **Analysis Summary:**
+                - Tokens with gaps ≥10 minutes: **{large_gaps_count}**
+                - Tokens meeting current threshold (>5 total gaps): **{current_threshold_count}**
+                - Your expected ~20 tokens with 61-minute gaps should appear above
+                """)
+                
+                # Suggest threshold adjustment if needed
+                if large_gaps_count > current_threshold_count:
+                    st.warning(f"""
+                    **Potential Issue**: {large_gaps_count} tokens have large gaps (≥10min) but only {current_threshold_count} meet the current threshold (>5 total gaps).
+                    
+                    Consider adjusting the threshold or gap detection criteria.
+                    """)
+            else:
+                st.warning("No tokens with gaps ≥10 minutes found. This might indicate an issue with gap detection.")
+        
+        # NEW: Investigate tokens with gaps button
+        if st.button("🔬 Investigate Tokens with Gaps", key="investigate_gaps", help="Comprehensive analysis of tokens with gaps to decide keep vs remove"):
+            with st.spinner("Investigating tokens with gaps..."):
+                investigation_results = st.session_state.quality_analyzer.investigate_tokens_with_gaps(quality_reports)
+                
+                # Display results in Streamlit
+                st.subheader("🔬 Gap Investigation Results")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Tokens Analyzed", investigation_results['tokens_analyzed'])
+                    
+                with col2:
+                    keep_count = len(investigation_results['recommendations']['keep_and_clean'])
+                    st.metric("Keep & Clean", keep_count, delta="Recommended")
+                    
+                with col3:
+                    remove_count = len(investigation_results['recommendations']['remove_completely'])
+                    st.metric("Remove Completely", remove_count, delta="Exclude")
+                
+                # Recommendations breakdown
+                st.subheader("📋 Recommendations Breakdown")
+                
+                for action, tokens in investigation_results['recommendations'].items():
+                    if tokens:
+                        action_name = action.replace('_', ' ').title()
+                        
+                        if action == 'keep_and_clean':
+                            st.success(f"✅ **{action_name}** ({len(tokens)} tokens)")
+                            st.write("These tokens have minor gaps that can be filled effectively")
+                            with st.expander(f"View {action_name} tokens"):
+                                st.write(", ".join(tokens))
+                                
+                        elif action == 'remove_completely':
+                            st.error(f"❌ **{action_name}** ({len(tokens)} tokens)")
+                            st.write("These tokens have too many/large gaps for reliable analysis")
+                            with st.expander(f"View {action_name} tokens"):
+                                st.write(", ".join(tokens))
+                                
+                        elif action == 'needs_manual_review':
+                            st.warning(f"🤔 **{action_name}** ({len(tokens)} tokens)")
+                            st.write("These tokens are borderline cases - examine individually")
+                            with st.expander(f"View {action_name} tokens"):
+                                st.write(", ".join(tokens))
+                
+                # Gap severity analysis
+                st.subheader("📊 Gap Severity Analysis")
+                severity_data = []
+                for severity, tokens in investigation_results['gap_analysis'].items():
+                    severity_data.append({
+                        'Severity': severity.replace('_', ' ').title(),
+                        'Count': len(tokens),
+                        'Tokens': ', '.join(tokens[:3]) + ('...' if len(tokens) > 3 else '')
+                    })
+                
+                if severity_data:
+                    st.dataframe(severity_data, use_container_width=True)
+                
+                st.info("💡 **Next Steps**: Check the terminal output for detailed recommendations and then proceed with data cleaning or token removal as suggested.")
+        
+        if st.button("🔄 Export All Categories (Mutually Exclusive)", key="export_all_categories"):
+            st.info('Exporting all categories with mutual exclusivity enforcement...')
+            try:
+                exported_results = st.session_state.quality_analyzer.export_all_categories_mutually_exclusive(quality_reports)
+                
+                # Display results
+                total_exported = sum(len(tokens) for tokens in exported_results.values())
+                st.success(f'✅ Successfully exported {total_exported:,} tokens across all categories!')
+                
+                # Show breakdown
+                st.subheader("Export Summary")
+                for category, tokens in exported_results.items():
+                    if tokens:
+                        st.write(f"✅ **{category}**: {len(tokens):,} tokens exported")
+                    else:
+                        st.write(f"⚠️ **{category}**: No tokens found")
+                        
+                st.info("💡 **No overlaps**: Each token now appears in exactly one category based on hierarchy: gaps > normal > extremes > dead")
+                
+            except Exception as e:
+                st.error(f"Export failed: {e}")
+        
+        st.divider()
+        
+        # List of tokens with gaps (for information only, not export)
         tokens_with_gaps = [token for token, report in quality_reports.items() if report['gaps']['total_gaps'] > 0]
         if tokens_with_gaps:
-            st.subheader("Tokens with Gaps")
+            st.subheader("Tokens with Gaps (Analysis)")
+            st.caption("Note: Use 'Export All Categories' above for mutually exclusive exports")
             
             # Calculate gap statistics (only from tokens that have gaps)
             all_gaps = []
@@ -270,41 +402,15 @@ def show_data_quality(selected_tokens, selection_mode):
                 
                 if len(gap_table_data) > 20:
                     st.info(f"Showing all {len(gap_table_data)} gaps from {len(tokens_with_gaps)} tokens with gaps.")
-            
-            # Simple token list for download/export (unchanged functionality)
-            st.subheader("Token List for Export")
-            tokens_with_gaps_df = pl.DataFrame({'Token': tokens_with_gaps})
-            st.dataframe(tokens_with_gaps_df)
-            if st.button("Download Tokens with Gaps List as CSV", key="download_gaps_csv"):
-                st.download_button(
-                    label="Download as CSV",
-                    data=tokens_with_gaps_df.to_csv(),
-                    file_name="tokens_with_gaps.csv",
-                    mime="text/csv",
-                    key="download_gaps_csv_file"
-                )
-            if st.button("Export Gap Token Parquet Files to processed/", key="export_gaps_parquet"):
-                st.info('Export button clicked! (Tokens with Gaps)')
-                export_parquet_files(tokens_with_gaps, "Tokens with Gaps")
         
-        # List of tokens with extreme movements (consolidated category)
+        # List of tokens with extreme movements (for information only)
         tokens_with_extremes = [token for token, report in quality_reports.items() if report.get('is_extreme_token', False)]
         if tokens_with_extremes:
-            st.subheader("Tokens with Extreme Movements")
+            st.subheader("Tokens with Extreme Movements (Analysis)")
+            st.caption("Note: Use 'Export All Categories' above for mutually exclusive exports")
             st.write(f"Found {len(tokens_with_extremes)} tokens with extreme price movements (>1M% returns or >10k% minute jumps)")
             tokens_with_extremes_df = pl.DataFrame({'Token': tokens_with_extremes})
             st.dataframe(tokens_with_extremes_df)
-            if st.button("Download Tokens with Extremes List as CSV", key="download_extremes_csv"):
-                st.download_button(
-                    label="Download as CSV",
-                    data=tokens_with_extremes_df.to_csv(),
-                    file_name="tokens_with_extremes.csv",
-                    mime="text/csv",
-                    key="download_extremes_csv_file"
-                )
-            if st.button("Export Extreme Token Parquet Files to processed/", key="export_extremes_parquet"):
-                st.info('Export button clicked! (Tokens with Extremes)')
-                export_parquet_files(tokens_with_extremes, "Tokens with Extremes")
         
         # Launch context analysis
         st.subheader("Launch Context Analysis")
@@ -324,40 +430,28 @@ def show_data_quality(selected_tokens, selection_mode):
                          yaxis_title="Number of Tokens")
         st.plotly_chart(fig)
 
-        # Normal behavior tokens (exclusive category)
+        # Normal behavior tokens (for information only)
         normal_behavior_tokens = []
         for token, report in quality_reports.items():
             is_dead = report.get('is_dead', False)
             is_extreme = report.get('is_extreme_token', False)
-            has_significant_gaps = report.get('gaps', {}).get('total_gaps', 0) > 5
+            # UPDATED: Check for significant gaps (many gaps OR large gaps)
+            total_gaps = report.get('gaps', {}).get('total_gaps', 0)
+            max_gap = report.get('gaps', {}).get('max_gap', 0)
+            has_many_gaps = total_gaps > 5  # More than 5 gaps
+            has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+            has_significant_gaps = has_many_gaps or has_large_gap
             
             # Only include tokens with normal behavior (not dead, not extreme, minimal gaps)
             if not (is_dead or is_extreme or has_significant_gaps):
                 normal_behavior_tokens.append(token)
         
         if normal_behavior_tokens:
-            st.subheader("Normal Behavior Tokens")
+            st.subheader("Normal Behavior Tokens (Analysis)")
+            st.caption("Note: Use 'Export All Categories' above for mutually exclusive exports")
             st.write(f"Found {len(normal_behavior_tokens)} tokens with normal behavior (not dead, not extreme, minimal gaps)")
             normal_behavior_df = pl.DataFrame({'Token': normal_behavior_tokens})
             st.dataframe(normal_behavior_df)
-            
-            # Add download button for normal behavior tokens
-            if st.button("Download Normal Behavior Tokens List", key="download_normal_behavior_csv_main"):
-                st.download_button(
-                    label="Download as CSV",
-                    data="\n".join(normal_behavior_tokens),
-                    file_name="normal_behavior_tokens.csv",
-                    mime="text/csv",
-                    key="download_normal_behavior_csv_file_main"
-                )
-            # Add export button for normal behavior tokens to processed folder
-            if st.button("Export Normal Behavior Token Parquet Files to processed/", key="export_normal_behavior_parquet_main"):
-                st.info('Export button clicked! (Normal Behavior Tokens)')
-                try:
-                    export_parquet_files(normal_behavior_tokens, "Normal Behavior Tokens")
-                    st.success(f'Exported {len(normal_behavior_tokens)} normal behavior token parquet files to data/processed/normal_behavior_tokens/')
-                except Exception as e:
-                    st.error(f"Export failed: {e}")
         else:
             st.info("No tokens with normal behavior found in this sample.")
     else:
