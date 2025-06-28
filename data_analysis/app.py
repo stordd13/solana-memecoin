@@ -2,12 +2,18 @@
 Streamlit app for memecoin data analysis
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 import streamlit as st
 import polars as pl
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from pathlib import Path
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union
@@ -17,10 +23,10 @@ import shutil
 import plotly.express as px
 import os
 
-from data_loader import DataLoader
-from data_quality import DataQualityAnalyzer
-from price_analysis import PriceAnalyzer
-from export_utils import export_parquet_files
+from data_analysis.data_loader import DataLoader
+from data_analysis.data_quality import DataQualityAnalyzer
+from data_analysis.price_analysis import PriceAnalyzer
+from data_analysis.export_utils import export_parquet_files
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,45 +51,76 @@ def main():
     st.sidebar.title("Navigation")
     # Data folder selection (before loading)
     if not st.session_state.data_loaded:
+        st.sidebar.subheader("Select Data Source")
+        
+        # Common data subfolders
+        common_subfolders = [
+            "raw/dataset",
+            "processed",
+            "cleaned",
+            "features"
+        ]
+        
+        # Find available subfolders with parquet files
         project_root = Path(__file__).resolve().parent.parent
         data_root = project_root / "data"
-        subdirs = []
+        available_subfolders = []
+        
+        for subfolder in common_subfolders:
+            subfolder_path = data_root / subfolder
+            if subfolder_path.exists():
+                parquet_files = list(subfolder_path.rglob('*.parquet'))
+                if parquet_files:
+                    available_subfolders.append((subfolder, len(parquet_files)))
+        
+        # Add custom option for other subfolders
         for root, dirs, files in os.walk(data_root):
             if any(f.endswith('.parquet') for f in files):
                 rel = os.path.relpath(root, data_root)
-                subdirs.append(rel)
-        subdirs = sorted(subdirs)
-        if 'selected_data_root' not in st.session_state:
-            st.session_state.selected_data_root = subdirs[0] if subdirs else ''
-        selected_root = st.sidebar.selectbox("Select data folder:", subdirs, index=subdirs.index(st.session_state.selected_data_root))
-        st.session_state.selected_data_root = selected_root
-        data_dir = str(data_root / selected_root)
+                if rel not in common_subfolders and (rel, len([f for f in files if f.endswith('.parquet')])) not in available_subfolders:
+                    available_subfolders.append((rel, len([f for f in files if f.endswith('.parquet')])))
         
-        # Display the number of files in the selected folder
-        try:
-            num_files = len([f for f in Path(data_dir).rglob('*.parquet')])
-            st.sidebar.info(f"{num_files} parquet files found.")
-        except Exception as e:
-            st.sidebar.warning(f"Could not count files: {e}")
-
-        if st.sidebar.button("Load Data"):
+        if not available_subfolders:
+            st.sidebar.error("No parquet files found in data directory!")
+            return
+        
+        # Create selectbox with subfolder info
+        subfolder_options = [f"{sf} ({count:,} files)" for sf, count in available_subfolders]
+        if 'selected_subfolder_idx' not in st.session_state:
+            st.session_state.selected_subfolder_idx = 0
+        
+        selected_idx = st.sidebar.selectbox(
+            "Choose data subfolder:",
+            range(len(subfolder_options)),
+            format_func=lambda x: subfolder_options[x],
+            index=st.session_state.selected_subfolder_idx,
+            key="subfolder_select"
+        )
+        
+        selected_subfolder = available_subfolders[selected_idx][0]
+        file_count = available_subfolders[selected_idx][1]
+        
+        st.sidebar.info(f"Selected: `data/{selected_subfolder}`\n{file_count:,} parquet files")
+        
+        if st.sidebar.button("Load Data", type="primary"):
             try:
-                st.session_state.data_loader = DataLoader(data_dir)
+                st.session_state.data_loader = DataLoader(subfolder=selected_subfolder)
                 # Pre-cache the tokens
                 st.session_state.data_loader.get_available_tokens()
                 st.session_state.data_loaded = True
-                st.success(f"Data loaded from {selected_root} successfully!")
+                st.session_state.selected_subfolder_idx = selected_idx
+                st.success(f"Data loaded from data/{selected_subfolder} successfully!")
                 st.rerun()
             except Exception as e:
-                st.error(f"Error loading data from {data_dir}: {e}")
-                logger.error(f"Error loading data from {data_dir}: {e}")
+                st.error(f"Error loading data from data/{selected_subfolder}: {e}")
+                logger.error(f"Error loading data from data/{selected_subfolder}: {e}")
         return
     # Sidebar navigation after loading
     page = st.sidebar.radio("Go to", ["Data Quality", "Price Analysis", "Pattern Detection", "Price Distribution"])
     if st.sidebar.button("Change Data Source"):
         st.session_state.data_loaded = False
         st.session_state.data_loader = None
-        st.session_state.pop('selected_data_root', None)
+        st.session_state.pop('selected_subfolder_idx', None)
         st.session_state.pop('dq_selected_datasets', None)
         st.rerun()
     

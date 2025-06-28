@@ -27,8 +27,8 @@ import numpy as np
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/cleaned"),
-    'features_dir': Path("data/features"),  # NEW: Pre-engineered features directory
+    'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
+    'features_dir': Path("data/features"),  # Pre-engineered features directory
     'results_dir': Path("ML/results/lightgbm_short_term"),
     'categories': [
         "normal_behavior_tokens",      # Highest quality for training
@@ -70,6 +70,55 @@ def load_features_from_file(features_path: Path) -> pl.DataFrame:
         return None
 
 
+def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool:
+    """
+    CRITICAL: Validate features for data leakage before training
+    Returns True if features are safe, False otherwise
+    """
+    if features_df is None or features_df.height == 0:
+        return False
+    
+    # List of unsafe feature patterns that indicate data leakage
+    unsafe_patterns = [
+        'total_return', 'max_gain', 'max_drawdown', 'price_range',
+        'global_', 'spectral_entropy', 'max_periodicity', 'dominant_period',
+        'has_strong_cycles', 'cycle_interpretation', 'granularity'
+    ]
+    
+    unsafe_features = []
+    
+    # Check each column for potential leakage
+    for col in features_df.columns:
+        col_lower = col.lower()
+        
+        # Check for unsafe patterns
+        if any(pattern in col_lower for pattern in unsafe_patterns):
+            unsafe_features.append(col)
+            continue
+            
+        # Check for constant features (sign of repeated global values)
+        if col not in ['datetime', 'price']:
+            try:
+                if features_df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]:
+                    unique_count = features_df[col].n_unique()
+                    total_count = features_df.height
+                    
+                    # If more than 95% of values are the same, it's likely a global feature
+                    if unique_count == 1 or (unique_count / total_count) < 0.05:
+                        unsafe_features.append(f"{col}_constant")
+            except:
+                continue
+    
+    if unsafe_features:
+        print(f"\n🚨 DATA LEAKAGE DETECTED in {token_name}:")
+        for feature in unsafe_features:
+            print(f"   ❌ {feature}")
+        print(f"\n🛡️  Solution: Regenerate features with safe feature engineering")
+        return False
+    
+    return True
+
+
 def create_labels_for_horizons(df: pl.DataFrame, horizons: List[int]) -> pl.DataFrame:
     """Create directional labels for multiple horizons"""
     if 'price' not in df.columns:
@@ -88,6 +137,7 @@ def create_labels_for_horizons(df: pl.DataFrame, horizons: List[int]) -> pl.Data
 def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: str = 'all') -> pl.DataFrame:
     """
     FIXED: Load pre-engineered features and apply temporal splitting
+    Now reads from features/[category]/ structure instead of flat directory
     """
     all_samples = []
     processed_tokens = 0
@@ -96,17 +146,23 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
     
     for path in tqdm(data_paths, desc=f"Loading {split_type} features"):
         try:
-            # Check if pre-engineered features exist
+            # The path is now pointing to features/[category]/[token].parquet
+            # which is the actual feature file - no need to reconstruct the path
             token_name = path.stem
-            features_path = CONFIG['features_dir'] / f"{token_name}_features.parquet"
             
-            if not features_path.exists():
-                print(f"No pre-engineered features found for {token_name}, skipping...")
+            # Since we're already reading from features dir, just load directly
+            if path.exists() and path.suffix == '.parquet':
+                features_df = load_features_from_file(path)
+            else:
+                print(f"Feature file not found: {path}")
                 continue
             
-            # Load pre-engineered features
-            features_df = load_features_from_file(features_path)
             if features_df is None or len(features_df) == 0:
+                continue
+            
+            # CRITICAL: Validate features for data leakage before using
+            if not validate_features_safety(features_df, token_name):
+                print(f"⚠️  SKIPPING {token_name} due to unsafe features")
                 continue
             
             # Create directional labels
@@ -269,8 +325,8 @@ def plot_metrics(metrics: Dict):
 def main():
     """Main training pipeline for the short-term LightGBM model."""
     print("="*50)
-    print("Training Short-Term LightGBM Directional Model")
-    print("USING PRE-ENGINEERED FEATURES")
+    print("🛡️  Training Short-Term LightGBM Directional Model")
+    print("USING SAFE PRE-ENGINEERED FEATURES (NO DATA LEAKAGE)")
     print("Horizons: 15min, 30min, 1h")
     print("="*50)
     

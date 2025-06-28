@@ -1,296 +1,251 @@
-# Feature Engineering for Memecoin Analysis
+# 🧮 Feature Engineering Module
 
-This directory contains advanced feature engineering implementations for the Solana memecoin prediction system. These modules should be used **after** data cleaning to extract meaningful features from cleaned price data.
+**Enhanced roadmap implementation with CLEAN ARCHITECTURE**
 
-## 🔄 **Workflow Position**
+## 🚀 Quick Start
 
-```
-Raw Data → Data Cleaning → **Feature Engineering** → Model Training → Prediction
-                ↗️              ↗️ YOU ARE HERE
-```
-
-## 📁 **Module Overview**
-
-### **🧬 `advanced_feature_engineering.py`**
-**Purpose**: Comprehensive feature extraction from cleaned price data
-
-**Key Features**:
-- ✅ **Log-returns calculation** (Critical roadmap requirement)
-- ✅ **FFT analysis** for cyclical pattern detection
-- ✅ **Advanced technical indicators**: MACD, Bollinger Bands, ATR, Enhanced RSI
-- ✅ **Statistical moments**: Skewness, kurtosis, VaR, expected shortfall
-- ✅ **Multi-granularity analysis**: 2-min, 5-min candlestick patterns
-- ✅ **Formal outlier detection**: Winsorization, Z-score, IQR methods
-
-**Usage**:
-```python
-from feature_engineering.advanced_feature_engineering import AdvancedFeatureEngineer
-
-engineer = AdvancedFeatureEngineer()
-features = engineer.create_comprehensive_features(cleaned_df, 'token_name')
-```
-
-### **📊 `correlation_analysis.py`**
-**Purpose**: Analyze relationships and correlations between multiple tokens
-
-**Key Features**:
-- ✅ **Multi-method correlation**: Pearson, Spearman, Kendall
-- ✅ **PCA redundancy analysis** with explained variance ratios
-- ✅ **Interactive heatmaps** for correlation visualization
-- ✅ **Token clustering** based on price movement patterns
-- ✅ **Rolling correlations** for time-varying relationships
-
-**Usage**:
-```python
-from feature_engineering.correlation_analysis import TokenCorrelationAnalyzer
-
-analyzer = TokenCorrelationAnalyzer()
-results = analyzer.analyze_token_correlations(token_data_dict)
-heatmap = analyzer.create_correlation_heatmap(results['correlation_matrices']['main'])
-```
-
-### **🚀 `roadmap_dashboard.py`**
-**Purpose**: Interactive Streamlit dashboard showcasing all feature engineering capabilities
-
-**Features**:
-- 📈 **Live feature engineering demos**
-- 🔍 **FFT pattern visualization**
-- 📊 **Correlation matrix exploration**
-- 📋 **Implementation status reports**
-
-**Usage**:
+### **Unified Streamlit Dashboard**
 ```bash
-streamlit run feature_engineering/roadmap_dashboard.py
-```
-
-## 🛠️ **Prerequisites**
-
-Before using these feature engineering modules:
-
-1. **Data must be cleaned** using `data_cleaning/` modules
-2. **Required data format**: Polars DataFrame with columns:
-   - `datetime`: Timestamp column
-   - `price` or `close`: Price data column
-
-## 🎯 **Roadmap Implementation Status**
-
-### **✅ Section 1: Data Quality & Cleaning** (Completed in `data_cleaning/`)
-- [x] Outlier detection methods implemented
-- [x] Incomplete token handling strategies
-
-### **✅ Section 2: Preprocessing** (Implemented here)
-- [x] **Log-returns calculation** (Critical requirement)
-- [x] Rolling window normalization
-- [x] Robust scaling per token
-- [x] Temporal data splitting
-
-### **✅ Section 3: Exploration & Feature Engineering** (Implemented here)
-- [x] **FFT analysis** for cyclical patterns
-- [x] **Correlation matrix & heatmap** analysis
-- [x] **PCA explained variance ratio** calculation
-- [x] **Advanced technical indicators** (MACD, Bollinger Bands, ATR)
-- [x] **Multi-granularity downsampling** (2-min, 5-min)
-- [x] **Statistical moments** (skewness, kurtosis)
-
-## 🚀 **Quick Start Examples**
-
-### **1. Single Token Feature Engineering**
-```python
-import polars as pl
-from feature_engineering.advanced_feature_engineering import AdvancedFeatureEngineer
-
-# Load cleaned data
-df = pl.read_parquet('data/cleaned/normal_behavior_tokens/token123.parquet')
-
-# Engineer features
-engineer = AdvancedFeatureEngineer()
-features = engineer.create_comprehensive_features(df, 'token123')
-
-# Access different feature sets
-log_returns = features['price_features']['log_returns']
-technical_indicators = features['technical_features']
-statistical_moments = features['moment_features']
-```
-
-### **2. Multi-Token Correlation Analysis**
-```python
-from pathlib import Path
-from feature_engineering.correlation_analysis import load_tokens_for_correlation, TokenCorrelationAnalyzer
-
-# Load multiple tokens
-token_paths = list(Path('data/cleaned/normal_behavior_tokens').glob('*.parquet'))
-token_data = load_tokens_for_correlation(token_paths[:50])  # Analyze 50 tokens
-
-# Analyze correlations
-analyzer = TokenCorrelationAnalyzer()
-results = analyzer.analyze_token_correlations(token_data, use_log_returns=True)
-
-# Create visualization
-heatmap = analyzer.create_correlation_heatmap(results['correlation_matrices']['main'])
-heatmap.show()
-```
-
-### **3. Batch Feature Engineering**
-```python
-from feature_engineering.advanced_feature_engineering import batch_feature_engineering
-from pathlib import Path
-
-# Process multiple tokens
-token_paths = list(Path('data/cleaned/normal_behavior_tokens').glob('*.parquet'))
-features_dict = batch_feature_engineering(token_paths, limit=100)
-
-# Access features for each token
-for token_name, features in features_dict.items():
-    if features['status'] == 'success':
-        print(f"{token_name}: {len(features['price_features']['log_returns'])} features")
-```
-
-## 📈 **Integration with ML Pipeline**
-
-These feature engineering modules integrate seamlessly with the ML training pipeline:
-
-```python
-# 1. Feature Engineering Phase
-features = engineer.create_comprehensive_features(cleaned_df, token_name)
-
-# 2. ML Training Integration
-from ML.directional_models.train_lightgbm_model import CONFIG
-
-# Enhanced features can be used directly in ML models
-enhanced_df = cleaned_df.with_columns([
-    pl.Series('log_returns', features['price_features']['log_returns']),
-    pl.Series('macd', features['technical_features']['macd']['macd_line']),
-    pl.Series('rsi', features['technical_features']['enhanced_rsi']['values'])
-])
-```
-
-## 🔧 **Advanced Configuration**
-
-### **Outlier Detection Methods**
-```python
-# Choose outlier detection method
-features = engineer.create_comprehensive_features(
-    df, 
-    token_name='token123',
-    outlier_method='winsorization',  # 'z_score', 'iqr'
-    winsor_limits=(0.01, 0.01)      # Lower/upper percentile limits
-)
-```
-
-### **Correlation Analysis Options**
-```python
-# Advanced correlation analysis
-results = analyzer.analyze_token_correlations(
-    token_data,
-    method='spearman',        # 'pearson', 'kendall'
-    use_log_returns=True,     # Use log-returns vs normalized prices
-    min_overlap=100           # Minimum data overlap required
-)
-```
-
-## 📊 **Output Formats**
-
-### **Feature Engineering Output**
-```python
-{
-    'token': 'token_name',
-    'status': 'success',
-    'price_features': {
-        'log_returns': np.array([...]),
-        'cumulative_log_returns': np.array([...]),
-        'price_stats': {...}
-    },
-    'technical_features': {
-        'macd': {...},
-        'bollinger_bands': {...},
-        'enhanced_rsi': {...}
-    },
-    'moment_features': {
-        'skewness': float,
-        'kurtosis': float,
-        'value_at_risk_95': float
-    },
-    'fft_features': {
-        'dominant_periods_minutes': [...],
-        'spectral_entropy': float
-    }
-}
-```
-
-### **Correlation Analysis Output**
-```python
-{
-    'status': 'success',
-    'correlation_matrices': {
-        'main': pd.DataFrame,
-        'rolling_240': pd.DataFrame
-    },
-    'significant_pairs': [...],
-    'pca_analysis': {
-        'explained_variance_ratio': [...],
-        'n_components_95_variance': int
-    }
-}
-```
-
-## 🧪 **Testing & Validation**
-
-Test the feature engineering implementations:
-
-```bash
-# Test advanced feature engineering
-python -c "
-from feature_engineering.advanced_feature_engineering import AdvancedFeatureEngineer
-import polars as pl
-import numpy as np
-from datetime import datetime, timedelta
-
-# Create test data
-dates = [datetime(2024,1,1) + timedelta(minutes=i) for i in range(100)]
-prices = 100 * np.exp(np.cumsum(np.random.normal(0, 0.01, 100)))
-df = pl.DataFrame({'datetime': dates, 'price': prices})
-
-engineer = AdvancedFeatureEngineer()
-features = engineer.create_comprehensive_features(df, 'test_token')
-print('✅ Advanced Feature Engineering:', features['status'])
-"
-
-# Test correlation analysis
-python -c "
-from feature_engineering.correlation_analysis import TokenCorrelationAnalyzer
-import polars as pl
-import numpy as np
-from datetime import datetime, timedelta
-
-dates = [datetime(2024,1,1) + timedelta(minutes=i) for i in range(100)]
-token_data = {
-    'token1': pl.DataFrame({'datetime': dates, 'price': 100 + np.cumsum(np.random.normal(0, 1, 100))}),
-    'token2': pl.DataFrame({'datetime': dates, 'price': 100 + np.cumsum(np.random.normal(0, 1, 100))})
-}
-
-analyzer = TokenCorrelationAnalyzer()
-results = analyzer.analyze_token_correlations(token_data)
-print('✅ Correlation Analysis:', results['status'])
-"
-```
-
-## 🔄 **Next Steps**
-
-After feature engineering:
-
-1. **🤖 Model Training**: Use features in `ML/directional_models/` or `ML/forecasting_models/`
-2. **📊 Quantitative Analysis**: Apply features in `quant_analysis/`
-3. **⏱️ Time Series Analysis**: Use in `time_series/` modules
-
-## 🎛️ **Dashboard Access**
-
-Launch the interactive dashboard to explore all features:
-
-```bash
+# Run the comprehensive feature engineering dashboard
 cd feature_engineering/
-streamlit run roadmap_dashboard.py
+streamlit run app.py
+```
+
+**Single app handles everything:**
+- 📁 **Flexible folder browsing** (any data/ subfolder)
+- 🧮 **Rolling feature engineering** (ML-safe only)
+- 🔗 **Multi-token correlation analysis** with PCA
+- 📊 **FFT cyclical pattern detection** 
+- ⚙️ **Batch processing** for large-scale feature engineering
+- 📋 **Implementation report** with usage guide
+- 🧠 **On-demand global features** (no redundancy)
+
+## 🧠 **CLEAN ARCHITECTURE**
+
+### **Core Principle: Separation of Concerns**
+```
+Rolling Features (ML-Safe)          Global Features (Analysis)
+data/features/                  ←→  Computed on-demand in Streamlit
+├── normal_behavior/                 ├── Uses price_analysis.py
+├── tokens_with_extremes/            ├── No storage redundancy  
+└── dead_tokens/                     └── Analysis-only features
+```
+
+### **Benefits:**
+- ✅ **No redundancy** with data_analysis modules
+- ✅ **Impossible to accidentally use global features in ML**
+- ✅ **Cleaner separation** of rolling vs global features
+- ✅ **Reduced storage** requirements
+- ✅ **Leverages existing** price_analysis functionality
+
+## 📊 **Analysis Types Available**
+
+### 1. **🧮 Feature Engineering**
+- **Rolling Features**: MACD, Bollinger position, RSI, log-returns
+- **Expanding Windows**: Volatility, Sharpe ratio, statistical moments
+- **✅ ML-Safe**: Only historical data, no future peeking
+- **❌ Global Features**: Computed on-demand, not stored
+
+### 2. **🔗 Correlation Analysis** 
+- **Multi-method**: Pearson, Spearman, Kendall correlations
+- **PCA Analysis**: Explained variance ratios for redundancy detection
+- **Log-returns**: Option to use log-returns vs prices
+- **Robust Scaling**: Per-token normalization option
+- **Rolling Correlations**: Time-varying correlation analysis
+
+### 3. **📊 FFT Analysis**
+- **Multi-token**: Sequential analysis of multiple tokens
+- **Window Functions**: Hamming, Hann, Blackman for spectral analysis
+- **Pattern Detection**: Short-term, medium-term, long-term cycles
+- **Advanced Options**: Detrending, phase analysis, normalization
+- **Comparison Mode**: Compare FFT patterns between token groups
+
+### 4. **⚙️ Batch Processing**
+- **Rolling Features Only**: No global features computed
+- **Configurable**: Select technical indicators and window sizes
+- **Progress Tracking**: Real-time progress bars
+- **Category-aware**: Maintains folder structure
+
+### 5. **🧠 On-Demand Global Features**
+- **Uses price_analysis.py**: Leverages existing analysis functionality
+- **No Storage**: Computed when needed, not pre-stored
+- **Complete Analysis**: Total returns, drawdowns, pattern classification
+- **No Redundancy**: Eliminates duplicate computation
+
+## 💾 **Data Architecture**
+
+### **Clean Separation:**
+```python
+# ✅ ROLLING FEATURES (data/features/)
+- log_returns, rolling_volatility, rolling_sharpe
+- macd_line, macd_signal, bb_position
+- rsi_values, atr_values
+- rolling_skewness, rolling_kurtosis
+
+# 🧠 GLOBAL FEATURES (computed on-demand)
+- total_return_pct, max_drawdown_pct  
+- global_volatility, pattern_classification
+- FFT spectral_entropy, dominant_periods
+- Multi-granularity candlestick patterns
+```
+
+### **ML Training Pipeline:**
+```bash
+# 1. Feature Engineering (rolling only)
+python feature_engineering/advanced_feature_engineering.py
+
+# 2. ML Training (uses only rolling features)
+python ML/directional_models/train_lightgbm_model.py
+```
+
+### **Analysis Pipeline:**
+```bash
+# 1. Streamlit Analysis (computes global on-demand)
+streamlit run feature_engineering/app.py
+
+# 2. Select token → global features computed automatically
+# 3. No storage waste, no redundancy
+```
+
+## 🔬 **Technical Implementation**
+
+### **Rolling Feature Engineering**
+```python
+from feature_engineering import AdvancedFeatureEngineer, create_rolling_features_safe
+
+# Only rolling features saved
+engineer = AdvancedFeatureEngineer()
+features = engineer.create_comprehensive_features(df, token_name)
+
+# Clean architecture: saves only ML-safe features
+save_features_to_files(features_dict, token_paths)  # Rolling only
+```
+
+### **On-Demand Global Features**
+```python
+from feature_engineering.app import compute_global_features_on_demand
+
+# Computed when needed using existing price_analysis
+global_features = compute_global_features_on_demand(df, token_name)
+# Uses: data_analysis.price_analysis.PriceAnalyzer
+```
+
+### **Multi-Token Correlation**
+```python
+from feature_engineering import TokenCorrelationAnalyzer
+
+analyzer = TokenCorrelationAnalyzer()
+results = analyzer.analyze_token_correlations(
+    token_data, 
+    use_log_returns=True,
+    use_robust_scaling=True,
+    min_overlap=100
+)
+```
+
+## 🎯 **Usage Examples**
+
+### **1. Single Token Analysis**
+```bash
+streamlit run app.py
+# → Select token
+# → Check "Show Global Features" for on-demand computation
+# → Rolling features always available
+```
+
+### **2. Batch Feature Engineering**
+```python
+python advanced_feature_engineering.py
+# → Processes all cleaned tokens
+# → Saves ONLY rolling features
+# → No global feature storage
+```
+
+### **3. Multi-Token Correlation** 
+```bash
+streamlit run app.py
+# → Select "Correlation Analysis"
+# → Choose multiple tokens
+# → PCA redundancy detection included
+```
+
+## 🛡️ **Data Leakage Prevention**
+
+### **Safe Features (Stored):**
+- ✅ Rolling windows (expanding/fixed)
+- ✅ Technical indicators (MACD, RSI, BB)
+- ✅ Lag features and momentum
+- ✅ Expanding statistical moments
+
+### **Unsafe Features (On-Demand Only):**
+- 🧠 Total returns (uses final price)
+- 🧠 Max drawdowns (uses min/max across series)  
+- 🧠 FFT spectral entropy (uses entire series)
+- 🧠 Pattern classification (uses full dataset)
+
+## 📁 **File Structure**
+
+```
+feature_engineering/
+├── app.py                           # 🎯 Main Streamlit dashboard
+├── advanced_feature_engineering.py  # 🔄 Rolling feature extraction
+├── correlation_analysis.py          # 🔗 Multi-token relationships
+├── __init__.py                      # 📦 Package initialization
+└── README.md                        # 📚 This documentation
+
+data/
+├── features/                        # 🔄 Rolling features (ML-safe)
+│   ├── normal_behavior_tokens/
+│   ├── tokens_with_extremes/
+│   └── dead_tokens/
+└── [no global_features directory]   # 🧠 Computed on-demand
+```
+
+## 🏆 **Architecture Benefits**
+
+### **Before (Redundant):**
+- ❌ Global features stored in feature_engineering 
+- ❌ Same features computed in data_analysis
+- ❌ Storage waste and confusion
+- ❌ Risk of using global features in ML
+
+### **After (Clean):**
+- ✅ Rolling features only in feature_engineering
+- ✅ Global features on-demand from price_analysis
+- ✅ No redundancy or storage waste
+- ✅ Impossible to use global features in ML by accident
+
+## 🚀 **Migration Guide**
+
+If you have existing global feature files, they can be safely deleted:
+```bash
+# Remove old global features (now computed on-demand)
+rm -rf data/global_features_analysis_only/
+
+# Keep rolling features (ML-safe)
+# data/features/ directory remains unchanged
+```
+
+## 🧪 **Testing the Clean Architecture**
+
+```python
+# Test rolling features
+from feature_engineering import create_rolling_features_safe
+rolling_df = create_rolling_features_safe(df, token_name)
+print(f"Rolling features: {rolling_df.columns}")
+
+# Test on-demand global features  
+from feature_engineering.app import compute_global_features_on_demand
+global_features = compute_global_features_on_demand(df, token_name)
+print(f"Global computed: {global_features['computed_on_demand']}")
 ```
 
 ---
 
-**Note**: Always ensure data is properly cleaned using `data_cleaning/` modules before applying feature engineering techniques. 
+## 📞 **Support**
+
+The clean architecture ensures:
+- 🎯 **Single responsibility**: Each module has a clear purpose
+- 🔒 **Data safety**: Impossible to leak global features into ML
+- 📊 **No redundancy**: Global features computed once when needed
+- 🧠 **Leverages existing code**: Uses proven price_analysis functionality 

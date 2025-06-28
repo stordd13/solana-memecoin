@@ -10,7 +10,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
-import pandas as pd
+
 
 logger = logging.getLogger(__name__)
 
@@ -701,7 +701,7 @@ class PriceAnalyzer:
                 
                 # Display timeline
                 if timeline_data:
-                    df = pd.DataFrame(timeline_data)
+                    df = pl.DataFrame(timeline_data)
                     st.dataframe(df)
                 else:
                     st.info("No significant patterns detected")

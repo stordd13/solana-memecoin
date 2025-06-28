@@ -29,20 +29,24 @@ warnings.filterwarnings('ignore')
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/cleaned"),
-    'features_dir': Path("data/features"),  # NEW: Pre-engineered features directory
-    'results_dir': Path("ML/results/unified_lstm_directional"),
+    'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
+    'features_dir': Path("data/features"),  # Pre-engineered features directory
+    'results_dir': Path("ML/results/unified_lstm"),
     'categories': [
         "normal_behavior_tokens",      # Highest quality for training
         "tokens_with_extremes",        # Valuable volatile patterns  
         "dead_tokens",                 # Complete token lifecycles
         # "tokens_with_gaps",          # EXCLUDED: Data quality issues
     ],
-    'sequence_length': 60,  # Use 60 features as sequence (instead of raw prices)
-    'horizons': [15, 30, 60, 120, 240, 360, 720],  # ALL horizons: 15min, 30min, 1h, 2h, 4h, 6h, 12h
-    'batch_size': 32,    # Smaller batch due to longer sequences
-    'num_epochs': 30,
+    'sequence_length': 60,  # 1 hour lookback
+    'horizons': [15, 30, 60, 120, 240, 360, 720],  # All prediction horizons
+    'batch_size': 128,
+    'epochs': 50,
     'learning_rate': 0.001,
+    'random_state': 42,
+    'early_stopping_patience': 10,
+    'val_size': 0.2,
+    'test_size': 0.2,
     'hidden_size': 32,   # Larger due to more horizons
     'num_layers': 2,     # Deeper network
     'dropout': 0.2,
@@ -549,6 +553,107 @@ def main():
     with open(metrics_json_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"Metrics JSON saved to: {metrics_json_path}")
+
+# --- Data Preparation ---
+def prepare_data_fixed(data_paths: List[Path], 
+                      horizons: List[int], 
+                      sequence_length: int,
+                      split_type: str = 'all') -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    """
+    FIXED: Load pre-engineered features and create sequences
+    Now reads from features/[category]/ structure instead of flat directory
+    """
+    all_sequences = []
+    all_labels = []
+    all_tokens = []
+    processed_tokens = 0
+    
+    print(f"Loading pre-engineered features for {len(data_paths)} tokens ({split_type} split)...")
+    
+    for path in tqdm(data_paths, desc=f"Loading {split_type} features"):
+        try:
+            # The path is now pointing to features/[category]/[token].parquet
+            # which is the actual feature file - no need to reconstruct the path
+            token_name = path.stem
+            
+            # Since we're already reading from features dir, just load directly
+            if path.exists() and path.suffix == '.parquet':
+                features_df = load_features_from_file(path)
+            else:
+                print(f"Feature file not found: {path}")
+                continue
+            
+            if features_df is None or len(features_df) == 0:
+                continue
+            
+            # Create directional labels
+            features_df = create_labels_for_horizons(features_df, horizons)
+            
+            # CRITICAL FIX: Split FIRST, then create sequences
+            n_rows = len(features_df) if hasattr(features_df, '__len__') else features_df.height
+            
+            if split_type == 'train':
+                start_idx = 0
+                end_idx = int(n_rows * 0.6)
+            elif split_type == 'val':
+                start_idx = int(n_rows * 0.6)
+                end_idx = int(n_rows * 0.8)
+            elif split_type == 'test':
+                start_idx = int(n_rows * 0.8)
+                end_idx = n_rows
+            else:  # 'all' for backwards compatibility
+                start_idx = 0
+                end_idx = n_rows
+            
+            # Only include if we have enough samples for sequences
+            if end_idx - start_idx < sequence_length + 50:  # Need extra samples for sequences
+                continue
+                
+            # Split the features temporally
+            token_split = features_df.slice(start_idx, end_idx - start_idx)
+            
+            # Get the features (assuming feature columns start after basic columns)
+            feature_cols = [col for col in token_split.columns 
+                          if col not in ['datetime', 'price', 'timestamp', 'token_id'] 
+                          and not col.startswith('label_')]
+            
+            # Extract features and labels
+            features = token_split.select(feature_cols).to_numpy()
+            label_cols = [f'label_{h}m' for h in horizons]
+            labels = token_split.select(label_cols).to_numpy()
+            
+            # Create sequences
+            for i in range(len(features) - sequence_length):
+                seq = features[i:i+sequence_length]
+                label = labels[i+sequence_length-1]  # Labels at the end of sequence
+                
+                # Skip if any label is null
+                if not np.isnan(label).any():
+                    all_sequences.append(seq)
+                    all_labels.append(label)
+                    all_tokens.append(token_name)
+            
+            processed_tokens += 1
+                
+        except Exception as e:
+            print(f"Error processing {path.name}: {e}")
+            continue
+    
+    print(f"Successfully processed {processed_tokens} tokens")
+    
+    if not all_sequences:
+        print("ERROR: No valid sequences created!")
+        return torch.empty(0), torch.empty(0), []
+    
+    # Convert to tensors
+    X = torch.FloatTensor(np.array(all_sequences))
+    y = torch.FloatTensor(np.array(all_labels))
+    
+    print(f"{split_type.upper()} set: {X.shape[0]:,} sequences from {processed_tokens} tokens")
+    print(f"Sequence shape: {X.shape}, Labels shape: {y.shape}")
+    
+    return X, y, all_tokens
+
 
 if __name__ == "__main__":
     main()

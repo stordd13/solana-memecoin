@@ -2,18 +2,23 @@
 Data quality analysis for memecoin data using Polars
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 import polars as pl
 import numpy as np
-import pandas as pd
-from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Union
 import logging
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
-from export_utils import export_parquet_files
-from price_analysis import PriceAnalyzer
+from data_analysis.export_utils import export_parquet_files
+from data_analysis.price_analysis import PriceAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,14 @@ class DataQualityAnalyzer:
             'extreme_total_return': 10000.0,  # 1,000,000% total return
             'extreme_volatility': 100.0,     # 10,000% volatility
             'extreme_range': 100.0           # 10,000% price range
+        }
+        
+        # Outlier detection methods and thresholds (adjusted for crypto data)
+        self.outlier_methods = {
+            'winsorization': {'lower': 0.005, 'upper': 0.995},  # More extreme percentiles for crypto
+            'z_score': {'threshold': 5.0},                      # Higher threshold for crypto volatility
+            'iqr': {'multiplier': 3.0},                        # Use extreme outlier threshold
+            'modified_z_score': {'threshold': 5.0}             # Higher threshold for crypto data
         }
     
     def extract_launch_context(self, df: pl.DataFrame) -> Dict:
@@ -169,6 +182,9 @@ class DataQualityAnalyzer:
             price_anomalies = self._analyze_price_anomalies(df)
             has_extreme_jump = price_anomalies.get('has_extreme_jump', False)
 
+            # --- NEW: Comprehensive outlier detection (using local detection for crypto data) ---
+            outlier_analysis = self.comprehensive_outlier_analysis(df, price_col='price', use_local_detection=True, local_window=60)
+            
             # --- NEW: Enhanced extreme movement detection ---
             extreme_movements = self._detect_extreme_movements(df)
             
@@ -210,7 +226,7 @@ class DataQualityAnalyzer:
             death_duration_hours = self._get_death_duration(df)
             
             # A token is considered dead if its price is constant for at least 2 hours
-            is_dead = death_duration_hours >= 2
+            is_dead = death_duration_hours >= 1
             
             return {
                 'token': token,
@@ -227,6 +243,8 @@ class DataQualityAnalyzer:
                 'has_extreme_volatility': has_extreme_volatility,
                 'has_extreme_return': has_extreme_return,
                 'has_extreme_range': has_extreme_range,
+                # NEW: Comprehensive outlier analysis
+                'outlier_analysis': outlier_analysis,
                 # NEW: Enhanced extreme movement metrics
                 'extreme_movements': extreme_movements,
                 'is_extreme_token': is_extreme_token,
@@ -387,6 +405,12 @@ class DataQualityAnalyzer:
             'has_extreme_volatility': False,
             'has_extreme_return': False,
             'has_extreme_range': False,
+            # NEW: Comprehensive outlier analysis
+            'outlier_analysis': {
+                'summary': {'error': 'No data available'},
+                'processed_dataframe': None,
+                'status': 'error'
+            },
             # NEW: Enhanced extreme movement metrics
             'extreme_movements': {
                 'has_extreme_minute_jump': False,
@@ -715,17 +739,15 @@ class DataQualityAnalyzer:
         # Overall summary
         st.subheader("Overall Data Quality Summary")
         
-        # Convert to pandas for easier display
-        quality_pd = quality_df.to_pandas()
-        
+        # Use Polars for processing
         # Display average quality score
-        avg_score = quality_pd['quality_score'].mean()
+        avg_score = quality_df['quality_score'].mean()
         st.metric("Average Quality Score", f"{avg_score:.1f}/100")
         
         # Quality score distribution
         fig = go.Figure()
         fig.add_trace(go.Histogram(
-            x=quality_pd['quality_score'],
+            x=quality_df['quality_score'].to_list(),
             nbinsx=20,
             name="Quality Score Distribution"
         ))
@@ -740,11 +762,11 @@ class DataQualityAnalyzer:
         # Detailed metrics
         st.subheader("Detailed Quality Metrics")
         
-        # Sort by quality score
-        quality_pd = quality_pd.sort_values('quality_score', ascending=False)
+        # Sort by quality score using Polars
+        quality_sorted = quality_df.sort('quality_score', descending=True)
         
-        # Display metrics for each token
-        for _, row in quality_pd.iterrows():
+        # Display metrics for each token using Polars iteration
+        for row in quality_sorted.iter_rows(named=True):
             with st.expander(f"{row['token']} (Score: {row['quality_score']:.1f})"):
                 col1, col2 = st.columns(2)
                 
@@ -754,9 +776,9 @@ class DataQualityAnalyzer:
                     st.metric("Duplicate Percentage", f"{row['duplicate_pct']:.1f}%")
                 
                 with col2:
-                    if pd.notna(row['avg_gap']):
+                    if row['avg_gap'] is not None:
                         st.metric("Average Time Gap", str(row['avg_gap']))
-                    if pd.notna(row['max_gap']):
+                    if row['max_gap'] is not None:
                         st.metric("Maximum Time Gap", str(row['max_gap']))
                     
                     # Display missing values
@@ -776,7 +798,7 @@ class DataQualityAnalyzer:
                     
                 if row['duplicate_pct'] > 5:
                     st.warning("High percentage of duplicates. Consider cleaning the data.")
-                if pd.notna(row['max_gap']) and isinstance(row['max_gap'], (timedelta, np.timedelta64)) and row['max_gap'] > timedelta(hours=24):
+                if row['max_gap'] is not None and isinstance(row['max_gap'], (timedelta, np.timedelta64)) and row['max_gap'] > timedelta(hours=24):
                     st.warning("Large gaps in data. Consider filling missing values.")
 
     def display_quality_summary(self, quality_reports: Dict):
@@ -844,6 +866,11 @@ class DataQualityAnalyzer:
                 dead_tokens_count = sum(1 for report in quality_reports.values() if report.get('is_dead', False))
                 st.metric("Tokens with Extremes", tokens_with_extremes)
                 st.metric("Dead Tokens", dead_tokens_count)
+            
+            # Outlier Detection Summary
+            st.subheader("Outlier Detection Summary (Local Detection)")
+            st.info("🔍 **Local Outlier Detection**: Using 60-minute rolling windows to detect outliers relative to local patterns (better for cryptocurrency data)")
+            self._display_outlier_summary(quality_reports)
             
             # Quality score distribution
             st.subheader("Quality Score Distribution")
@@ -1412,7 +1439,7 @@ class DataQualityAnalyzer:
         
         # Automatic removal criteria
         if (analysis['total_gaps'] > 15 or 
-            analysis['max_gap_minutes'] > 120 or 
+            analysis['max_gap_minutes'] > 59 or 
             analysis['quality_score'] < 40):
             return 'remove_completely'
         
@@ -1424,7 +1451,7 @@ class DataQualityAnalyzer:
         
         # Manual review criteria (borderline cases)
         if (analysis['total_gaps'] <= 8 and 
-            analysis['max_gap_minutes'] <= 60 and 
+            analysis['max_gap_minutes'] <= 59 and 
             analysis['quality_score'] > 50):
             return 'needs_manual_review'
         
@@ -1491,3 +1518,610 @@ class DataQualityAnalyzer:
         print(f"3. For 'remove_completely' tokens: Exclude from analysis")
         print(f"4. For 'needs_manual_review' tokens: Examine individually")
         print(f"5. Update your token categorization accordingly")
+
+    def _display_outlier_summary(self, quality_reports: Dict):
+        """Display outlier detection summary in Streamlit"""
+        try:
+            # Collect outlier statistics across all tokens
+            outlier_stats = {
+                'winsorization': {'total_outliers': 0, 'tokens_with_outliers': 0},
+                'z_score': {'total_outliers': 0, 'tokens_with_outliers': 0},
+                'iqr': {'total_outliers': 0, 'tokens_with_outliers': 0},
+                'modified_z_score': {'total_outliers': 0, 'tokens_with_outliers': 0},
+                'consensus': {'total_outliers': 0, 'tokens_with_outliers': 0}
+            }
+            
+            total_tokens_analyzed = 0
+            
+            for token, report in quality_reports.items():
+                outlier_analysis = report.get('outlier_analysis', {})
+                if outlier_analysis.get('status') == 'success':
+                    total_tokens_analyzed += 1
+                    summary = outlier_analysis.get('summary', {})
+                    outlier_counts = summary.get('outlier_counts', {})
+                    
+                    # Aggregate statistics
+                    for method in ['winsorization', 'z_score', 'iqr', 'modified_z_score']:
+                        count = outlier_counts.get(method, 0)
+                        if count > 0:
+                            outlier_stats[method]['total_outliers'] += count
+                            outlier_stats[method]['tokens_with_outliers'] += 1
+                    
+                    # Consensus outliers
+                    consensus_count = summary.get('consensus_outliers', 0)
+                    if consensus_count > 0:
+                        outlier_stats['consensus']['total_outliers'] += consensus_count
+                        outlier_stats['consensus']['tokens_with_outliers'] += 1
+            
+            if total_tokens_analyzed == 0:
+                st.warning("No outlier analysis data available. Outlier detection uses local rolling windows for cryptocurrency data.")
+                return
+            
+            # Display summary metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric("Winsorization Outliers", 
+                         f"{outlier_stats['winsorization']['tokens_with_outliers']}/{total_tokens_analyzed}",
+                         f"{outlier_stats['winsorization']['total_outliers']} total")
+            
+            with col2:
+                st.metric("Z-Score Outliers", 
+                         f"{outlier_stats['z_score']['tokens_with_outliers']}/{total_tokens_analyzed}",
+                         f"{outlier_stats['z_score']['total_outliers']} total")
+            
+            with col3:
+                st.metric("IQR Outliers", 
+                         f"{outlier_stats['iqr']['tokens_with_outliers']}/{total_tokens_analyzed}",
+                         f"{outlier_stats['iqr']['total_outliers']} total")
+            
+            with col4:
+                st.metric("Modified Z-Score", 
+                         f"{outlier_stats['modified_z_score']['tokens_with_outliers']}/{total_tokens_analyzed}",
+                         f"{outlier_stats['modified_z_score']['total_outliers']} total")
+            
+            with col5:
+                st.metric("Consensus Outliers", 
+                         f"{outlier_stats['consensus']['tokens_with_outliers']}/{total_tokens_analyzed}",
+                         f"{outlier_stats['consensus']['total_outliers']} total")
+            
+            # Show detailed outlier analysis for tokens with high outlier counts
+            st.subheader("Tokens with High Outlier Counts")
+            high_outlier_tokens = []
+            
+            for token, report in quality_reports.items():
+                outlier_analysis = report.get('outlier_analysis', {})
+                if outlier_analysis.get('status') == 'success':
+                    summary = outlier_analysis.get('summary', {})
+                    consensus_count = summary.get('consensus_outliers', 0)
+                    total_points = summary.get('total_points', 0)
+                    
+                    if total_points > 0:
+                        outlier_percentage = (consensus_count / total_points) * 100
+                        if outlier_percentage > 5:  # More than 5% outliers
+                            high_outlier_tokens.append({
+                                'Token': token,
+                                'Consensus Outliers': consensus_count,
+                                'Total Points': total_points,
+                                'Outlier %': f"{outlier_percentage:.1f}%"
+                            })
+            
+            if high_outlier_tokens:
+                # Sort by outlier percentage
+                high_outlier_tokens.sort(key=lambda x: float(x['Outlier %'][:-1]), reverse=True)
+                outlier_df = pl.DataFrame(high_outlier_tokens[:10])  # Show top 10
+                st.dataframe(outlier_df, use_container_width=True)
+            else:
+                st.info("No tokens with significant outlier counts (>5%)")
+            
+        except Exception as e:
+            self.logger.error(f"Error displaying outlier summary: {e}")
+            st.error(f"Error displaying outlier summary: {e}")
+
+    # ========================================
+    # COMPREHENSIVE OUTLIER DETECTION METHODS
+    # ========================================
+    
+    def detect_outliers_winsorization(self, df: pl.DataFrame, 
+                                    price_col: str = 'price',
+                                    lower_pct: float = 0.01,
+                                    upper_pct: float = 0.99) -> pl.DataFrame:
+        """
+        Apply winsorization to detect and cap outliers
+        
+        Args:
+            df: DataFrame with price data
+            price_col: Name of price column
+            lower_pct: Lower percentile for winsorization (e.g., 0.01 = 1st percentile)
+            upper_pct: Upper percentile for winsorization (e.g., 0.99 = 99th percentile)
+            
+        Returns:
+            DataFrame with winsorized prices and outlier flags
+        """
+        try:
+            # Calculate percentiles using Polars
+            lower_bound = df.select(pl.col(price_col).quantile(lower_pct)).item()
+            upper_bound = df.select(pl.col(price_col).quantile(upper_pct)).item()
+            
+            # Apply winsorization and flag outliers
+            df_winsorized = df.with_columns([
+                # Flag outliers before winsorization
+                ((pl.col(price_col) < lower_bound) | (pl.col(price_col) > upper_bound)).alias('is_outlier_winsor'),
+                
+                # Apply winsorization
+                pl.when(pl.col(price_col) < lower_bound).then(lower_bound)
+                .when(pl.col(price_col) > upper_bound).then(upper_bound)
+                .otherwise(pl.col(price_col))
+                .alias(f'{price_col}_winsorized'),
+                
+                # Calculate outlier magnitude
+                pl.when(pl.col(price_col) < lower_bound).then((lower_bound - pl.col(price_col)) / lower_bound)
+                .when(pl.col(price_col) > upper_bound).then((pl.col(price_col) - upper_bound) / upper_bound)
+                .otherwise(0.0)
+                .alias('outlier_magnitude_winsor')
+            ])
+            
+            return df_winsorized
+            
+        except Exception as e:
+            self.logger.error(f"Error in winsorization: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_winsor'),
+                pl.col(price_col).alias(f'{price_col}_winsorized'),
+                pl.lit(0.0).alias('outlier_magnitude_winsor')
+            ])
+    
+    def detect_outliers_z_score(self, df: pl.DataFrame,
+                               price_col: str = 'price',
+                               threshold: float = 3.0,
+                               use_returns: bool = True) -> pl.DataFrame:
+        """
+        Detect outliers using Z-score method
+        
+        Args:
+            df: DataFrame with price data
+            price_col: Name of price column
+            threshold: Z-score threshold (typically 3.0)
+            use_returns: Whether to use returns instead of raw prices
+            
+        Returns:
+            DataFrame with Z-score outlier flags
+        """
+        try:
+            if use_returns:
+                # Calculate returns first
+                df_with_returns = df.with_columns([
+                    pl.col(price_col).pct_change().alias('returns')
+                ])
+                
+                # Calculate Z-scores for returns
+                df_z_score = df_with_returns.with_columns([
+                    ((pl.col('returns') - pl.col('returns').mean()) / pl.col('returns').std()).alias('z_score'),
+                ]).with_columns([
+                    (pl.col('z_score').abs() > threshold).alias('is_outlier_z_score'),
+                    pl.col('z_score').abs().alias('outlier_magnitude_z_score')
+                ])
+            else:
+                # Calculate Z-scores for raw prices
+                df_z_score = df.with_columns([
+                    ((pl.col(price_col) - pl.col(price_col).mean()) / pl.col(price_col).std()).alias('z_score'),
+                ]).with_columns([
+                    (pl.col('z_score').abs() > threshold).alias('is_outlier_z_score'),
+                    pl.col('z_score').abs().alias('outlier_magnitude_z_score')
+                ])
+            
+            return df_z_score
+            
+        except Exception as e:
+            self.logger.error(f"Error in Z-score detection: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_z_score'),
+                pl.lit(0.0).alias('outlier_magnitude_z_score')
+            ])
+    
+    def detect_outliers_iqr(self, df: pl.DataFrame,
+                           price_col: str = 'price',
+                           multiplier: float = 1.5,
+                           use_returns: bool = True) -> pl.DataFrame:
+        """
+        Detect outliers using Interquartile Range (IQR) method
+        
+        Args:
+            df: DataFrame with price data
+            price_col: Name of price column
+            multiplier: IQR multiplier (1.5 = standard, 3.0 = extreme outliers)
+            use_returns: Whether to use returns instead of raw prices
+            
+        Returns:
+            DataFrame with IQR outlier flags
+        """
+        try:
+            if use_returns:
+                # Calculate returns first
+                df_with_returns = df.with_columns([
+                    pl.col(price_col).pct_change().alias('returns')
+                ])
+                
+                analysis_col = 'returns'
+                df_working = df_with_returns
+            else:
+                analysis_col = price_col
+                df_working = df
+            
+            # Calculate IQR using Polars
+            q1 = df_working.select(pl.col(analysis_col).quantile(0.25)).item()
+            q3 = df_working.select(pl.col(analysis_col).quantile(0.75)).item()
+            
+            if q1 is None or q3 is None:
+                return df.with_columns([
+                    pl.lit(False).alias('is_outlier_iqr'),
+                    pl.lit(0.0).alias('outlier_magnitude_iqr')
+                ])
+            
+            iqr = q3 - q1
+            lower_bound = q1 - (multiplier * iqr)
+            upper_bound = q3 + (multiplier * iqr)
+            
+            # Detect outliers
+            df_iqr = df_working.with_columns([
+                ((pl.col(analysis_col) < lower_bound) | (pl.col(analysis_col) > upper_bound)).alias('is_outlier_iqr'),
+                
+                # Calculate outlier magnitude relative to IQR
+                pl.when(pl.col(analysis_col) < lower_bound).then((lower_bound - pl.col(analysis_col)) / iqr)
+                .when(pl.col(analysis_col) > upper_bound).then((pl.col(analysis_col) - upper_bound) / iqr)
+                .otherwise(0.0)
+                .alias('outlier_magnitude_iqr')
+            ])
+            
+            return df_iqr
+            
+        except Exception as e:
+            self.logger.error(f"Error in IQR detection: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_iqr'),
+                pl.lit(0.0).alias('outlier_magnitude_iqr')
+            ])
+    
+    def detect_outliers_modified_z_score(self, df: pl.DataFrame,
+                                        price_col: str = 'price',
+                                        threshold: float = 3.5,
+                                        use_returns: bool = True) -> pl.DataFrame:
+        """
+        Detect outliers using Modified Z-score (using median instead of mean)
+        More robust to outliers than standard Z-score
+        
+        Args:
+            df: DataFrame with price data
+            price_col: Name of price column
+            threshold: Modified Z-score threshold (typically 3.5)
+            use_returns: Whether to use returns instead of raw prices
+            
+        Returns:
+            DataFrame with Modified Z-score outlier flags
+        """
+        try:
+            if use_returns:
+                # Calculate returns first
+                df_with_returns = df.with_columns([
+                    pl.col(price_col).pct_change().alias('returns')
+                ])
+                
+                analysis_col = 'returns'
+                df_working = df_with_returns
+            else:
+                analysis_col = price_col
+                df_working = df
+            
+            # Calculate median and MAD (Median Absolute Deviation)
+            median_val = df_working.select(pl.col(analysis_col).median()).item()
+            
+            if median_val is None:
+                return df.with_columns([
+                    pl.lit(False).alias('is_outlier_mod_z'),
+                    pl.lit(0.0).alias('outlier_magnitude_mod_z')
+                ])
+            
+            # Calculate MAD and modified Z-score
+            df_mod_z = df_working.with_columns([
+                (pl.col(analysis_col) - median_val).abs().alias('abs_dev_from_median')
+            ]).with_columns([
+                pl.col('abs_dev_from_median').median().alias('mad')
+            ]).with_columns([
+                # Modified Z-score = 0.6745 * (x - median) / MAD
+                (0.6745 * (pl.col(analysis_col) - median_val) / pl.col('mad')).alias('modified_z_score')
+            ]).with_columns([
+                (pl.col('modified_z_score').abs() > threshold).alias('is_outlier_mod_z'),
+                pl.col('modified_z_score').abs().alias('outlier_magnitude_mod_z')
+            ])
+            
+            return df_mod_z
+            
+        except Exception as e:
+            self.logger.error(f"Error in Modified Z-score detection: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_mod_z'),
+                pl.lit(0.0).alias('outlier_magnitude_mod_z')
+            ])
+    
+    def comprehensive_outlier_analysis(self, df: pl.DataFrame,
+                                     price_col: str = 'price',
+                                     methods: List[str] = None,
+                                     use_local_detection: bool = True,
+                                     local_window: int = 60) -> Dict:
+        """
+        Perform comprehensive outlier analysis using multiple methods
+        
+        Args:
+            df: DataFrame with price data
+            price_col: Name of price column
+            methods: List of methods to use ['winsorization', 'z_score', 'iqr', 'modified_z_score']
+            use_local_detection: Whether to use local rolling window detection (better for crypto)
+            local_window: Size of rolling window for local outlier detection (minutes)
+            
+        Returns:
+            Dictionary with outlier analysis results and processed DataFrame
+        """
+        if methods is None:
+            methods = ['winsorization', 'z_score', 'iqr', 'modified_z_score']
+        
+        try:
+            df_processed = df.clone()
+            outlier_summary = {
+                'total_points': len(df),
+                'methods_used': methods,
+                'outlier_counts': {},
+                'outlier_percentages': {},
+                'consensus_outliers': 0,
+                'method_agreement': {}
+            }
+            
+            # Apply each method (global or local detection)
+            if 'winsorization' in methods:
+                if use_local_detection:
+                    df_processed = self.detect_outliers_winsorization_local(df_processed, price_col, local_window)
+                else:
+                    df_processed = self.detect_outliers_winsorization(df_processed, price_col)
+                outlier_count = df_processed['is_outlier_winsor'].sum()
+                outlier_summary['outlier_counts']['winsorization'] = outlier_count
+                outlier_summary['outlier_percentages']['winsorization'] = (outlier_count / len(df)) * 100
+            
+            if 'z_score' in methods:
+                if use_local_detection:
+                    df_processed = self.detect_outliers_z_score_local(df_processed, price_col, local_window)
+                else:
+                    df_processed = self.detect_outliers_z_score(df_processed, price_col)
+                outlier_count = df_processed['is_outlier_z_score'].sum()
+                outlier_summary['outlier_counts']['z_score'] = outlier_count
+                outlier_summary['outlier_percentages']['z_score'] = (outlier_count / len(df)) * 100
+            
+            if 'iqr' in methods:
+                if use_local_detection:
+                    df_processed = self.detect_outliers_iqr_local(df_processed, price_col, local_window)
+                else:
+                    df_processed = self.detect_outliers_iqr(df_processed, price_col)
+                outlier_count = df_processed['is_outlier_iqr'].sum()
+                outlier_summary['outlier_counts']['iqr'] = outlier_count
+                outlier_summary['outlier_percentages']['iqr'] = (outlier_count / len(df)) * 100
+            
+            if 'modified_z_score' in methods:
+                if use_local_detection:
+                    df_processed = self.detect_outliers_modified_z_score_local(df_processed, price_col, local_window)
+                else:
+                    df_processed = self.detect_outliers_modified_z_score(df_processed, price_col)
+                outlier_count = df_processed['is_outlier_mod_z'].sum()
+                outlier_summary['outlier_counts']['modified_z_score'] = outlier_count
+                outlier_summary['outlier_percentages']['modified_z_score'] = (outlier_count / len(df)) * 100
+            
+            # Calculate consensus outliers (flagged by multiple methods)
+            outlier_cols = [col for col in df_processed.columns if col.startswith('is_outlier_')]
+            if len(outlier_cols) > 1:
+                # Sum outlier flags across methods
+                df_processed = df_processed.with_columns([
+                    pl.sum_horizontal(outlier_cols).alias('outlier_method_count')
+                ]).with_columns([
+                    (pl.col('outlier_method_count') >= 2).alias('is_consensus_outlier')
+                ])
+                
+                consensus_count = df_processed['is_consensus_outlier'].sum()
+                outlier_summary['consensus_outliers'] = consensus_count
+                outlier_summary['consensus_percentage'] = (consensus_count / len(df)) * 100
+            
+            # Method agreement analysis
+            for i, method1 in enumerate(methods):
+                for method2 in methods[i+1:]:
+                    col1 = f'is_outlier_{method1.replace("_score", "").replace("ization", "")}'
+                    col2 = f'is_outlier_{method2.replace("_score", "").replace("ization", "")}'
+                    
+                    if col1 in df_processed.columns and col2 in df_processed.columns:
+                        agreement = df_processed.filter(
+                            pl.col(col1) == pl.col(col2)
+                        ).height / len(df_processed)
+                        
+                        outlier_summary['method_agreement'][f'{method1}_vs_{method2}'] = agreement
+            
+            return {
+                'summary': outlier_summary,
+                'processed_dataframe': df_processed,
+                'status': 'success'
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error in comprehensive outlier analysis: {e}")
+            return {
+                'summary': {'error': str(e)},
+                'processed_dataframe': df,
+                'status': 'error'
+            }
+    
+    # ========================================
+    # LOCAL OUTLIER DETECTION METHODS (Better for Crypto)
+    # ========================================
+    
+    def detect_outliers_winsorization_local(self, df: pl.DataFrame, 
+                                           price_col: str = 'price',
+                                           window_size: int = 60) -> pl.DataFrame:
+        """
+        Apply local winsorization within rolling windows (better for crypto data)
+        """
+        try:
+            # Calculate returns for analysis
+            df = df.with_columns([
+                pl.col(price_col).pct_change().alias('returns')
+            ])
+            
+            # Get winsorization thresholds
+            lower_pct = self.outlier_methods['winsorization']['lower']
+            upper_pct = self.outlier_methods['winsorization']['upper']
+            
+            # Apply rolling winsorization
+            df = df.with_columns([
+                # Rolling quantiles for winsorization bounds
+                pl.col('returns').rolling_quantile(lower_pct, window_size=window_size).alias('rolling_lower'),
+                pl.col('returns').rolling_quantile(upper_pct, window_size=window_size).alias('rolling_upper')
+            ]).with_columns([
+                # Flag local outliers
+                ((pl.col('returns') < pl.col('rolling_lower')) | 
+                 (pl.col('returns') > pl.col('rolling_upper'))).alias('is_outlier_winsor'),
+                
+                # Calculate magnitude relative to local bounds
+                pl.when(pl.col('returns') < pl.col('rolling_lower'))
+                .then((pl.col('rolling_lower') - pl.col('returns')) / pl.col('rolling_lower').abs())
+                .when(pl.col('returns') > pl.col('rolling_upper'))
+                .then((pl.col('returns') - pl.col('rolling_upper')) / pl.col('rolling_upper').abs())
+                .otherwise(0.0)
+                .alias('outlier_magnitude_winsor')
+            ])
+            
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error in local winsorization: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_winsor'),
+                pl.lit(0.0).alias('outlier_magnitude_winsor')
+            ])
+    
+    def detect_outliers_z_score_local(self, df: pl.DataFrame,
+                                     price_col: str = 'price',
+                                     window_size: int = 60) -> pl.DataFrame:
+        """
+        Detect outliers using local Z-score within rolling windows
+        """
+        try:
+            # Calculate returns for analysis
+            df = df.with_columns([
+                pl.col(price_col).pct_change().alias('returns')
+            ])
+            
+            threshold = self.outlier_methods['z_score']['threshold']
+            
+            # Apply rolling Z-score
+            df = df.with_columns([
+                # Rolling mean and std for local Z-score
+                pl.col('returns').rolling_mean(window_size).alias('rolling_mean'),
+                pl.col('returns').rolling_std(window_size).alias('rolling_std')
+            ]).with_columns([
+                # Local Z-score
+                ((pl.col('returns') - pl.col('rolling_mean')) / pl.col('rolling_std')).alias('local_z_score')
+            ]).with_columns([
+                # Flag local outliers
+                (pl.col('local_z_score').abs() > threshold).alias('is_outlier_z_score'),
+                pl.col('local_z_score').abs().alias('outlier_magnitude_z_score')
+            ])
+            
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error in local Z-score detection: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_z_score'),
+                pl.lit(0.0).alias('outlier_magnitude_z_score')
+            ])
+    
+    def detect_outliers_iqr_local(self, df: pl.DataFrame,
+                                 price_col: str = 'price',
+                                 window_size: int = 60) -> pl.DataFrame:
+        """
+        Detect outliers using local IQR within rolling windows
+        """
+        try:
+            # Calculate returns for analysis
+            df = df.with_columns([
+                pl.col(price_col).pct_change().alias('returns')
+            ])
+            
+            multiplier = self.outlier_methods['iqr']['multiplier']
+            
+            # Apply rolling IQR
+            df = df.with_columns([
+                # Rolling quartiles
+                pl.col('returns').rolling_quantile(0.25, window_size=window_size).alias('rolling_q1'),
+                pl.col('returns').rolling_quantile(0.75, window_size=window_size).alias('rolling_q3')
+            ]).with_columns([
+                # Local IQR and bounds
+                (pl.col('rolling_q3') - pl.col('rolling_q1')).alias('rolling_iqr'),
+            ]).with_columns([
+                # IQR bounds
+                (pl.col('rolling_q1') - multiplier * pl.col('rolling_iqr')).alias('iqr_lower'),
+                (pl.col('rolling_q3') + multiplier * pl.col('rolling_iqr')).alias('iqr_upper')
+            ]).with_columns([
+                # Flag local outliers
+                ((pl.col('returns') < pl.col('iqr_lower')) | 
+                 (pl.col('returns') > pl.col('iqr_upper'))).alias('is_outlier_iqr'),
+                
+                # Calculate magnitude relative to local IQR
+                pl.when(pl.col('returns') < pl.col('iqr_lower'))
+                .then((pl.col('iqr_lower') - pl.col('returns')) / pl.col('rolling_iqr'))
+                .when(pl.col('returns') > pl.col('iqr_upper'))
+                .then((pl.col('returns') - pl.col('iqr_upper')) / pl.col('rolling_iqr'))
+                .otherwise(0.0)
+                .alias('outlier_magnitude_iqr')
+            ])
+            
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error in local IQR detection: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_iqr'),
+                pl.lit(0.0).alias('outlier_magnitude_iqr')
+            ])
+    
+    def detect_outliers_modified_z_score_local(self, df: pl.DataFrame,
+                                              price_col: str = 'price',
+                                              window_size: int = 60) -> pl.DataFrame:
+        """
+        Detect outliers using local Modified Z-score within rolling windows
+        """
+        try:
+            # Calculate returns for analysis
+            df = df.with_columns([
+                pl.col(price_col).pct_change().alias('returns')
+            ])
+            
+            threshold = self.outlier_methods['modified_z_score']['threshold']
+            
+            # Apply rolling Modified Z-score
+            df = df.with_columns([
+                # Rolling median
+                pl.col('returns').rolling_median(window_size).alias('rolling_median')
+            ]).with_columns([
+                # Rolling MAD (Median Absolute Deviation)
+                (pl.col('returns') - pl.col('rolling_median')).abs().rolling_median(window_size).alias('rolling_mad')
+            ]).with_columns([
+                # Local Modified Z-score
+                (0.6745 * (pl.col('returns') - pl.col('rolling_median')) / pl.col('rolling_mad')).alias('local_mod_z_score')
+            ]).with_columns([
+                # Flag local outliers
+                (pl.col('local_mod_z_score').abs() > threshold).alias('is_outlier_mod_z'),
+                pl.col('local_mod_z_score').abs().alias('outlier_magnitude_mod_z')
+            ])
+            
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error in local Modified Z-score detection: {e}")
+            return df.with_columns([
+                pl.lit(False).alias('is_outlier_mod_z'),
+                pl.lit(0.0).alias('outlier_magnitude_mod_z')
+            ])

@@ -10,26 +10,33 @@ import re
 import os
 
 class DataLoader:
-    def __init__(self, base_path: Optional[Union[str, Path]] = None):
+    def __init__(self, subfolder: str = "raw/dataset"):
         """
         Initialize the data loader
         
         Args:
-            base_path: Base path to the data directory. If None, uses default path.
+            subfolder: Subfolder within the data directory (e.g., "raw/dataset", "processed", "cleaned")
         """
-        if base_path is None:
-            # Try to find the data directory relative to the current file
-            current_dir = Path(__file__).parent
-            base_path = current_dir.parent / "data" / "raw"
-        else:
-            base_path = Path(base_path)
-            
-        self.base_path = base_path
+        # Auto-detect project root by looking for characteristic files
+        current_dir = Path(__file__).parent  # data_analysis/
+        project_root = current_dir.parent    # memecoin2/
+        
+        # Verify we found the right project root by checking for key files/folders
+        if not ((project_root / "data").exists() and (project_root / "run_pipeline.py").exists()):
+            # Fallback: assume we're in the right structure
+            project_root = current_dir.parent
+        
+        # Always use project_root/data as base, then add the subfolder
+        self.data_root = project_root / "data"
+        self.base_path = self.data_root / subfolder
+        self.subfolder = subfolder
+        
         self.logger = logging.getLogger(__name__)
         self.token_cache: Optional[List[Dict[str, str]]] = None
         
         # Log the data path
-        self.logger.info(f"Using data path: {self.base_path}")
+        self.logger.info(f"Using data root: {self.data_root}")
+        self.logger.info(f"Using data path: {self.base_path} (subfolder: {subfolder})")
         if not self.base_path.exists():
             self.logger.warning(f"Data path does not exist: {self.base_path}")
             

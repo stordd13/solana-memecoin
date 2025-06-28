@@ -1,5 +1,5 @@
 import os
-import pandas as pd
+import polars as pl
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -70,13 +70,13 @@ class CategoryAwareTokenCleaner:
         """
         try:
             # Load data
-            df = pd.read_parquet(token_path)
+            df = pl.read_parquet(token_path)
             token_name = token_path.stem
             
             log = {
                 'token': token_name,
                 'category': category,
-                'original_rows': len(df),
+                'original_rows': df.height,
                 'modifications': [],
                 'strategy_used': CATEGORIES.get(category, 'gentle'),
                 'status': 'processing'
@@ -101,11 +101,11 @@ class CategoryAwareTokenCleaner:
             output_dir.mkdir(exist_ok=True)
             output_path = output_dir / f"{token_name}.parquet"
             
-            df_cleaned.to_parquet(output_path, index=False)
+            df_cleaned.write_parquet(output_path)
             
             log.update({
-                'final_rows': len(df_cleaned),
-                'rows_removed': len(df) - len(df_cleaned),
+                'final_rows': df_cleaned.height,
+                'rows_removed': df.height - df_cleaned.height,
                 'modifications': modifications,
                 'output_path': str(output_path),
                 'status': 'cleaned_successfully'
@@ -122,12 +122,12 @@ class CategoryAwareTokenCleaner:
                 'error': str(e)
             }
 
-    def _validate_data_structure(self, df: pd.DataFrame) -> bool:
+    def _validate_data_structure(self, df: pl.DataFrame) -> bool:
         """Validate that the dataframe has required columns and structure"""
         required_columns = ['datetime', 'price']
         return all(col in df.columns for col in required_columns)
 
-    def _gentle_cleaning(self, df: pd.DataFrame, token_name: str) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _gentle_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         Gentle cleaning for normal behavior tokens
         - Remove obvious data artifacts only
@@ -135,7 +135,7 @@ class CategoryAwareTokenCleaner:
         - Fill small gaps conservatively
         """
         modifications = []
-        df = df.copy()
+        df = df.clone()
         
         # 1. Remove obvious listing artifacts (but preserve real pumps)
         df, listing_mods = self._remove_listing_artifacts(df)
@@ -159,14 +159,14 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
-    def _minimal_cleaning(self, df: pd.DataFrame, token_name: str) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _minimal_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         Minimal cleaning for dead tokens
         - Only fix critical data errors
         - Don't bother with gaps or minor issues since token is inactive
         """
         modifications = []
-        df = df.copy()
+        df = df.clone()
         
         # Only fix severe data errors and invalid prices
         df, error_mods = self._fix_data_errors(df)
@@ -179,7 +179,7 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
-    def _preserve_extremes_cleaning(self, df: pd.DataFrame, token_name: str) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _preserve_extremes_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         Preserve extremes cleaning for tokens with extreme movements
         - Keep ALL legitimate extreme movements (this is their defining characteristic!)
@@ -187,7 +187,7 @@ class CategoryAwareTokenCleaner:
         - Be very conservative about what constitutes an "error"
         """
         modifications = []
-        df = df.copy()
+        df = df.clone()
         
         # Only remove the most obvious data corruption (not extreme movements!)
         # 1. Remove only impossible values (negative prices, exact zeros from data errors)
@@ -207,7 +207,7 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
-    def _aggressive_cleaning(self, df: pd.DataFrame, token_name: str) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _aggressive_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         Aggressive cleaning for tokens with gaps
         - Fill all reasonable gaps
@@ -215,7 +215,7 @@ class CategoryAwareTokenCleaner:
         - Still preserve legitimate market movements
         """
         modifications = []
-        df = df.copy()
+        df = df.clone()
         
         # 1. Remove listing artifacts
         df, listing_mods = self._remove_listing_artifacts(df)
@@ -239,185 +239,208 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
-    def _remove_listing_artifacts(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _remove_listing_artifacts(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Remove obvious listing artifacts while preserving real explosive launches
-        
-        Criteria for listing artifacts:
-        - First few minutes only
-        - Price >20x median of next 10 minutes  
-        - Followed by >99% drop immediately
-        - No volume or trading activity confirmation
-        """
-        if len(df) < 15:  # Need enough data to analyze
-            return df, []
-        
-        modifications = []
-        df = df.sort_values('datetime').reset_index(drop=True)
-        
-        # Check first 3 minutes for listing artifacts
-        for i in range(min(3, len(df) - 10)):
-            current_price = df.iloc[i]['price']
-            
-            # Get median of next 10 minutes
-            window = df.iloc[i+1:i+11]['price']
-            if len(window) == 0 or window.median() == 0:
-                continue
-                
-            price_ratio = current_price / window.median()
-            
-            # Check if this looks like a listing artifact
-            if price_ratio > self.artifact_thresholds['listing_spike_multiplier']:
-                # Check for immediate crash (listing artifact signature)
-                if i + 1 < len(df):
-                    next_price = df.iloc[i + 1]['price']
-                    drop_ratio = (current_price - next_price) / current_price
-                    
-                    if drop_ratio > self.artifact_thresholds['listing_drop_threshold']:
-                        # This looks like a listing artifact - remove it
-                        df = df.drop(df.index[i]).reset_index(drop=True)
-                        modifications.append({
-                            'type': 'listing_artifact_removed',
-                            'position': i,
-                            'price_ratio': price_ratio,
-                            'drop_ratio': drop_ratio,
-                            'reason': 'Obvious listing artifact: extreme spike followed by immediate crash'
-                        })
-                        break  # Only remove one at a time to avoid index issues
-        
-        return df, modifications
-
-    def _fix_data_errors(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
-        """
-        Fix obvious data errors while preserving legitimate extreme movements
-        
-        Data errors vs legitimate movements:
-        - Data error: Single point >100,000% different from surrounding prices
-        - Legitimate: Sustained movement with volume/context
+        Remove obvious listing artifacts while preserving legitimate pumps
         """
         modifications = []
-        df = df.copy()
+        
+        if df.height < 10:
+            return df, modifications
+        
+        # Sort by datetime
+        df = df.sort('datetime')
         
         # Calculate returns
-        df['returns'] = df['price'].pct_change()
+        df = df.with_columns([
+            pl.col('price').pct_change().alias('returns')
+        ])
         
-        # Find potential data errors (>100,000% single-minute moves)
-        error_threshold = self.artifact_thresholds['data_error_threshold']
-        potential_errors = df[abs(df['returns']) > error_threshold].index
+        # Detect potential listing artifacts
+        # 1. Initial spike followed by immediate crash (classic listing artifact)
+        median_price = df.select(pl.col('price').median()).item()
         
-        for idx in potential_errors:
-            if idx == 0 or idx == len(df) - 1:
-                continue  # Skip first/last points
-            
-            current_price = df.loc[idx, 'price']
-            prev_price = df.loc[idx - 1, 'price']
-            next_price = df.loc[idx + 1, 'price']
-            
-            # Check if this is an isolated error (price reverts immediately)
-            prev_ratio = abs((current_price - prev_price) / prev_price)
-            next_ratio = abs((next_price - current_price) / current_price)
-            
-            # If both moves are extreme and price reverts, it's likely a data error
-            if (prev_ratio > error_threshold and next_ratio > 0.9):
-                # Replace with interpolated value
-                df.loc[idx, 'price'] = (prev_price + next_price) / 2
-                modifications.append({
-                    'type': 'data_error_corrected',
-                    'position': idx,
-                    'original_price': current_price,
-                    'corrected_price': df.loc[idx, 'price'],
-                    'reason': 'Isolated extreme price point (likely data error)'
-                })
+        # Look for initial spikes >20x median in first 10 minutes
+        first_10_rows = df.head(10)
+        spike_mask = first_10_rows['price'] > (median_price * self.artifact_thresholds['listing_spike_multiplier'])
         
-        # Recalculate returns after corrections
-        df['returns'] = df['price'].pct_change()
-        df = df.drop('returns', axis=1)
+        if spike_mask.any():
+            # Check if followed by >99% drop within next few minutes
+            spike_indices = first_10_rows.with_row_count().filter(spike_mask)['row_nr'].to_list()
+            
+            for spike_idx in spike_indices:
+                if spike_idx < df.height - 3:  # Ensure we have data after spike
+                    spike_price = df.row(spike_idx, named=True)['price']
+                    next_few_prices = df.slice(spike_idx+1, 3)['price']
+                    
+                    # Check if price drops >99% after spike
+                    min_after_spike = next_few_prices.min()
+                    if min_after_spike < spike_price * (1 - self.artifact_thresholds['listing_drop_threshold']):
+                        # This is likely a listing artifact
+                        spike_datetime = df.row(spike_idx, named=True)['datetime']
+                        df = df.filter(pl.col('datetime') != spike_datetime)
+                        modifications.append({
+                            'type': 'listing_artifact_removed',
+                            'index': spike_idx,
+                            'price': spike_price,
+                            'reason': 'spike_followed_by_crash'
+                        })
         
         return df, modifications
 
-    def _fix_extreme_data_corruption(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _fix_data_errors(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Fix only the most extreme data corruption (>1,000,000% moves)
-        Used for extreme tokens to preserve their legitimate extreme movements
+        Fix obvious data errors (>100,000% moves in one minute)
         """
         modifications = []
-        df = df.copy()
         
-        # Only fix moves >1,000,000% (10,000x) - these are definitely data errors
-        corruption_threshold = 10000  # 1,000,000%
-        df['returns'] = df['price'].pct_change()
+        if df.height < 2:
+            return df, modifications
         
-        corruption_points = df[abs(df['returns']) > corruption_threshold].index
+        # Calculate returns if not present
+        if 'returns' not in df.columns:
+            df = df.with_columns([
+                pl.col('price').pct_change().alias('returns')
+            ])
         
-        for idx in corruption_points:
-            if idx == 0 or idx == len(df) - 1:
-                continue
+        # Find extreme data errors (>100,000% = 1000x in one minute)
+        error_threshold = self.artifact_thresholds['data_error_threshold']
+        extreme_returns = df.filter(pl.col('returns').abs() > error_threshold)
+        
+        if extreme_returns.height > 0:
+            # Remove these extreme outliers by interpolating
+            error_indices = extreme_returns.with_row_count()['row_nr'].to_list()
             
-            # Replace with local median (very conservative)
-            local_window = df.iloc[max(0, idx-2):min(len(df), idx+3)]['price']
-            df.loc[idx, 'price'] = local_window.median()
+            # Replace extreme values with interpolated values
+            df = df.with_row_count().with_columns([
+                pl.when(pl.col('row_nr').is_in(error_indices))
+                .then(None)
+                .otherwise(pl.col('price'))
+                .alias('price_clean')
+            ])
+            
+            # Linear interpolation for missing values
+            df = df.with_columns([
+                pl.col('price_clean').interpolate().alias('price')
+            ]).drop(['price_clean', 'row_nr'])
             
             modifications.append({
-                'type': 'extreme_corruption_fixed',
-                'position': idx,
-                'reason': 'Data corruption >1,000,000% detected'
+                'type': 'extreme_data_errors_fixed',
+                'count': len(error_indices),
+                'threshold_used': error_threshold,
+                'method': 'linear_interpolation'
             })
         
-        df = df.drop('returns', axis=1)
         return df, modifications
 
-    def _fill_small_gaps_only(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _fix_extreme_data_corruption(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Fix only extreme data corruption (>1,000,000% moves)
+        """
+        modifications = []
+        
+        if df.height < 2:
+            return df, modifications
+        
+        # Calculate returns if not present
+        if 'returns' not in df.columns:
+            df = df.with_columns([
+                pl.col('price').pct_change().alias('returns')
+            ])
+        
+        # Only fix absolutely extreme corruption (>1,000,000%)
+        corruption_threshold = 10000  # 1,000,000%
+        extreme_corruption = df.filter(pl.col('returns').abs() > corruption_threshold)
+        
+        if extreme_corruption.height > 0:
+            # Remove these corrupted points
+            corruption_indices = extreme_corruption.with_row_count()['row_nr'].to_list()
+            
+            df = df.with_row_count().with_columns([
+                pl.when(pl.col('row_nr').is_in(corruption_indices))
+                .then(None)
+                .otherwise(pl.col('price'))
+                .alias('price_clean')
+            ])
+            
+            df = df.with_columns([
+                pl.col('price_clean').interpolate().alias('price')
+            ]).drop(['price_clean', 'row_nr'])
+            
+            modifications.append({
+                'type': 'extreme_data_corruption_fixed',
+                'count': len(corruption_indices),
+                'threshold_used': corruption_threshold
+            })
+        
+        return df, modifications
+
+    def _fill_small_gaps_only(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """Fill only small gaps (1-2 minutes) with linear interpolation"""
         return self._fill_gaps_with_size_limit(df, max_gap_minutes=2)
 
-    def _fill_critical_gaps_only(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
-        """Fill only critical gaps that break data continuity"""
-        return self._fill_gaps_with_size_limit(df, max_gap_minutes=1)
+    def _fill_critical_gaps_only(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """Fill only critical gaps (1-3 minutes) for extreme tokens"""
+        return self._fill_gaps_with_size_limit(df, max_gap_minutes=3)
 
-    def _fill_gaps_comprehensive(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _fill_gaps_comprehensive(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """Fill gaps comprehensively for tokens where gaps are the main issue"""
         return self._fill_gaps_with_size_limit(df, max_gap_minutes=10)
 
-    def _fill_gaps_with_size_limit(self, df: pd.DataFrame, max_gap_minutes: int) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _fill_gaps_with_size_limit(self, df: pl.DataFrame, max_gap_minutes: int) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         Fill gaps up to specified size limit with appropriate interpolation
         """
         modifications = []
-        df = df.copy().sort_values('datetime').reset_index(drop=True)
-        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort('datetime')
+        
+        # Ensure datetime is properly parsed
+        if df['datetime'].dtype != pl.Datetime:
+            df = df.with_columns([
+                pl.col('datetime').str.strptime(pl.Datetime).alias('datetime')
+            ])
         
         # Handle duplicates first
-        if df['datetime'].duplicated().any():
-            duplicates = df[df['datetime'].duplicated(keep=False)]['datetime'].tolist()
-            df = df.groupby('datetime', as_index=False).agg({'price': 'mean'})
+        duplicates_count = df.group_by('datetime').len().filter(pl.col('len') > 1).height
+        if duplicates_count > 0:
+            df = df.group_by('datetime').agg([
+                pl.col('price').mean().alias('price')
+            ]).sort('datetime')
             modifications.append({
                 'type': 'duplicates_aggregated',
-                'count': len(duplicates),
+                'count': duplicates_count,
                 'method': 'mean_price'
             })
         
-        # Create complete time range
-        full_range = pd.date_range(
-            df['datetime'].iloc[0], 
-            df['datetime'].iloc[-1], 
-            freq='1min'
+        # Create complete time range using Polars
+        start_time = df.select(pl.col('datetime').min()).item()
+        end_time = df.select(pl.col('datetime').max()).item()
+        
+        # Generate minute-by-minute range
+        time_range = pl.datetime_range(
+            start_time, 
+            end_time, 
+            interval='1m',
+            eager=True
         )
         
-        df = df.set_index('datetime').reindex(full_range)
+        # Create complete DataFrame and join
+        complete_df = pl.DataFrame({'datetime': time_range})
+        df = complete_df.join(df, on='datetime', how='left')
         
-        # Find and fill gaps
-        is_gap = df['price'].isna()
-        if not is_gap.any():
-            df = df.reset_index().rename(columns={'index': 'datetime'})
+        # Find gaps
+        null_mask = df['price'].is_null()
+        if not null_mask.any():
             return df, modifications
         
-        # Identify gap segments
-        gap_starts = np.where((~is_gap[:-1]) & (is_gap[1:]))[0] + 1
-        gap_ends = np.where((is_gap[:-1]) & (~is_gap[1:]))[0] + 1
+        # Identify gap segments using numpy for efficiency
+        null_array = null_mask.to_numpy()
+        gap_starts = np.where((~null_array[:-1]) & (null_array[1:]))[0] + 1
+        gap_ends = np.where((null_array[:-1]) & (~null_array[1:]))[0] + 1
         
-        if is_gap.iloc[0]:
+        if null_array[0]:
             gap_starts = np.insert(gap_starts, 0, 0)
-        if is_gap.iloc[-1]:
+        if null_array[-1]:
             gap_ends = np.append(gap_ends, len(df))
         
         # Fill gaps based on size
@@ -425,43 +448,30 @@ class CategoryAwareTokenCleaner:
             gap_size = end - start
             
             if gap_size <= max_gap_minutes:
-                if gap_size == 1:
-                    # Linear interpolation for 1-minute gaps
-                    df.iloc[start:end] = df.interpolate().iloc[start:end]
-                    method = 'linear'
-                elif gap_size <= 3:
-                    # Linear interpolation for small gaps
-                    df.iloc[start:end] = df.interpolate().iloc[start:end]
-                    method = 'linear'
-                elif gap_size <= 6:
-                    # Polynomial for medium gaps
-                    df.iloc[start:end] = df.interpolate(method='polynomial', order=2).iloc[start:end]
-                    method = 'polynomial'
-                else:
-                    # Forward fill + linear for larger gaps
-                    df.iloc[start:end] = df.fillna(method='ffill').interpolate().iloc[start:end]
-                    method = 'ffill_linear'
+                # Use linear interpolation for all gap sizes
+                df = df.with_columns([
+                    pl.col('price').interpolate().alias('price')
+                ])
                 
                 modifications.append({
                     'type': 'gap_filled',
-                    'start': start,
-                    'end': end,
-                    'size_minutes': gap_size,
-                    'method': method
+                    'start': int(start),
+                    'end': int(end),
+                    'size_minutes': int(gap_size),
+                    'method': 'linear'
                 })
             else:
                 modifications.append({
                     'type': 'gap_too_large',
-                    'start': start,
-                    'end': end,
-                    'size_minutes': gap_size,
+                    'start': int(start),
+                    'end': int(end),
+                    'size_minutes': int(gap_size),
                     'action': 'left_unfilled'
                 })
         
-        df = df.reset_index().rename(columns={'index': 'datetime'})
         return df, modifications
 
-    def _handle_invalid_prices_conservative(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _handle_invalid_prices_conservative(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """Handle zero/negative prices conservatively"""
         modifications = []
         
@@ -473,18 +483,24 @@ class CategoryAwareTokenCleaner:
             return df, modifications
         
         # If >5% of data is invalid, flag for exclusion
-        if invalid_count / len(df) > 0.05:
+        if invalid_count / df.height > 0.05:
             modifications.append({
                 'type': 'too_many_invalid_prices',
                 'invalid_count': invalid_count,
-                'total_count': len(df),
-                'percentage': (invalid_count / len(df)) * 100
+                'total_count': df.height,
+                'percentage': (invalid_count / df.height) * 100
             })
             return None, modifications
         
         # Interpolate isolated invalid prices
-        df.loc[invalid_mask, 'price'] = np.nan
-        df['price'] = df['price'].interpolate()
+        df = df.with_columns([
+            pl.when(pl.col('price') <= 0)
+            .then(None)
+            .otherwise(pl.col('price'))
+            .alias('price')
+        ]).with_columns([
+            pl.col('price').interpolate().alias('price')
+        ])
         
         modifications.append({
             'type': 'invalid_prices_interpolated',
@@ -494,7 +510,7 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
-    def _handle_impossible_values_only(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
+    def _handle_impossible_values_only(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """Handle only impossible values (negative prices, exact zeros from data errors)"""
         modifications = []
         
@@ -506,17 +522,23 @@ class CategoryAwareTokenCleaner:
             return df, modifications
         
         # If >10% of data is impossible, flag for exclusion (higher threshold for extreme tokens)
-        if impossible_count / len(df) > 0.10:
+        if impossible_count / df.height > 0.10:
             modifications.append({
                 'type': 'too_many_impossible_values',
                 'impossible_count': impossible_count,
-                'total_count': len(df)
+                'total_count': df.height
             })
             return None, modifications
         
         # Interpolate impossible values only
-        df.loc[impossible_mask, 'price'] = np.nan
-        df['price'] = df['price'].interpolate()
+        df = df.with_columns([
+            pl.when((pl.col('price') < 0) | (pl.col('price') == 0))
+            .then(None)
+            .otherwise(pl.col('price'))
+            .alias('price')
+        ]).with_columns([
+            pl.col('price').interpolate().alias('price')
+        ])
         
         modifications.append({
             'type': 'impossible_values_fixed',
@@ -571,70 +593,70 @@ def clean_category(category: str, limit: Optional[int] = None) -> Dict:
         else:
             error_count += 1
     
-    # Save cleaning log
-    log_df = pd.DataFrame(results)
+    # Save cleaning log using Polars
+    log_df = pl.DataFrame(results)
     log_path = CLEANED_BASE / f'{category}_cleaning_log.json'
-    log_df.to_json(log_path, orient='records', lines=True)
+    log_df.write_json(log_path)
     
     summary = {
         'category': category,
-        'total_files': len(parquet_files),
+        'total_files_processed': len(parquet_files),
         'successfully_cleaned': success_count,
         'errors': error_count,
-        'success_rate': (success_count / len(parquet_files)) * 100,
-        'log_saved_to': str(log_path),
-        'strategy_used': CATEGORIES.get(category, 'gentle')
+        'success_rate': (success_count / len(parquet_files)) * 100 if parquet_files else 0,
+        'cleaning_log_path': str(log_path)
     }
     
-    logger.info(f"Cleaning complete for {category}: {success_count}/{len(parquet_files)} successful")
+    logger.info(f"Category {category} cleaning complete: {success_count}/{len(parquet_files)} files cleaned successfully")
     return summary
 
 def clean_all_categories(limit_per_category: Optional[int] = None) -> Dict:
     """
-    Clean all token categories with appropriate strategies
+    Clean all categories with their appropriate strategies
     
     Args:
-        limit_per_category: Optional limit on files per category
+        limit_per_category: Optional limit on number of files to process per category
         
     Returns:
-        Summary of all cleaning operations
+        Summary statistics of entire cleaning process
     """
-    logger.info("Starting category-aware cleaning for all token categories")
+    logger.info("Starting comprehensive cleaning of all categories")
     
-    all_results = {}
-    total_success = 0
+    results = {}
     total_files = 0
+    total_success = 0
+    total_errors = 0
     
     for category in CATEGORIES.keys():
-        logger.info(f"\n{'='*50}")
-        logger.info(f"Cleaning category: {category}")
-        logger.info(f"Strategy: {CATEGORIES[category]}")
-        logger.info(f"{'='*50}")
-        
+        logger.info(f"\n--- Cleaning category: {category} ---")
         result = clean_category(category, limit_per_category)
-        all_results[category] = result
+        results[category] = result
         
-        if 'total_files' in result:
-            total_files += result['total_files']
-            total_success += result.get('successfully_cleaned', 0)
+        if 'total_files_processed' in result:
+            total_files += result['total_files_processed']
+            total_success += result['successfully_cleaned']
+            total_errors += result['errors']
     
     # Overall summary
     overall_summary = {
-        'total_categories': len(CATEGORIES),
         'total_files_processed': total_files,
         'total_successfully_cleaned': total_success,
-        'overall_success_rate': (total_success / total_files * 100) if total_files > 0 else 0,
-        'category_results': all_results,
-        'cleaning_strategies_used': CATEGORIES
+        'total_errors': total_errors,
+        'overall_success_rate': (total_success / total_files) * 100 if total_files > 0 else 0,
+        'category_results': results,
+        'timestamp': datetime.now().isoformat()
     }
     
-    logger.info(f"\n{'='*60}")
-    logger.info("OVERALL CLEANING SUMMARY")
-    logger.info(f"{'='*60}")
+    # Save overall summary using Polars
+    summary_path = CLEANED_BASE / 'cleaning_summary.json'
+    pl.DataFrame([overall_summary]).write_json(summary_path)
+    
+    logger.info(f"\n=== CLEANING COMPLETE ===")
     logger.info(f"Total files processed: {total_files}")
     logger.info(f"Successfully cleaned: {total_success}")
-    logger.info(f"Overall success rate: {overall_summary['overall_success_rate']:.1f}%")
-    logger.info(f"Cleaned files saved to: {CLEANED_BASE}")
+    logger.info(f"Errors: {total_errors}")
+    logger.info(f"Success rate: {overall_summary['overall_success_rate']:.1f}%")
+    logger.info(f"Summary saved to: {summary_path}")
     
     return overall_summary
 
@@ -642,150 +664,200 @@ def clean_category_with_gap_investigation(category: str,
                                         investigation_results: Optional[Dict] = None,
                                         limit: Optional[int] = None) -> Dict:
     """
-    Clean a category with optional gap investigation results to exclude problematic tokens
+    Clean a category with intelligent gap handling based on investigation results
     
     Args:
-        category: Category to clean
-        investigation_results: Results from gap investigation (optional)
-        limit: Limit number of tokens to process
+        category: Category name
+        investigation_results: Results from gap investigation to guide cleaning decisions
+        limit: Optional limit on number of files to process
         
     Returns:
-        Dictionary with cleaning results
+        Summary statistics of cleaning process
     """
-    try:
-        # Get tokens to exclude based on investigation
-        tokens_to_exclude = set()
-        if investigation_results:
-            tokens_to_exclude.update(investigation_results.get('recommendations', {}).get('remove_completely', []))
-            print(f"Excluding {len(tokens_to_exclude)} tokens based on gap investigation")
+    cleaner = CategoryAwareTokenCleaner()
+    category_folder = PROCESSED_BASE / category
+    
+    if not category_folder.exists():
+        logger.error(f"Category folder {category_folder} does not exist")
+        return {'error': f"Category folder {category} not found"}
+    
+    # Get all parquet files
+    parquet_files = list(category_folder.glob('*.parquet'))
+    if limit:
+        parquet_files = parquet_files[:limit]
+    
+    if not parquet_files:
+        logger.warning(f"No parquet files found in {category_folder}")
+        return {'warning': f"No files found in {category}"}
+    
+    # Determine enhanced cleaning strategy based on investigation
+    if investigation_results and 'recommendations' in investigation_results:
+        recommendations = investigation_results['recommendations']
         
-        # Get source directory
-        source_dir = PROCESSED_BASE / category
-        if not source_dir.exists():
-            return {
+        # Override cleaning strategy based on gap investigation
+        enhanced_strategies = {}
+        
+        # Tokens recommended for removal - skip cleaning
+        skip_tokens = set()
+        if 'remove_completely' in recommendations:
+            skip_tokens.update(recommendations['remove_completely'])
+        
+        # Tokens that need manual review - use gentle cleaning
+        gentle_tokens = set()
+        if 'needs_manual_review' in recommendations:
+            gentle_tokens.update(recommendations['needs_manual_review'])
+        
+        # Tokens that can be kept and cleaned - use appropriate strategy
+        clean_tokens = set()
+        if 'keep_and_clean' in recommendations:
+            clean_tokens.update(recommendations['keep_and_clean'])
+        
+        logger.info(f"Gap investigation guided strategy:")
+        logger.info(f"  Skip cleaning: {len(skip_tokens)} tokens")
+        logger.info(f"  Gentle clean: {len(gentle_tokens)} tokens")
+        logger.info(f"  Standard clean: {len(clean_tokens)} tokens")
+    else:
+        skip_tokens = set()
+        gentle_tokens = set()
+        clean_tokens = set()
+    
+    # Process files with enhanced strategy
+    results = []
+    success_count = 0
+    error_count = 0
+    skipped_count = 0
+    
+    logger.info(f"Cleaning {len(parquet_files)} tokens from {category} with gap investigation guidance")
+    
+    for i, file_path in enumerate(parquet_files):
+        token_name = file_path.stem
+        
+        if (i + 1) % 10 == 0:
+            logger.info(f"Processed {i + 1}/{len(parquet_files)} files")
+        
+        # Check if token should be skipped based on investigation
+        if token_name in skip_tokens:
+            results.append({
+                'token': token_name,
                 'category': category,
-                'status': 'source_directory_not_found',
-                'source_dir': str(source_dir)
-            }
+                'status': 'skipped_per_investigation',
+                'reason': 'recommended_for_removal'
+            })
+            skipped_count += 1
+            continue
         
-        # Get all parquet files
-        token_files = list(source_dir.glob("*.parquet"))
-        
-        if limit:
-            token_files = token_files[:limit]
-        
-        # Filter out excluded tokens
-        if tokens_to_exclude:
-            original_count = len(token_files)
-            token_files = [f for f in token_files if f.stem not in tokens_to_exclude]
-            excluded_count = original_count - len(token_files)
-            print(f"Filtered out {excluded_count} tokens from {category} based on gap investigation")
-        
-        if not token_files:
-            return {
-                'category': category,
-                'status': 'no_files_found_after_filtering',
-                'tokens_excluded': len(tokens_to_exclude)
-            }
-        
-        # Initialize cleaner and process files
-        cleaner = CategoryAwareTokenCleaner()
-        
-        results = {
-            'category': category,
-            'total_files': len(token_files),
-            'tokens_excluded_by_investigation': len(tokens_to_exclude),
-            'successful_cleanings': 0,
-            'failed_cleanings': 0,
-            'excluded_due_to_issues': 0,
-            'cleaning_logs': [],
-            'status': 'processing'
-        }
-        
-        print(f"\nCleaning {category} category...")
-        print(f"Processing {len(token_files)} files (excluded {len(tokens_to_exclude)} based on investigation)")
-        
-        for token_file in tqdm(token_files, desc=f"Cleaning {category}"):
-            log = cleaner.clean_token_file(token_file, category)
-            results['cleaning_logs'].append(log)
+        # Apply appropriate cleaning strategy
+        if token_name in gentle_tokens:
+            # Force gentle cleaning regardless of category
+            original_strategy = cleaner.cleaning_strategies[CATEGORIES.get(category, 'gentle')]
+            cleaner.cleaning_strategies[CATEGORIES.get(category, 'gentle')] = cleaner._gentle_cleaning
             
-            if log['status'] == 'cleaned_successfully':
-                results['successful_cleanings'] += 1
-            elif log['status'] == 'excluded_due_to_severe_issues':
-                results['excluded_due_to_issues'] += 1
-            else:
-                results['failed_cleanings'] += 1
+        result = cleaner.clean_token_file(file_path, category)
+        results.append(result)
         
-        results['status'] = 'completed'
+        # Restore original strategy
+        if token_name in gentle_tokens:
+            cleaner.cleaning_strategies[CATEGORIES.get(category, 'gentle')] = original_strategy
         
-        # Print summary
-        print(f"\n{category.upper()} CLEANING SUMMARY:")
-        print(f"  Total files processed: {results['total_files']}")
-        print(f"  Excluded by investigation: {results['tokens_excluded_by_investigation']}")
-        print(f"  Successfully cleaned: {results['successful_cleanings']}")
-        print(f"  Excluded due to issues: {results['excluded_due_to_issues']}")
-        print(f"  Failed: {results['failed_cleanings']}")
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error cleaning category {category}: {e}")
-        return {
-            'category': category,
-            'status': 'error',
-            'error': str(e)
-        }
+        if result['status'] == 'cleaned_successfully':
+            success_count += 1
+        else:
+            error_count += 1
+    
+    # Save enhanced cleaning log
+    log_df = pl.DataFrame(results)
+    log_path = CLEANED_BASE / f'{category}_enhanced_cleaning_log.json'
+    log_df.write_json(log_path)
+    
+    summary = {
+        'category': category,
+        'total_files_processed': len(parquet_files),
+        'successfully_cleaned': success_count,
+        'errors': error_count,
+        'skipped': skipped_count,
+        'success_rate': (success_count / (len(parquet_files) - skipped_count)) * 100 if (len(parquet_files) - skipped_count) > 0 else 0,
+        'cleaning_log_path': str(log_path),
+        'investigation_guided': investigation_results is not None
+    }
+    
+    logger.info(f"Enhanced category {category} cleaning complete:")
+    logger.info(f"  Cleaned: {success_count}")
+    logger.info(f"  Errors: {error_count}")
+    logger.info(f"  Skipped: {skipped_count}")
+    
+    return summary
 
 def clean_all_categories_with_investigation(investigation_results: Optional[Dict] = None,
                                           limit_per_category: Optional[int] = None) -> Dict:
     """
-    Clean all categories with gap investigation results
+    Clean all categories with intelligent gap handling based on investigation results
     
     Args:
-        investigation_results: Results from gap investigation
-        limit_per_category: Limit tokens per category
+        investigation_results: Results from comprehensive gap investigation
+        limit_per_category: Optional limit on number of files to process per category
         
     Returns:
-        Dictionary with all cleaning results
+        Summary statistics of entire enhanced cleaning process
     """
-    print("="*60)
-    print("CATEGORY-AWARE TOKEN CLEANING WITH GAP INVESTIGATION")
-    print("="*60)
+    logger.info("Starting enhanced cleaning of all categories with gap investigation guidance")
     
     if investigation_results:
-        print(f"Using gap investigation results:")
-        for action, tokens in investigation_results.get('recommendations', {}).items():
-            print(f"  {action}: {len(tokens)} tokens")
+        logger.info("Gap investigation results will guide cleaning decisions")
+        logger.info(f"Tokens to skip: {len(investigation_results.get('recommendations', {}).get('remove_completely', []))}")
+        logger.info(f"Tokens for manual review: {len(investigation_results.get('recommendations', {}).get('needs_manual_review', []))}")
+        logger.info(f"Tokens to clean: {len(investigation_results.get('recommendations', {}).get('keep_and_clean', []))}")
+    else:
+        logger.info("No gap investigation results provided - using standard category cleaning")
     
-    all_results = {}
+    results = {}
+    total_files = 0
+    total_success = 0
+    total_errors = 0
+    total_skipped = 0
     
     for category in CATEGORIES.keys():
-        print(f"\n{'='*20} {category.upper()} {'='*20}")
-        results = clean_category_with_gap_investigation(category, investigation_results, limit_per_category)
-        all_results[category] = results
+        logger.info(f"\n--- Enhanced cleaning category: {category} ---")
+        result = clean_category_with_gap_investigation(
+            category, 
+            investigation_results, 
+            limit_per_category
+        )
+        results[category] = result
+        
+        if 'total_files_processed' in result:
+            total_files += result['total_files_processed']
+            total_success += result['successfully_cleaned']
+            total_errors += result['errors']
+            total_skipped += result.get('skipped', 0)
     
-    # Overall summary
-    total_processed = sum(r.get('total_files', 0) for r in all_results.values())
-    total_successful = sum(r.get('successful_cleanings', 0) for r in all_results.values())
-    total_excluded_investigation = sum(r.get('tokens_excluded_by_investigation', 0) for r in all_results.values())
-    total_excluded_issues = sum(r.get('excluded_due_to_issues', 0) for r in all_results.values())
+    # Overall enhanced summary
+    overall_summary = {
+        'total_files_processed': total_files,
+        'total_successfully_cleaned': total_success,
+        'total_errors': total_errors,
+        'total_skipped': total_skipped,
+        'overall_success_rate': (total_success / (total_files - total_skipped)) * 100 if (total_files - total_skipped) > 0 else 0,
+        'category_results': results,
+        'investigation_guided': investigation_results is not None,
+        'timestamp': datetime.now().isoformat()
+    }
     
-    print(f"\n{'='*60}")
-    print("OVERALL CLEANING SUMMARY")
-    print(f"{'='*60}")
-    print(f"Total files processed: {total_processed}")
-    print(f"Excluded by gap investigation: {total_excluded_investigation}")
-    print(f"Successfully cleaned: {total_successful}")
-    print(f"Excluded due to cleaning issues: {total_excluded_issues}")
-    print(f"Success rate: {total_successful/max(total_processed,1)*100:.1f}%")
+    # Save enhanced summary
+    summary_path = CLEANED_BASE / 'enhanced_cleaning_summary.json'
+    pl.DataFrame([overall_summary]).write_json(summary_path)
     
-    return all_results
+    logger.info(f"\n=== ENHANCED CLEANING COMPLETE ===")
+    logger.info(f"Total files processed: {total_files}")
+    logger.info(f"Successfully cleaned: {total_success}")
+    logger.info(f"Errors: {total_errors}")
+    logger.info(f"Skipped (per investigation): {total_skipped}")
+    logger.info(f"Success rate: {overall_summary['overall_success_rate']:.1f}%")
+    logger.info(f"Enhanced summary saved to: {summary_path}")
+    
+    return overall_summary
 
-if __name__ == '__main__':
-    # Example usage - clean all categories
+if __name__ == "__main__":
+    # Example usage
     summary = clean_all_categories(limit_per_category=None)
-    
-    # Save overall summary
-    summary_path = CLEANED_BASE / 'overall_cleaning_summary.json'
-    pd.Series(summary).to_json(summary_path, indent=2)
-    logger.info(f"Overall summary saved to: {summary_path}") 
+    print("Cleaning complete!")
+    print(f"Overall success rate: {summary['overall_success_rate']:.1f}%") 

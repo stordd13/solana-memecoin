@@ -10,7 +10,7 @@ import os
 import argparse
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
-import pandas as pd
+
 import json
 from collections import defaultdict, Counter
 

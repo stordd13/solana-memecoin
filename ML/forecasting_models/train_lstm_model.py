@@ -502,7 +502,7 @@ def main():
     
     # Configuration
     CONFIG = {
-        'base_dir': Path("data/cleaned"),  # Corrected path
+        'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
         'results_dir': Path("ML/results/lstm"),
         'categories': [
             "normal_behavior_tokens",      # Best quality

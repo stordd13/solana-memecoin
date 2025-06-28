@@ -47,6 +47,7 @@ Thumbs.db
 .ipynb_checkpoints
 
 # Data files (too large for Git)
+analysis_results/
 data/
 results/
 *.parquet
