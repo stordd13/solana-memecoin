@@ -1,0 +1,698 @@
+"""
+Unified LSTM Model with Expanding Windows for All Horizon Directional Prediction
+This model uses expanding windows (all history from launch to current minute) instead of fixed sliding windows.
+
+IMPORTANT WORKFLOW:
+1. Run feature_engineering/advanced_feature_engineering.py FIRST
+2. Then run this script to train on pre-engineered features with expanding windows
+
+Key Innovation: Instead of fixed 60-minute windows, uses ALL available price history up to each prediction point.
+This allows the model to learn from complete token lifecycle patterns.
+"""
+
+import os
+import numpy as np
+import polars as pl
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import plotly.graph_objects as go
+import plotly.subplots as sp
+from tqdm import tqdm
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+# --- Configuration ---
+CONFIG = {
+    'base_dir': Path("data/features"),
+    'features_dir': Path("data/features"),
+    'results_dir': Path("ML/results/unified_lstm_expanding"),
+    'categories': [
+        "normal_behavior_tokens",
+        "tokens_with_extremes",
+        "dead_tokens",
+    ],
+    'min_sequence_length': 3,    # Start predicting at minute 3
+    'max_sequence_length': 240,  # Cap at 4 hours for memory efficiency
+    'horizons': [15, 30, 60, 120, 240, 360, 720],
+    'batch_size': 32,            # Smaller due to variable sequence lengths
+    'epochs': 50,
+    'learning_rate': 0.001,
+    'random_state': 42,
+    'early_stopping_patience': 10,
+    'val_size': 0.2,
+    'test_size': 0.2,
+    'hidden_size': 64,           # Larger to handle variable sequences
+    'num_layers': 3,             # Deeper for complex patterns
+    'dropout': 0.3,
+    'focal_alpha': 0.25,
+    'focal_gamma': 2.0,
+}
+
+def smart_data_split(all_paths: List[Path]) -> Tuple[List[Path], List[Path], List[Path]]:
+    """Split data intelligently with stratification by category"""
+    print("\nAnalyzing data distribution...")
+    
+    # Group paths by category
+    category_paths = {}
+    for path in all_paths:
+        category = path.parent.name
+        if category not in category_paths:
+            category_paths[category] = []
+        category_paths[category].append(path)
+    
+    # Display distribution
+    print("\nFiles per category:")
+    for cat, paths in category_paths.items():
+        print(f"  {cat}: {len(paths)} files")
+    
+    # Stratified split by category
+    train_paths, val_paths, test_paths = [], [], []
+    
+    for category, paths in category_paths.items():
+        np.random.shuffle(paths)
+        n = len(paths)
+        n_train = int(n * 0.7)
+        n_val = int(n * 0.15)
+        
+        train_paths.extend(paths[:n_train])
+        val_paths.extend(paths[n_train:n_train + n_val])
+        test_paths.extend(paths[n_train + n_val:])
+        
+        print(f"\n{category}:")
+        print(f"  Train: {n_train}, Val: {n_val}, Test: {n - n_train - n_val}")
+    
+    np.random.shuffle(train_paths)
+    np.random.shuffle(val_paths)
+    np.random.shuffle(test_paths)
+    
+    print(f"\nTotal split:")
+    print(f"  Train: {len(train_paths)} files")
+    print(f"  Val: {len(val_paths)} files")
+    print(f"  Test: {len(test_paths)} files")
+    
+    return train_paths, val_paths, test_paths
+
+# --- Expanding Window Dataset Class ---
+class ExpandingWindowDataset(Dataset):
+    """Dataset that creates expanding windows from token launch to each prediction point."""
+    
+    def __init__(self, 
+                 data_paths: List[Path], 
+                 min_sequence_length: int,
+                 max_sequence_length: int,
+                 horizons: List[int]):
+        
+        self.min_sequence_length = min_sequence_length
+        self.max_sequence_length = max_sequence_length
+        self.horizons = sorted(horizons)
+        
+        self.sequences = []
+        self.labels = []
+        self.sequence_lengths = []  # Track actual length of each sequence
+        self.token_scalers = {}
+        
+        self._load_data(data_paths)
+    
+    def _load_data(self, data_paths: List[Path]):
+        """Load pre-engineered features and create expanding window sequences."""
+        valid_files = []
+        
+        print(f"Loading pre-engineered features from {len(data_paths)} files...")
+        
+        # First pass: check valid files
+        for path in tqdm(data_paths, desc="1/2 Validating feature files"):
+            try:
+                token_name = path.stem
+                
+                # Load features directly from the category path
+                if path.exists() and path.suffix == '.parquet':
+                    features_df = pl.read_parquet(path)
+                else:
+                    continue
+                
+                # Check if we have enough data for expanding windows
+                if len(features_df) < self.min_sequence_length + max(self.horizons):
+                    continue
+                
+                # Check for required columns
+                required_cols = ['price', 'datetime']
+                if not all(col in features_df.columns for col in required_cols):
+                    continue
+                    
+                valid_files.append((path, features_df))
+                
+            except Exception as e:
+                print(f"Error loading features for {path.name}: {e}")
+                continue
+
+        print(f"Found {len(valid_files)} tokens with valid pre-engineered features")
+        
+        # Second pass: create expanding window sequences
+        for path, features_df in tqdm(valid_files, desc="2/2 Creating expanding window sequences"):
+            try:
+                token_id = path.stem
+                
+                # Select numeric feature columns (exclude metadata)
+                exclude_cols = ['datetime', 'token_id', 'price']
+                feature_cols = [col for col in features_df.columns 
+                              if col not in exclude_cols and features_df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]]
+                
+                if len(feature_cols) < 10:  # Need at least 10 features
+                    print(f"Not enough features for {token_id}: {len(feature_cols)}")
+                    continue
+                
+                # Extract feature matrix and prices
+                feature_matrix = features_df[feature_cols].to_numpy()
+                prices = features_df['price'].to_numpy()
+                
+                # Create per-token scaler for features
+                scaler = RobustScaler()
+                scaler.fit(feature_matrix)
+                self.token_scalers[token_id] = scaler
+                
+                self._create_expanding_sequences(feature_matrix, prices, token_id, scaler)
+                
+            except Exception as e:
+                print(f"Error processing features for {path.name}: {e}")
+                continue
+
+        print(f"Created {len(self.sequences)} expanding window sequences total")
+        
+        if len(self.sequences) > 0:
+            # Convert to tensors - sequences will be padded during batching
+            self.labels = torch.FloatTensor(self.labels)
+        else:
+            print("WARNING: No expanding window sequences were created! Check feature engineering output.")
+    
+    def _create_expanding_sequences(self, feature_matrix: np.ndarray, prices: np.ndarray, token_id: str, scaler: RobustScaler):
+        """Create expanding window sequences from token launch to each prediction point."""
+        features_norm = scaler.transform(feature_matrix)
+        
+        max_horizon = max(self.horizons)
+        
+        # Create expanding windows starting from min_sequence_length
+        for current_minute in range(self.min_sequence_length, len(features_norm) - max_horizon + 1):
+            # Expanding window: from start (minute 0) to current_minute
+            sequence_length = current_minute
+            
+            # Cap sequence length for memory efficiency
+            if sequence_length > self.max_sequence_length:
+                # Use last max_sequence_length minutes
+                start_idx = current_minute - self.max_sequence_length
+                seq = features_norm[start_idx:current_minute]
+                actual_length = self.max_sequence_length
+            else:
+                # Use all history from launch
+                seq = features_norm[:current_minute]
+                actual_length = sequence_length
+            
+            # Skip if too many NaNs in inputs
+            nan_ratio = np.isnan(seq).sum() / seq.size
+            if nan_ratio > 0.1:
+                continue
+
+            current_price = prices[current_minute - 1]
+            if np.isnan(current_price):
+                continue
+                
+            # Create labels for all horizons
+            horizon_labels = []
+            valid_sequence = True
+            for h in self.horizons:
+                future_idx = current_minute + h - 1
+                if future_idx < len(prices):
+                    future_price = prices[future_idx]
+                    if np.isnan(future_price):
+                        valid_sequence = False
+                        break
+                    label = 1.0 if future_price > current_price else 0.0
+                    horizon_labels.append(label)
+                else:
+                    valid_sequence = False
+                    break
+
+            if not valid_sequence:
+                continue
+
+            # Clean any remaining NaNs in the sequence
+            if np.isnan(seq).any():
+                for col in range(seq.shape[1]):
+                    col_data = seq[:, col]
+                    mask = np.isnan(col_data)
+                    if mask.any() and not mask.all():
+                        seq[mask, col] = np.interp(np.where(mask)[0], np.where(~mask)[0], col_data[~mask])
+
+            self.sequences.append(seq)
+            self.labels.append(horizon_labels)
+            self.sequence_lengths.append(actual_length)
+    
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return self.sequences[idx], self.labels[idx], self.sequence_lengths[idx]
+
+def collate_fn(batch):
+    """Custom collate function to handle variable length sequences."""
+    sequences, labels, lengths = zip(*batch)
+    
+    # Find max length in this batch
+    max_len = max(len(seq) for seq in sequences)
+    
+    # Pad sequences to max length
+    padded_sequences = []
+    for seq in sequences:
+        if len(seq) < max_len:
+            # Pad with zeros at the beginning (left padding)
+            padding = np.zeros((max_len - len(seq), seq.shape[1]))
+            padded_seq = np.vstack([padding, seq])
+        else:
+            padded_seq = seq
+        padded_sequences.append(padded_seq)
+    
+    # Convert to tensors
+    sequences_tensor = torch.FloatTensor(np.array(padded_sequences))
+    labels_tensor = torch.FloatTensor(labels)
+    lengths_tensor = torch.LongTensor(lengths)
+    
+    return sequences_tensor, labels_tensor, lengths_tensor
+
+# --- Expanding Window LSTM Architecture ---
+class ExpandingWindowLSTM(nn.Module):
+    """LSTM model designed for expanding window sequences with variable lengths."""
+    
+    def __init__(self, 
+                 input_size: int,
+                 hidden_size: int = 64,
+                 num_layers: int = 3,
+                 dropout: float = 0.3,
+                 horizons: List[int] = [15, 30, 60, 120, 240, 360, 720]):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # LSTM with dropout
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True
+        )
+        
+        # Attention mechanism to focus on relevant parts of the expanding sequence
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=8,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Feature extractor after LSTM + attention
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        
+        # Separate output heads for each horizon
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size // 2, hidden_size // 4),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size // 4, 1)
+            ) for _ in horizons
+        ])
+    
+    def forward(self, x, lengths):
+        batch_size, seq_len, _ = x.shape
+        
+        # Pack padded sequences for efficient LSTM processing
+        packed_x = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        
+        # LSTM forward pass
+        packed_lstm_out, (hidden, cell) = self.lstm(packed_x)
+        
+        # Unpack sequences
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_lstm_out, batch_first=True
+        )
+        
+        # Apply attention to focus on relevant parts of the sequence
+        # Use the last hidden state as query for all positions
+        last_hidden = hidden[-1].unsqueeze(1)  # (batch_size, 1, hidden_size)
+        
+        # Self-attention over the LSTM outputs
+        attended_out, attention_weights = self.attention(
+            last_hidden, lstm_out, lstm_out
+        )
+        
+        # Use attended output
+        final_features = attended_out.squeeze(1)  # (batch_size, hidden_size)
+        
+        # Extract features
+        features = self.feature_extractor(final_features)
+        
+        # Generate predictions for each horizon
+        outputs = [head(features) for head in self.output_heads]
+        outputs = torch.cat(outputs, dim=1)
+        
+        return torch.sigmoid(outputs)
+
+# --- Focal Loss for Class Imbalance ---
+class FocalLoss(nn.Module):
+    """Focal Loss to handle class imbalance better than standard BCE"""
+    
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, inputs, targets):
+        bce_loss = nn.functional.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
+
+def train_model(model, train_loader, val_loader, config):
+    """Train the expanding window LSTM model."""
+    # Use MPS (Apple Silicon GPU) if available, then CUDA, then CPU
+    if torch.backends.mps.is_available():
+        device = 'mps'
+    elif torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+    model = model.to(device)
+    
+    # Use focal loss instead of BCE
+    criterion = FocalLoss(alpha=config['focal_alpha'], gamma=config['focal_gamma'])
+    
+    # Use AdamW with weight decay
+    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-4)
+    
+    # Add learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    
+    print(f"\nTraining expanding window LSTM on {device}...")
+    for epoch in range(config['epochs']):
+        model.train()
+        train_loss = 0
+        for batch_x, batch_y, batch_lengths in train_loader:
+            batch_x, batch_y, batch_lengths = batch_x.to(device), batch_y.to(device), batch_lengths.to(device)
+            optimizer.zero_grad()
+            outputs = model(batch_x, batch_lengths)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            
+            # Gradient clipping for stability with variable sequences
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_x, batch_y, batch_lengths in val_loader:
+                batch_x, batch_y, batch_lengths = batch_x.to(device), batch_y.to(device), batch_lengths.to(device)
+                outputs = model(batch_x, batch_lengths)
+                val_loss += criterion(outputs, batch_y).item()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+        scheduler.step(avg_val_loss)
+        
+        if (epoch + 1) % 5 == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f'Epoch [{epoch+1}/{config["epochs"]}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {current_lr:.6f}')
+    
+    return model
+
+def evaluate_model(model, test_loader, horizons):
+    """Evaluate using classification metrics for each horizon."""
+    if torch.backends.mps.is_available():
+        device = 'mps'
+    elif torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+    
+    model.eval()
+    all_preds, all_targets = [], []
+    
+    with torch.no_grad():
+        for batch_x, batch_y, batch_lengths in test_loader:
+            batch_x, batch_lengths = batch_x.to(device), batch_lengths.to(device)
+            predictions = model(batch_x, batch_lengths)
+            all_preds.append(predictions.cpu().numpy())
+            all_targets.append(batch_y.numpy())
+            
+    predictions = np.vstack(all_preds)
+    targets = np.vstack(all_targets)
+    
+    metrics = {}
+    for i, h in enumerate(horizons):
+        preds_h = predictions[:, i]
+        targets_h = targets[:, i]
+        binary_preds_h = (preds_h > 0.5).astype(int)
+        
+        if h >= 60:
+            horizon_name = f'{h//60}h'
+        else:
+            horizon_name = f'{h}m'
+        
+        metrics[horizon_name] = {
+            'accuracy': accuracy_score(targets_h, binary_preds_h),
+            'precision': precision_score(targets_h, binary_preds_h, zero_division=0),
+            'recall': recall_score(targets_h, binary_preds_h, zero_division=0),
+            'f1_score': f1_score(targets_h, binary_preds_h, zero_division=0),
+            'roc_auc': roc_auc_score(targets_h, preds_h)
+        }
+    
+    return metrics
+
+def plot_metrics(metrics: Dict):
+    """Plot key metrics for all horizons."""
+    horizons = list(metrics.keys())
+    
+    # Create subplots for better organization
+    fig = sp.make_subplots(
+        rows=2, cols=3,
+        subplot_titles=('Accuracy', 'F1 Score', 'Precision', 'Recall', 'ROC AUC', 'Performance Summary'),
+        specs=[[{'type': 'bar'}, {'type': 'bar'}, {'type': 'bar'}],
+               [{'type': 'bar'}, {'type': 'bar'}, {'type': 'bar'}]]
+    )
+    
+    # Individual metric plots
+    metric_names = ['accuracy', 'f1_score', 'precision', 'recall', 'roc_auc']
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    
+    positions = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]
+    
+    for idx, (metric, color) in enumerate(zip(metric_names, colors)):
+        row, col = positions[idx]
+        values = [metrics[h][metric] for h in horizons]
+        
+        fig.add_trace(go.Bar(
+            x=horizons,
+            y=values,
+            text=[f"{v:.2f}" for v in values],
+            textposition='auto',
+            marker_color=color,
+            showlegend=False
+        ), row=row, col=col)
+        
+        # Add baseline line at 50% for reference
+        if metric in ['accuracy', 'f1_score']:
+            fig.add_hline(y=0.5, line_dash="dash", line_color="gray", 
+                         annotation_text="50% Random", row=row, col=col)
+    
+    # Summary plot - all metrics together
+    for i, (metric, color) in enumerate(zip(metric_names, colors)):
+        values = [metrics[h][metric] for h in horizons]
+        fig.add_trace(go.Bar(
+            name=metric.replace('_', ' ').title(),
+            x=horizons,
+            y=values,
+            marker_color=color,
+            showlegend=True
+        ), row=2, col=3)
+    
+    fig.update_layout(
+        height=800,
+        title_text='Expanding Window LSTM: Performance Metrics',
+        barmode='group'
+    )
+    
+    # Add annotation explaining the expanding window approach
+    fig.add_annotation(
+        x=0.02, y=0.98,
+        xref="paper", yref="paper",
+        text="<b>Expanding Window Innovation:</b><br>• Uses ALL history from token launch<br>• Variable sequence lengths (3-240 min)<br>• Attention mechanism for focus<br>• Captures complete lifecycle patterns",
+        showarrow=False,
+        font=dict(size=10),
+        bgcolor="rgba(255,255,255,0.8)",
+        bordercolor="gray",
+        borderwidth=1,
+        align="left"
+    )
+    
+    return fig
+
+def main():
+    """Main training pipeline for the expanding window LSTM model."""
+    print("="*60)
+    print("🚀 Training Expanding Window LSTM Directional Model")
+    print("INNOVATION: Uses ALL token history (expanding windows)")
+    print("All Horizons: 15min, 30min, 1h, 2h, 4h, 6h, 12h")
+    print("="*60)
+    
+    # Check if feature engineering has been run
+    if not CONFIG['features_dir'].exists():
+        print(f"\n❌ ERROR: Features directory not found: {CONFIG['features_dir']}")
+        print("\n🔧 REQUIRED STEP: Run feature engineering first!")
+        print("   python feature_engineering/advanced_feature_engineering.py")
+        print("\nThis will create the pre-engineered features needed for training.")
+        return
+    
+    # Create results directory
+    CONFIG['results_dir'].mkdir(parents=True, exist_ok=True)
+    print(f"Results will be saved to: {CONFIG['results_dir']}")
+    
+    # Load paths and split data
+    all_paths = []
+    for category in CONFIG['categories']:
+        cat_dir = CONFIG['base_dir'] / category
+        if cat_dir.exists():
+            all_paths.extend(list(cat_dir.glob("*.parquet")))
+    
+    if not all_paths:
+        print(f"ERROR: No files found in {CONFIG['base_dir']}. Exiting.")
+        return
+
+    train_paths, val_paths, test_paths = smart_data_split(all_paths)
+    
+    # Create datasets with expanding windows
+    print("\nCreating expanding window datasets...")
+    train_dataset = ExpandingWindowDataset(
+        train_paths, 
+        CONFIG['min_sequence_length'], 
+        CONFIG['max_sequence_length'],
+        CONFIG['horizons']
+    )
+    
+    if len(train_dataset) == 0:
+        print("ERROR: Training dataset is empty. Check feature engineering output.")
+        return
+
+    val_dataset = ExpandingWindowDataset(
+        val_paths, 
+        CONFIG['min_sequence_length'], 
+        CONFIG['max_sequence_length'],
+        CONFIG['horizons']
+    )
+    
+    test_dataset = ExpandingWindowDataset(
+        test_paths, 
+        CONFIG['min_sequence_length'], 
+        CONFIG['max_sequence_length'],
+        CONFIG['horizons']
+    )
+    
+    # Determine input size from first sample
+    sample_sequence, _, _ = train_dataset[0]
+    input_size = sample_sequence.shape[1]
+    print(f"Using {input_size} features per timestep for expanding window LSTM")
+    
+    # Create dataloaders with custom collate function
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=CONFIG['batch_size'], 
+        shuffle=True, 
+        collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=CONFIG['batch_size'], 
+        collate_fn=collate_fn
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=CONFIG['batch_size'], 
+        collate_fn=collate_fn
+    )
+    
+    # Initialize and train model
+    model_params = {
+        'input_size': input_size,
+        'hidden_size': CONFIG['hidden_size'],
+        'num_layers': CONFIG['num_layers'],
+        'dropout': CONFIG['dropout'],
+        'horizons': CONFIG['horizons']
+    }
+    model = ExpandingWindowLSTM(**model_params)
+    
+    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    model = train_model(model, train_loader, val_loader, CONFIG)
+    
+    # Evaluate
+    print("\nEvaluating on test set...")
+    metrics = evaluate_model(model, test_loader, CONFIG['horizons'])
+    
+    print("\nTest Set Metrics:")
+    for horizon, m in metrics.items():
+        print(f"  Horizon {horizon}:")
+        for name, val in m.items():
+            print(f"    {name.title()}: {val:.2%}")
+
+    # Save model and results
+    model_path = CONFIG['results_dir'] / 'expanding_window_lstm_model.pth'
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': CONFIG,
+        'token_scalers': train_dataset.token_scalers,
+        'metrics': metrics,
+        'input_size': input_size,
+        'model_type': 'expanding_window_lstm'
+    }, model_path)
+    print(f"\nModel saved to: {model_path}")
+    
+    # Create and save plot
+    fig = plot_metrics(metrics)
+    metrics_path = CONFIG['results_dir'] / 'expanding_window_metrics.html'
+    fig.write_html(metrics_path)
+    print(f"Metrics plot saved to: {metrics_path}")
+    
+    # Save metrics as JSON for easy comparison
+    metrics_json_path = CONFIG['results_dir'] / 'metrics.json'
+    with open(metrics_json_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics JSON saved to: {metrics_json_path}")
+    
+    # Print comparison info
+    print(f"\n🎯 EXPANDING WINDOW APPROACH SUMMARY:")
+    print(f"   • Sequence lengths: {CONFIG['min_sequence_length']} to {CONFIG['max_sequence_length']} minutes")
+    print(f"   • Uses ALL token history from launch")
+    print(f"   • Attention mechanism for relevance")
+    print(f"   • Variable length sequences per batch")
+    print(f"   • Compare with fixed-window model results!")
+
+if __name__ == "__main__":
+    main() 

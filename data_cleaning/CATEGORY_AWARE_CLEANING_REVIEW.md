@@ -51,12 +51,18 @@ Two sets of thresholds to distinguish artifacts from legitimate behavior:
 **Philosophy**: Don't over-clean inactive tokens, fix only critical issues
 
 **Process**:
-1. **Fix Severe Data Errors**: Only obvious corruption
-2. **Handle Invalid Prices**: Basic negative/zero price fixes
-3. **Skip Gap Filling**: Don't bother with gaps since token is inactive
-4. **Skip Volatility Cleaning**: Dead tokens don't need volatility management
+1. **🛡️ Remove Death Period (CRITICAL)**: Remove constant price periods ≥60 minutes at end
+2. **Fix Severe Data Errors**: Only obvious corruption
+3. **Handle Invalid Prices**: Basic negative/zero price fixes
+4. **Skip Gap Filling**: Don't bother with gaps since token is inactive
+5. **Skip Volatility Cleaning**: Dead tokens don't need volatility management
 
-**Rationale**: Dead tokens don't need perfect data since they're inactive
+**CRITICAL ANTI-LEAKAGE FIX**: 
+- **Problem**: Models learn "constant price → predict constant price" 
+- **Solution**: Remove bulk of constant periods, keep only 2 minutes for minimal context
+- **Impact**: Prevents artificially inflated forecasting accuracy
+
+**Rationale**: Dead tokens need minimal cleaning but MUST prevent data leakage
 
 ### **3. PRESERVE EXTREMES** (Tokens with Extremes)
 **Philosophy**: Keep ALL legitimate extreme movements - they define these tokens!

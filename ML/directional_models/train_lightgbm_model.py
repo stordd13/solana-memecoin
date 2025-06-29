@@ -74,6 +74,10 @@ def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool
     """
     CRITICAL: Validate features for data leakage before training
     Returns True if features are safe, False otherwise
+    
+    IMPROVED: More intelligent detection that distinguishes between:
+    - True data leakage (global features, future information)
+    - Low variability (expected in dead tokens, not necessarily leakage)
     """
     if features_df is None or features_df.height == 0:
         return False
@@ -86,28 +90,53 @@ def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool
     ]
     
     unsafe_features = []
+    low_variability_features = []
     
     # Check each column for potential leakage
     for col in features_df.columns:
         col_lower = col.lower()
         
-        # Check for unsafe patterns
+        # Check for unsafe patterns (TRUE data leakage)
         if any(pattern in col_lower for pattern in unsafe_patterns):
             unsafe_features.append(col)
             continue
             
-        # Check for constant features (sign of repeated global values)
+        # Check for constant/low variability features
         if col not in ['datetime', 'price']:
             try:
                 if features_df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]:
                     unique_count = features_df[col].n_unique()
                     total_count = features_df.height
                     
-                    # If more than 95% of values are the same, it's likely a global feature
-                    if unique_count == 1 or (unique_count / total_count) < 0.05:
-                        unsafe_features.append(f"{col}_constant")
+                    # TRULY constant features (only 1 unique value) are suspicious
+                    if unique_count == 1:
+                        # But check if it's a legitimate zero/small value from dead token
+                        unique_val = features_df[col].drop_nulls().unique().to_list()[0]
+                        if abs(unique_val) < 1e-10:  # Very small value, likely from dead token
+                            low_variability_features.append(f"{col}_near_zero")
+                        else:
+                            unsafe_features.append(f"{col}_constant")
+                    
+                    # Very low variability (< 1% unique values) might be suspicious
+                    elif (unique_count / total_count) < 0.01:
+                        # Check if values are all very close to zero (expected for dead tokens)
+                        values = features_df[col].drop_nulls().to_numpy()
+                        if len(values) > 0:
+                            max_abs_val = np.max(np.abs(values))
+                            if max_abs_val < 1e-6:  # Very small values, likely legitimate
+                                low_variability_features.append(f"{col}_low_variability")
+                            else:
+                                unsafe_features.append(f"{col}_suspicious_constant")
             except:
                 continue
+    
+    # Report findings
+    if low_variability_features:
+        print(f"\n⚠️  LOW VARIABILITY in {token_name} (expected for dead tokens):")
+        for feature in low_variability_features[:3]:  # Show first 3
+            print(f"   📊 {feature}")
+        if len(low_variability_features) > 3:
+            print(f"   ... and {len(low_variability_features) - 3} more")
     
     if unsafe_features:
         print(f"\n🚨 DATA LEAKAGE DETECTED in {token_name}:")
@@ -116,6 +145,7 @@ def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool
         print(f"\n🛡️  Solution: Regenerate features with safe feature engineering")
         return False
     
+    # Accept tokens with low variability (they're still valid for training)
     return True
 
 

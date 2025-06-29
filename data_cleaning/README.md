@@ -2,6 +2,21 @@
 
 A sophisticated **category-aware cleaning system** designed specifically for memecoin data that intelligently distinguishes between data artifacts and legitimate market behavior.
 
+## 🚨 **CRITICAL DATA LEAKAGE FIX IMPLEMENTED**
+
+**Problem Identified**: Dead tokens with constant price periods at the end would cause **severe data leakage** in forecasting models:
+- Models would learn: "If price constant for X minutes → predict same price"  
+- Result: **Artificially inflated accuracy** (90%+ on dead tokens)
+- **Misleading performance metrics** that don't reflect real predictive ability
+
+**Solution Implemented**: 
+- **`_remove_death_period()`** method in minimal cleaning for dead tokens
+- **Removes constant periods ≥60 minutes** at end of token timelines
+- **Keeps only 2 minutes** of constant price for minimal context
+- **Prevents models from learning trivial constant-price patterns**
+
+**Impact**: Ensures **realistic model performance** and **honest accuracy metrics**
+
 ## 🎯 **Overview**
 
 This system revolutionizes token data cleaning by applying different strategies based on token behavior patterns, ensuring that:
@@ -119,6 +134,11 @@ data/cleaned/
 **Philosophy**: Don't over-clean inactive tokens, fix only critical issues
 
 **What it does**:
+- ✅ **🛡️ REMOVES CONSTANT PRICE PERIODS** (**CRITICAL ANTI-LEAK FIX**)
+  - *How*: Detects constant price periods ≥60 minutes at the end of token timeline
+  - *Method*: `_remove_death_period()` - removes bulk of constant period, keeps only 2 minutes for context
+  - *Why*: **PREVENTS DATA LEAKAGE** - without this, models learn "constant price → predict constant price"
+  - *Impact*: Prevents artificially inflated accuracy metrics on dead tokens
 - ✅ **Fixes severe data errors only**
   - *How*: Detects isolated >100,000% price moves that revert immediately
   - *Method*: `_fix_data_errors()` - replaces with interpolated value between prev/next prices

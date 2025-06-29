@@ -4,6 +4,7 @@ Runs data analysis, cleaning, and feature engineering without Streamlit
 """
 
 import sys
+import argparse
 from pathlib import Path
 import logging
 from datetime import datetime
@@ -25,41 +26,62 @@ from data_analysis.data_quality import DataQualityAnalyzer
 from data_cleaning.clean_tokens import clean_all_categories
 from feature_engineering.advanced_feature_engineering import main as run_feature_engineering
 
+# Data folders you want to include under data/raw/
+RAW_SUBFOLDERS = [
+    "raw/dataset",       # original dataset
+    "raw/dataset-fresh"  # newly added dataset with 10k extra tokens
+]
 
-def run_data_quality_analysis():
-    """Run data quality analysis and export categories"""
+def run_data_quality_analysis(raw_subfolders: list[str] = None):
+    """Run data quality analysis on one or more raw subfolders and export categories"""
+
+    if raw_subfolders is None:
+        raw_subfolders = RAW_SUBFOLDERS
+
     print("\n" + "="*60)
     print("STEP 1: DATA QUALITY ANALYSIS & CATEGORIZATION")
     print("="*60)
     
-    # Initialize data loader and analyzer (uses data/raw/dataset)
-    data_loader = DataLoader(subfolder="raw/dataset")
     analyzer = DataQualityAnalyzer()
     
-    # Get all available tokens
-    available_tokens = data_loader.get_available_tokens()
-    print(f"Found {len(available_tokens)} tokens in raw data")
-    
-    # Analyze each token
+    # Accumulate quality reports across all subfolders
     quality_reports = {}
-    print("\nAnalyzing data quality for all tokens...")
-    
-    for i, token_info in enumerate(available_tokens):
-        if (i + 1) % 100 == 0:
-            print(f"  Processed {i + 1}/{len(available_tokens)} tokens...")
-        
-        try:
-            # Load token data
-            df = data_loader.get_token_data(token_info['symbol'])
-            if df is not None and not df.is_empty():
-                # Analyze quality
-                report = analyzer.analyze_single_file(df, token_info['symbol'])
-                quality_reports[token_info['symbol']] = report
-        except Exception as e:
-            logger.error(f"Error analyzing {token_info['symbol']}: {e}")
+    processed_symbols = set()
+
+    for subfolder in raw_subfolders:
+        # Skip folders that don't exist
+        data_loader = DataLoader(subfolder=subfolder)
+        if not data_loader.base_path.exists():
+            print(f"⚠️  Skipping missing folder: data/{subfolder}")
             continue
-    
-    print(f"\nSuccessfully analyzed {len(quality_reports)} tokens")
+
+        print(f"\n📂 Processing {subfolder} ...")
+
+        available_tokens = data_loader.get_available_tokens()
+        print(f"Found {len(available_tokens)} tokens in data/{subfolder}")
+
+        # Analyze each token
+        for i, token_info in enumerate(available_tokens):
+            symbol = token_info['symbol']
+
+            # Skip duplicates across folders (keep first occurrence)
+            if symbol in processed_symbols:
+                continue
+
+            if (i + 1) % 1000 == 0:
+                print(f"  Processed {i + 1}/{len(available_tokens)} tokens in {subfolder} …")
+
+            try:
+                df = data_loader.get_token_data(symbol)
+                if df is not None and not df.is_empty():
+                    report = analyzer.analyze_single_file(df, symbol)
+                    quality_reports[symbol] = report
+                    processed_symbols.add(symbol)
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol} ({subfolder}): {e}")
+                continue
+
+    print(f"\nSuccessfully analyzed {len(quality_reports)} unique tokens across all folders")
     
     # Export all categories with mutual exclusivity
     print("\n📊 Exporting tokens to mutually exclusive categories...")
@@ -111,15 +133,20 @@ def run_data_cleaning():
         return False
 
 
-def run_feature_engineering_step():
-    """Run feature engineering on cleaned data"""
+def run_feature_engineering_step(fast_mode: bool = False):
+    """Run feature engineering on cleaned data
+    Parameters
+    ----------
+    fast_mode : bool
+        If True, invoke the feature-engineering module in fast mode (rolling features only).
+    """
     print("\n" + "="*60)
     print("STEP 3: FEATURE ENGINEERING")
     print("="*60)
     
     try:
-        # Run feature engineering
-        run_feature_engineering()
+        # Run feature engineering (propagate fast_mode flag)
+        run_feature_engineering(fast_mode=fast_mode)
         return True
         
     except Exception as e:
@@ -127,8 +154,13 @@ def run_feature_engineering_step():
         return False
 
 
-def main():
-    """Run the complete pipeline"""
+def main(fast_mode: bool = False):
+    """Run the complete pipeline
+    Parameters
+    ----------
+    fast_mode : bool
+        If True, use fast mode for feature engineering (rolling features only) to save time.
+    """
     start_time = datetime.now()
     
     print("\n" + "🚀"*20)
@@ -145,7 +177,7 @@ def main():
     }
     
     # Step 1: Data Quality Analysis & Export
-    success, quality_reports = run_data_quality_analysis()
+    success, quality_reports = run_data_quality_analysis(RAW_SUBFOLDERS)
     pipeline_status['data_quality'] = success
     
     if not success:
@@ -163,7 +195,7 @@ def main():
     
     # Step 3: Feature Engineering
     print("\n⏳ Proceeding to feature engineering...")
-    success = run_feature_engineering_step()
+    success = run_feature_engineering_step(fast_mode=fast_mode)
     pipeline_status['feature_engineering'] = success
     
     # Final summary
@@ -198,4 +230,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    parser = argparse.ArgumentParser(description="Memecoin data-processing pipeline")
+    parser.add_argument('--fast', '--fast_mode', action='store_true', dest='fast_mode',
+                        help='Enable fast mode (rolling features only)')
+    args = parser.parse_args()
+
+    main(fast_mode=args.fast_mode) 

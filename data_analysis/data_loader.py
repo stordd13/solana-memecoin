@@ -10,12 +10,13 @@ import re
 import os
 
 class DataLoader:
-    def __init__(self, subfolder: str = "raw/dataset"):
+    def __init__(self, subfolder: str = "raw/dataset", base_path: str | Path | None = None):
         """
         Initialize the data loader
         
         Args:
             subfolder: Subfolder within the data directory (e.g., "raw/dataset", "processed", "cleaned")
+            base_path: Explicit base path for data. If None, uses default project structure
         """
         # Auto-detect project root by looking for characteristic files
         current_dir = Path(__file__).parent  # data_analysis/
@@ -26,10 +27,21 @@ class DataLoader:
             # Fallback: assume we're in the right structure
             project_root = current_dir.parent
         
-        # Always use project_root/data as base, then add the subfolder
-        self.data_root = project_root / "data"
-        self.base_path = self.data_root / subfolder
-        self.subfolder = subfolder
+        # Determine base_path. If an explicit base_path is supplied, use it directly.
+        if base_path is not None:
+            self.base_path = Path(base_path).expanduser().resolve()
+            # data_root is the parent data/ directory if detectable, else explicit path's parent
+            self.data_root = self.base_path.parent
+            # Derive relative subfolder for UI display only
+            try:
+                self.subfolder = str(self.base_path.relative_to(project_root / "data"))
+            except Exception:
+                self.subfolder = str(self.base_path)
+        else:
+            # Always use project_root/data as base, then add the subfolder
+            self.data_root = project_root / "data"
+            self.base_path = self.data_root / subfolder
+            self.subfolder = subfolder
         
         self.logger = logging.getLogger(__name__)
         self.token_cache: Optional[List[Dict[str, str]]] = None

@@ -163,10 +163,16 @@ class CategoryAwareTokenCleaner:
         """
         Minimal cleaning for dead tokens
         - Only fix critical data errors
+        - Remove constant price periods at the end (CRITICAL: prevents data leakage!)
         - Don't bother with gaps or minor issues since token is inactive
         """
         modifications = []
         df = df.clone()
+        
+        # CRITICAL FIX: Remove constant price periods at the end to prevent data leakage
+        df, death_mods = self._remove_death_period(df, token_name)
+        if death_mods:
+            modifications.extend(death_mods)
         
         # Only fix severe data errors and invalid prices
         df, error_mods = self._fix_data_errors(df)
@@ -176,6 +182,75 @@ class CategoryAwareTokenCleaner:
         df, price_mods = self._handle_invalid_prices_conservative(df)
         if price_mods:
             modifications.extend(price_mods)
+        
+        return df, modifications
+
+    def _remove_death_period(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Remove constant price periods at the end of dead tokens to prevent data leakage.
+        
+        This is CRITICAL for ML model integrity - without this, models will learn to predict
+        constant prices when they see a pattern of constant prices, leading to artificially
+        high accuracy metrics.
+        
+        Args:
+            df: Token dataframe sorted by datetime
+            token_name: Name of token for logging
+            
+        Returns:
+            Tuple of (cleaned_df, modifications_list)
+        """
+        modifications = []
+        
+        if df.height < 60:  # Need at least 1 hour of data
+            return df, modifications
+        
+        # Sort by datetime to ensure proper order
+        df = df.sort('datetime')
+        
+        # Find the longest constant price period at the end
+        prices = df['price'].to_list()
+        
+        if not prices:
+            return df, modifications
+        
+        # Work backwards from the end to find where constant period starts
+        last_price = prices[-1]
+        constant_count = 0
+        
+        for i in range(len(prices) - 1, -1, -1):
+            if abs(prices[i] - last_price) < (last_price * 0.0001):  # Allow for tiny rounding differences
+                constant_count += 1
+            else:
+                break
+        
+        # Only remove if constant period is >= 60 minutes (1 hour) to prevent data leakage
+        min_constant_minutes = 60
+        
+        if constant_count >= min_constant_minutes:
+            # Keep minimal constant data for context, remove the bulk to prevent leakage
+            # Keep only 2 minutes of constant price - just enough to show the death transition
+            keep_constant_minutes = 2
+            remove_count = constant_count - keep_constant_minutes
+            
+            if remove_count > 0:
+                # Keep everything except the last 'remove_count' rows
+                df_cleaned = df.head(df.height - remove_count)
+                
+                modifications.append({
+                    'type': 'death_period_removed',
+                    'constant_minutes_total': constant_count,
+                    'constant_minutes_removed': remove_count,
+                    'constant_minutes_kept': keep_constant_minutes,
+                    'constant_price': last_price,
+                    'rows_before': df.height,
+                    'rows_after': df_cleaned.height,
+                    'reason': 'prevent_data_leakage_in_forecasting_models'
+                })
+                
+                print(f"🛡️  ANTI-LEAKAGE: {token_name} - Removed {remove_count} minutes of constant price (kept {keep_constant_minutes} for context)")
+                
+                return df_cleaned, modifications
         
         return df, modifications
 
