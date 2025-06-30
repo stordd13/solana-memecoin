@@ -37,6 +37,30 @@ except ImportError:
 # Import price analysis for on-demand global features
 from data_analysis.price_analysis import PriceAnalyzer
 
+def compute_global_features_on_demand(df: pl.DataFrame, token_name: str) -> Dict:
+    """Compute global features on-demand using the price analysis module"""
+    try:
+        # Initialize price analyzer
+        price_analyzer = PriceAnalyzer()
+        
+        # Convert to pandas for price analysis (if needed)
+        df_pandas = df.to_pandas()
+        
+        # Perform comprehensive price analysis
+        analysis_results = price_analyzer.analyze_price_patterns(df_pandas, token_name)
+        
+        return {
+            'computed_on_demand': True,
+            'global_features': analysis_results,
+            'token_name': token_name
+        }
+        
+    except Exception as e:
+        return {
+            'error': f"Failed to compute global features: {str(e)}",
+            'computed_on_demand': False
+        }
+
 # Page configuration
 st.set_page_config(
     page_title="🚀 Enhanced Feature Engineering Suite",
@@ -245,9 +269,9 @@ def run_feature_engineering(data_loader, feature_engineer, available_tokens):
     with st.expander("⚙️ Feature Configuration"):
         col1, col2 = st.columns(2)
         with col1:
-            use_technical = st.checkbox("Technical Indicators", value=True)
-            use_statistical = st.checkbox("Statistical Features", value=True)
-            use_volume = st.checkbox("Volume Features", value=True)
+            use_technical = st.checkbox("Technical Indicators", value=True, key="fe_use_technical")
+            use_statistical = st.checkbox("Statistical Features", value=True, key="fe_use_statistical")
+            use_volume = st.checkbox("Volume Features", value=True, key="fe_use_volume")
         with col2:
             window_sizes = st.multiselect(
                 "Window Sizes:",
@@ -276,12 +300,12 @@ def analyze_token_features(df, token_symbol, feature_engineer):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        show_rolling_features = st.checkbox("🔄 Show Rolling Features", value=True)
+        show_rolling_features = st.checkbox("🔄 Show Rolling Features", value=True, key="token_show_rolling")
     with col2:
         show_global_features = st.checkbox("📊 Show Global Features", value=False,
-                                         help="Compute global analysis features on-demand")
+                                         help="Compute global analysis features on-demand", key="token_show_global")
     with col3:
-        show_technical_indicators = st.checkbox("📈 Show Technical Indicators", value=True)
+        show_technical_indicators = st.checkbox("📈 Show Technical Indicators", value=True, key="token_show_technical")
     
     if not any([show_rolling_features, show_global_features, show_technical_indicators]):
         st.warning("⚠️ Please select at least one feature type to display")
@@ -519,8 +543,8 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
     with col2:
         data_type = st.selectbox(
             "Data to correlate:",
-            ["Log Returns", "Normalized Prices", "Prices"],
-            help="Log Returns: ln(price_t/price_t-1) | Normalized Prices: price/first_price"
+            ["Log Returns", "Log Prices", "Normalized Prices", "Prices"],
+            help="Log Returns: ln(price_t/price_t-1) | Log Prices: ln(price) | Normalized Prices: price/first_price"
         )
     
     with col3:
@@ -535,10 +559,11 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
     **📊 Data Types & Scaling:**
     
     • **Log Returns**: `ln(price_t/price_t-1)` - Scale-independent, pure correlation ✅
+    • **Log Prices**: `ln(price)` - Logarithmic price levels, scale-independent ✅
     • **Normalized Prices**: `price/first_price` - Trajectory comparison from launch ✅  
     • **Prices**: Raw values - Uses RobustScaler for extreme price differences ⚠️
     
-    **💡 Recommendation**: Use "Log Returns" for pure correlation, "Normalized Prices" for trajectory comparison
+    **💡 Recommendation**: Use "Log Returns" for pure correlation, "Log Prices" for trend analysis
     """)
 
     # Simplified advanced options - lifecycle only
@@ -572,7 +597,8 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
             use_rolling = st.checkbox(
                 "Calculate rolling correlations", 
                 value=False,
-                help="Show how correlations change over time"
+                help="Show how correlations change over time",
+                key="corr_use_rolling"
             )
             
             if use_rolling:
@@ -589,7 +615,8 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
         col1, col2 = st.columns(2)
         with col1:
             enable_pca = st.checkbox("Enable PCA Analysis", value=True, 
-                                   help="Principal Component Analysis to identify patterns and redundancy")
+                                   help="Principal Component Analysis to identify patterns and redundancy",
+                                   key="corr_enable_pca")
             max_components = st.slider(
                 "Maximum PCA components:", 
                 min_value=2, 
@@ -598,7 +625,7 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
                 help="Number of principal components to calculate"
             )
         with col2:
-            show_pca_plot = st.checkbox("Show PCA visualization", value=True)
+            show_pca_plot = st.checkbox("Show PCA visualization", value=True, key="corr_show_pca_plot")
             pca_plot_components = st.slider(
                 "Components in plots:", 
                 min_value=2, 
@@ -615,7 +642,7 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
         
         if len(available_tokens) > 50:
             st.warning(f"⚠️ You have {len(available_tokens)} tokens. Consider limiting for performance.")
-            limit_tokens = st.checkbox("Limit for performance", value=True)
+            limit_tokens = st.checkbox("Limit for performance", value=True, key="corr_limit_tokens")
             if limit_tokens:
                 max_tokens = st.slider("Maximum tokens:", 10, 100, 50)
                 selected_tokens = available_tokens[:max_tokens]
@@ -665,7 +692,7 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
                         (f" and {len(token_names)-10} more..." if len(token_names) > 10 else ""))
                 
                 # Option to clear selection
-                if st.button("🗑️ Clear Selection", key="fft_clear_btn"):
+                if st.button("🗑️ Clear Selection", key="fft_clear_selected_tokens"):
                     del st.session_state.fft_random_selected_tokens
                     st.rerun()
             else:
@@ -715,6 +742,7 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
             
             # Determine analysis parameters
             use_log_returns = (data_type == "Log Returns")
+            use_log_prices = (data_type == "Log Prices")
             use_robust_scaling = (data_type == "Prices")  # Only for raw prices
             
             st.write("🔗 **Running lifecycle correlation analysis...**")
@@ -725,6 +753,7 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
                 method=correlation_method,
                 min_overlap=min_data_per_token,  # Reinterpret as minimum data per token
                 use_log_returns=use_log_returns,
+                use_log_prices=use_log_prices,
                 use_robust_scaling=use_robust_scaling,
                 use_rolling=use_rolling,
                 rolling_window=rolling_window if use_rolling else None,
@@ -734,6 +763,12 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
             )
             
             st.write("✅ **Analysis completed!**")
+            
+            # Store results in session state to prevent loss on rerun
+            st.session_state.correlation_results = results
+            st.session_state.enable_pca = enable_pca
+            st.session_state.show_pca_plot = show_pca_plot
+            st.session_state.pca_plot_components = pca_plot_components
             
             # Display results
             if 'error' in results:
@@ -758,6 +793,42 @@ def run_correlation_analysis(data_loader, correlation_analyzer, available_tokens
         st.warning("⚠️ Please select at least 2 tokens")
     elif len(selected_tokens) == 0:
         st.info("📋 Please select tokens above")
+    
+    # Display stored results if they exist (after rerun from UI interactions)
+    if 'correlation_results' in st.session_state:
+        results = st.session_state.correlation_results
+        enable_pca = st.session_state.get('enable_pca', False)
+        show_pca_plot = st.session_state.get('show_pca_plot', True)
+        pca_plot_components = st.session_state.get('pca_plot_components', 4)
+        
+        st.divider()
+        st.subheader("📊 Previous Analysis Results")
+        st.info("💡 Results are preserved even when changing visualization options")
+        
+        # Display results
+        if 'error' in results:
+            st.error(f"❌ Analysis failed: {results['error']}")
+            if 'suggestion' in results:
+                st.info(f"💡 Suggestion: {results['suggestion']}")
+        else:
+            display_correlation_results(results, correlation_analyzer)
+        
+        # Display PCA results if enabled
+        if enable_pca and results.get('pca_analysis', {}).get('pca_available', False):
+            st.divider()
+            display_pca_results(results['pca_analysis'], correlation_analyzer, show_pca_plot, pca_plot_components)
+        
+        # Add button to clear results
+        if st.button("🗑️ Clear Previous Results", key="clear_correlation_results"):
+            if 'correlation_results' in st.session_state:
+                del st.session_state.correlation_results
+            if 'enable_pca' in st.session_state:
+                del st.session_state.enable_pca
+            if 'show_pca_plot' in st.session_state:
+                del st.session_state.show_pca_plot
+            if 'pca_plot_components' in st.session_state:
+                del st.session_state.pca_plot_components
+            st.rerun()
 
 def display_correlation_results(results, correlation_analyzer):
     """Display correlation analysis results"""
@@ -777,23 +848,47 @@ def display_correlation_results(results, correlation_analyzer):
     
     # Correlation matrix visualization - use correct key name
     st.subheader("Correlation Visualization")
-    viz_type = st.selectbox(
-        "Visualization Type:",
-        ["Heatmap", "Network Graph"],
-        help="Network graph is better for many tokens."
-    )
-
+    
     if 'correlation_matrices' in results and 'main' in results['correlation_matrices']:
         correlation_matrix = results['correlation_matrices']['main']
         
-        if viz_type == "Heatmap":
-            fig = correlation_analyzer.create_correlation_heatmap(correlation_matrix)
+        # Use columns to prevent rerun when changing visualization type
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            viz_type = st.selectbox(
+                "Visualization Type:",
+                ["Heatmap", "Network Graph"],
+                help="Network graph is better for many tokens.",
+                key="viz_type_selector"  # Add unique key
+            )
+        
+        with col2:
+            if viz_type == "Network Graph":
+                threshold = st.slider(
+                    "Correlation Threshold", 
+                    0.1, 0.9, 0.5, 0.05,
+                    key="network_threshold_slider"  # Add unique key
+                )
+            else:
+                threshold = 0.5  # Default value for heatmap
+        
+        # Generate visualization
+        try:
+            if viz_type == "Heatmap":
+                fig = correlation_analyzer.create_correlation_heatmap(correlation_matrix)
+            else:  # Network Graph
+                fig = correlation_analyzer.create_correlation_network(correlation_matrix, threshold)
+            
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning(f"Could not generate {viz_type.lower()} visualization")
+                
+        except Exception as e:
+            st.error(f"Error creating {viz_type.lower()}: {str(e)}")
     else:
-        threshold = st.slider("Correlation Threshold", 0.1, 0.9, 0.5, 0.05)
-        fig = correlation_analyzer.create_correlation_network(correlation_matrix, threshold)
-
-    if fig:
-        st.plotly_chart(fig, use_container_width=True)
+        st.error("No correlation matrix available for visualization")
     
     # Rolling correlations if available
     if results.get('rolling_analysis', False) and 'correlation_matrices' in results:
@@ -987,8 +1082,18 @@ def display_global_features(global_features: Dict, token_name: str):
     st.info("💡 **Architecture Note**: These global features are computed on-demand to avoid redundancy with stored rolling features.")
 
 def run_fft_analysis(data_loader, correlation_analyzer, available_tokens):
-    """Run FFT analysis on multiple tokens"""
-    st.header("📊 Multi-Token FFT Analysis")
+    """Run enhanced FFT analysis on multiple tokens"""
+    st.header("📊 Enhanced Multi-Token FFT Analysis")
+    
+    st.info("""
+    **🔬 Enhanced Frequency Analysis Features:**
+    
+    • **4-Panel Visualization**: Frequency spectrum, power spectral density, dominant patterns, and time-frequency spectrogram
+    • **Pattern Classification**: Automatic categorization of cycles (noise, short-term, medium-term, long-term)
+    • **Multiple Methods**: Standard FFT, Welch's power spectral density, and spectrogram analysis
+    • **Advanced Statistics**: Power concentration, significant peaks detection, and pattern distribution
+    • **Comprehensive Reports**: Detailed frequency tables with period analysis
+    """)
     
     if not available_tokens:
         st.error("❌ No tokens found")
@@ -1058,7 +1163,7 @@ def run_fft_analysis(data_loader, correlation_analyzer, available_tokens):
                         (f" and {len(token_names)-10} more..." if len(token_names) > 10 else ""))
                 
                 # Option to clear selection
-                if st.button("🗑️ Clear Selection", key="fft_clear_btn"):
+                if st.button("🗑️ Clear Selection", key="fft_compare_clear_tokens"):
                     del st.session_state.fft_random_selected_tokens
                     st.rerun()
             else:
@@ -1117,14 +1222,44 @@ def run_fft_analysis(data_loader, correlation_analyzer, available_tokens):
 
             # Perform and display FFT analysis for each token
             for token_name, df in token_data.items():
-                with st.expander(f"📈 {token_name} - FFT Results", expanded=True):
+                with st.expander(f"📈 {token_name} - Enhanced FFT Results", expanded=True):
                     fft_results = correlation_analyzer.perform_fft_analysis(
-                        df, analysis_type, window_length, overlap_pct
+                        df, analysis_type, window_length, overlap_pct, detrend_method
                     )
                     
                     if fft_results['status'] == 'success':
+                        # Display summary statistics
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Data Points", f"{fft_results['data_points']:,}")
+                        with col2:
+                            dominant_period = fft_results.get('dominant_period')
+                            if dominant_period:
+                                st.metric("Dominant Period", f"{dominant_period:.1f} min")
+                            else:
+                                st.metric("Dominant Period", "N/A")
+                        with col3:
+                            st.metric("Significant Peaks", fft_results['num_significant_peaks'])
+                        with col4:
+                            st.metric("Power Concentration", f"{fft_results['power_concentration']:.1%}")
+                        
+                        # Display pattern summary
+                        if len(fft_results['dominant_freqs']) > 0:
+                            st.subheader("🔍 Pattern Analysis")
+                            pattern_summary = fft_results['dominant_freqs'].groupby('pattern_type').size().to_dict()
+                            pattern_text = " | ".join([f"**{k}**: {v}" for k, v in pattern_summary.items()])
+                            st.markdown(f"Pattern distribution: {pattern_text}")
+                        
+                        # Enhanced visualization
                         fig = correlation_analyzer.create_fft_visualization(fft_results)
                         st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Detailed frequency table
+                        st.subheader("📋 Detailed Frequency Analysis")
+                        dominant_freqs_display = fft_results['dominant_freqs'].head(10)[
+                            ['period_minutes', 'period_hours', 'amplitude', 'pattern_type']
+                        ].round(3)
+                        st.dataframe(dominant_freqs_display, use_container_width=True)
                     else:
                         st.error(f"FFT analysis failed for {token_name}: {fft_results['reason']}")
                 

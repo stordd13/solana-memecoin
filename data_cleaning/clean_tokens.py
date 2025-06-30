@@ -642,6 +642,7 @@ def clean_category(category: str, limit: Optional[int] = None) -> Dict:
     
     # Get all parquet files
     parquet_files = list(category_folder.glob('*.parquet'))
+    
     if limit:
         parquet_files = parquet_files[:limit]
     

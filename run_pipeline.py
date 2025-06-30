@@ -124,7 +124,14 @@ def run_data_cleaning():
             print("\n📁 Per-category results:")
             for category, result in summary['category_results'].items():
                 if isinstance(result, dict) and 'successfully_cleaned' in result:
-                    print(f"  {category}: {result['successfully_cleaned']}/{result.get('total_files', 0)} cleaned")
+                    total_processed = result.get('total_files_processed', 0)
+                    print(f"  {category}: {result['successfully_cleaned']}/{total_processed} cleaned")
+                elif isinstance(result, dict) and 'error' in result:
+                    print(f"  {category}: {result['error']}")
+                elif isinstance(result, dict) and 'warning' in result:
+                    print(f"  {category}: {result['warning']}")
+                else:
+                    print(f"  {category}: {result}")
         
         return True
         

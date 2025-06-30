@@ -23,7 +23,16 @@ import plotly.graph_objects as go
 from tqdm import tqdm
 import joblib
 import json
-import numpy as np
+import sys
+
+# Add project root to path for ML imports
+current_dir = Path(__file__).resolve()
+project_root = current_dir.parents[2]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from ML.utils.metrics_helpers import financial_classification_metrics
+# numpy import removed - using pure Polars for better performance
 
 # --- Configuration ---
 CONFIG = {
@@ -116,16 +125,36 @@ def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool
                         else:
                             unsafe_features.append(f"{col}_constant")
                     
-                    # Very low variability (< 1% unique values) might be suspicious
-                    elif (unique_count / total_count) < 0.01:
-                        # Check if values are all very close to zero (expected for dead tokens)
-                        values = features_df[col].drop_nulls().to_numpy()
-                        if len(values) > 0:
-                            max_abs_val = np.max(np.abs(values))
-                            if max_abs_val < 1e-6:  # Very small values, likely legitimate
-                                low_variability_features.append(f"{col}_low_variability")
-                            else:
-                                unsafe_features.append(f"{col}_suspicious_constant")
+                    # Very low variability (< 0.1% unique values) might be suspicious
+                    elif (unique_count / total_count) < 0.001:
+                        # Check RELATIVE variability using pure Polars (better for crypto)
+                        try:
+                            stats = features_df.select([
+                                pl.col(col).drop_nulls().min().alias('min_val'),
+                                pl.col(col).drop_nulls().max().alias('max_val'),
+                                pl.col(col).drop_nulls().mean().alias('mean_val'),
+                                pl.col(col).drop_nulls().count().alias('count')
+                            ])
+                            
+                            if stats['count'][0] > 0:
+                                min_val = stats['min_val'][0]
+                                max_val = stats['max_val'][0] 
+                                mean_val = stats['mean_val'][0]
+                                
+                                # Calculate relative range (handles tiny prices correctly)
+                                if abs(mean_val) > 1e-15:  # Avoid division by zero
+                                    relative_range = (max_val - min_val) / abs(mean_val)
+                                    if relative_range < 0.01:  # < 1% relative change is suspicious
+                                        unsafe_features.append(f"{col}_no_relative_variability")
+                                    else:
+                                        # Low unique count but good relative range = OK for crypto
+                                        low_variability_features.append(f"{col}_low_unique_count_ok")
+                                else:
+                                    # Values are truly zero/near-zero
+                                    low_variability_features.append(f"{col}_near_zero")
+                        except:
+                            # Fallback: if stats calculation fails, treat as low variability
+                            low_variability_features.append(f"{col}_stats_error")
             except:
                 continue
     
@@ -149,14 +178,15 @@ def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool
 
 
 def create_labels_for_horizons(df: pl.DataFrame, horizons: List[int]) -> pl.DataFrame:
-    """Create directional labels for multiple horizons"""
+    """Create directional labels and returns for multiple horizons"""
     if 'price' not in df.columns:
         return df
         
-    # Add labels for each horizon
+    # Add labels and returns for each horizon
     for h in horizons:
         df = df.with_columns([
-            (pl.col('price').shift(-h) > pl.col('price')).alias(f'label_{h}m')
+            (pl.col('price').shift(-h) > pl.col('price')).alias(f'label_{h}m'),
+            ((pl.col('price').shift(-h) - pl.col('price')) / pl.col('price')).alias(f'return_{h}m')
         ])
     
     return df
@@ -197,7 +227,7 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
             # Create directional labels for medium-term horizons
             features_df = create_labels_for_horizons(features_df, horizons)
             
-            # CRITICAL FIX: Split FIRST, then use features to prevent future leakage
+            # CRITICAL FIX: Use EXPANDING WINDOW splits to preserve historical context
             # Handle both DataFrame and LazyFrame
             if hasattr(features_df, 'height'):
                 n_rows = features_df.height
@@ -206,15 +236,23 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
                 features_df = features_df.collect()
                 n_rows = features_df.height
             
+            # EXPANDING WINDOW APPROACH: Each split has access to ALL previous data
             if split_type == 'train':
+                # Train on first 60% of token lifecycle
                 start_idx = 0
                 end_idx = int(n_rows * 0.6)
             elif split_type == 'val':
-                start_idx = int(n_rows * 0.6)
+                # Validate on first 80% (includes all training data + validation period)
+                start_idx = 0  # ← CRITICAL: Start from beginning!
                 end_idx = int(n_rows * 0.8)
+                # But only use predictions from the validation period for metrics
+                prediction_start = int(n_rows * 0.6)
             elif split_type == 'test':
-                start_idx = int(n_rows * 0.8)
+                # Test on entire token (includes all historical data)
+                start_idx = 0  # ← CRITICAL: Start from beginning!
                 end_idx = n_rows
+                # But only use predictions from the test period for metrics
+                prediction_start = int(n_rows * 0.8)
             else:  # 'all' for backwards compatibility
                 start_idx = 0
                 end_idx = n_rows
@@ -224,8 +262,14 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
             if end_idx - start_idx < 50:  # Need at least 50 samples for medium-term
                 continue
                 
-            # Split the features temporally
+            # Extract the data with full historical context
             token_split = features_df.slice(start_idx, end_idx - start_idx)
+            
+            # For val/test: mark which samples to use for evaluation
+            if split_type in ['val', 'test']:
+                # Add a column to mark evaluation samples
+                eval_mask = [False] * (prediction_start - start_idx) + [True] * (end_idx - prediction_start)
+                token_split = token_split.with_columns(pl.Series('eval_sample', eval_mask))
             
             # Add token identifier
             token_split = token_split.with_columns(pl.lit(path.stem).alias('token_id'))
@@ -243,12 +287,33 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
         print("ERROR: No valid feature splits created!")
         return pl.DataFrame()
     
-    # Concatenate all splits
-    result_df = pl.concat(all_samples)
+    # FIXED: Handle different feature sets by finding common columns
+    if len(all_samples) > 1:
+        # Find common columns across all samples
+        common_cols = set(all_samples[0].columns)
+        for sample_df in all_samples[1:]:
+            common_cols = common_cols.intersection(set(sample_df.columns))
+        
+        # Convert to sorted list for consistent ordering
+        common_cols = sorted(list(common_cols))
+        
+        print(f"Found {len(common_cols)} common columns across all tokens")
+        
+        # Select only common columns from each sample
+        aligned_samples = []
+        for sample_df in all_samples:
+            aligned_samples.append(sample_df.select(common_cols))
+        
+        # Now concatenate the aligned samples
+        result_df = pl.concat(aligned_samples)
+    else:
+        result_df = all_samples[0]
     
     # Drop any remaining nulls in labels
     label_cols = [f'label_{h}m' for h in horizons]
-    result_df = result_df.drop_nulls(subset=label_cols)
+    existing_label_cols = [col for col in label_cols if col in result_df.columns]
+    if existing_label_cols:
+        result_df = result_df.drop_nulls(subset=existing_label_cols)
     
     print(f"{split_type.upper()} set: {result_df.height:,} samples from {len(all_samples)} tokens")
     
@@ -259,38 +324,157 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
 def train_and_evaluate(train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl.DataFrame, horizon: int, params: dict):
     """Trains a LightGBM model for a specific horizon and evaluates it."""
     label_col = f'label_{horizon}m'
+    return_col = f'return_{horizon}m'
     
-    # Select feature columns (exclude metadata and labels)
-    exclude_cols = ['token_id', 'datetime', 'price'] + [f'label_{h}m' for h in CONFIG['horizons']]
+    # Select feature columns (exclude metadata, labels, and returns)
+    exclude_cols = ['token_id', 'datetime', 'price'] + [f'label_{h}m' for h in CONFIG['horizons']] + [f'return_{h}m' for h in CONFIG['horizons']]
     feature_cols = [col for col in train_df.columns if col not in exclude_cols]
     
     print(f"Using {len(feature_cols)} pre-engineered features for {horizon}m prediction")
 
     # Convert to pandas/numpy for scikit-learn API
+    print("📊 Preparing data...")
     X_train = train_df[feature_cols].to_pandas()
     y_train = train_df[label_col].to_pandas()
-    X_val = val_df[feature_cols].to_pandas()
-    y_val = val_df[label_col].to_pandas()
-    X_test = test_df[feature_cols].to_pandas()
-    y_test = test_df[label_col].to_pandas()
+    
+    # For validation: use all data for training, but only evaluate on validation period
+    X_val_full = val_df[feature_cols].to_pandas()
+    y_val_full = val_df[label_col].to_pandas()
+    
+    # For test: use all data for training, but only evaluate on test period  
+    X_test_full = test_df[feature_cols].to_pandas()
+    y_test_full = test_df[label_col].to_pandas()
+    
+    # Extract returns data for financial metrics
+    returns_val_full = val_df[return_col].to_pandas()
+    returns_test_full = test_df[return_col].to_pandas()
+    
+    # Extract evaluation masks for val/test
+    if 'eval_sample' in val_df.columns:
+        val_eval_mask = val_df['eval_sample'].to_pandas().values
+        X_val = X_val_full[val_eval_mask]
+        y_val = y_val_full[val_eval_mask]
+        returns_val = returns_val_full[val_eval_mask]
+    else:
+        X_val = X_val_full
+        y_val = y_val_full
+        returns_val = returns_val_full
+        
+    if 'eval_sample' in test_df.columns:
+        test_eval_mask = test_df['eval_sample'].to_pandas().values
+        X_test = X_test_full[test_eval_mask]
+        y_test = y_test_full[test_eval_mask]
+        returns_test = returns_test_full[test_eval_mask]
+    else:
+        X_test = X_test_full
+        y_test = y_test_full
+        returns_test = returns_test_full
+
+    # Check if we have any samples after filtering
+    if len(X_val) == 0:
+        print(f"⚠️  WARNING: No validation samples for {horizon}m after eval_sample filtering")
+        print(f"   Using full validation set instead")
+        X_val = X_val_full
+        y_val = y_val_full
+        returns_val = returns_val_full
+        
+    if len(X_test) == 0:
+        print(f"⚠️  WARNING: No test samples for {horizon}m after eval_sample filtering")
+        print(f"   Using full test set instead")
+        X_test = X_test_full
+        y_test = y_test_full
+        returns_test = returns_test_full
+
+    # Show class distribution
+    print(f"📈 Class distribution for {horizon}m horizon:")
+    if len(y_train) > 0:
+        print(f"   Train: UP={y_train.mean():.1%}, DOWN={1-y_train.mean():.1%}")
+    else:
+        print(f"   Train: No samples!")
+        
+    if len(y_val) > 0:
+        print(f"   Val:   UP={y_val.mean():.1%}, DOWN={1-y_val.mean():.1%}")
+    else:
+        print(f"   Val:   No samples!")
+        
+    if len(y_test) > 0:
+        print(f"   Test:  UP={y_test.mean():.1%}, DOWN={1-y_test.mean():.1%}")
+    else:
+        print(f"   Test:  No samples!")
+
+    # Check if we have enough data to train
+    if len(X_train) < 10 or len(X_val) < 10 or len(X_test) < 10:
+        print(f"⚠️  ERROR: Insufficient samples for {horizon}m horizon")
+        print(f"   Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+        print(f"   Skipping this horizon...")
+        
+        # Return dummy metrics
+        dummy_metrics = {
+            'validation': {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'roc_auc': 0.5},
+            'test': {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'roc_auc': 0.5}
+        }
+        return None, dummy_metrics
 
     # Train model
-    model = lgb.LGBMClassifier(**params)
+    print(f"🌳 Training LightGBM on {len(X_train):,} samples...")
+    print(f"📊 Validation set: {len(X_val):,} evaluation samples (with full historical context)")
+    print(f"📊 Test set: {len(X_test):,} evaluation samples (with full historical context)")
+    
+    model = lgb.LGBMClassifier(**params, verbose=-1)  # Suppress verbose output
     model.fit(X_train, y_train,
-              eval_set=[(X_val, y_val)],
+              eval_set=[(X_val, y_val)],  # Use only evaluation samples for early stopping
               eval_metric='logloss',
               callbacks=[lgb.early_stopping(100, verbose=False)])
 
-    # Evaluate on the unseen test set
-    preds = model.predict(X_test)
-    probs = model.predict_proba(X_test)[:, 1]
+    # Evaluate on validation set with financial metrics
+    print(f"🔮 Evaluating on validation set ({len(X_val):,} samples) with financial metrics...")
+    val_preds = model.predict(X_val)
+    val_probs = model.predict_proba(X_val)[:, 1]
+    
+    val_metrics = financial_classification_metrics(y_val, val_preds, returns_val, val_probs)
 
+    # Evaluate on test set with financial metrics
+    print(f"🔮 Evaluating on test set ({len(X_test):,} samples) with financial metrics...")
+    test_preds = model.predict(X_test)
+    test_probs = model.predict_proba(X_test)[:, 1]
+
+    test_metrics = financial_classification_metrics(y_test, test_preds, returns_test, test_probs)
+    
+    # Create confusion matrices
+    from sklearn.metrics import confusion_matrix
+    
+    val_cm = confusion_matrix(y_val, val_preds)
+    test_cm = confusion_matrix(y_test, test_preds)
+    
+    # Add confusion matrix info to metrics
+    val_metrics['confusion_matrix'] = {
+        'true_negative': int(val_cm[0, 0]),
+        'false_positive': int(val_cm[0, 1]), 
+        'false_negative': int(val_cm[1, 0]),
+        'true_positive': int(val_cm[1, 1])
+    }
+    
+    test_metrics['confusion_matrix'] = {
+        'true_negative': int(test_cm[0, 0]),
+        'false_positive': int(test_cm[0, 1]),
+        'false_negative': int(test_cm[1, 0]), 
+        'true_positive': int(test_cm[1, 1])
+    }
+    
+    # Print confusion matrices for immediate feedback
+    print(f"\n📊 Confusion Matrix - Validation (Horizon {horizon}m):")
+    print(f"   Predicted:  DOWN  UP")
+    print(f"   Actual DOWN: {val_cm[0,0]:4d} {val_cm[0,1]:3d}")
+    print(f"   Actual UP:   {val_cm[1,0]:4d} {val_cm[1,1]:3d}")
+    
+    print(f"\n📊 Confusion Matrix - Test (Horizon {horizon}m):")
+    print(f"   Predicted:  DOWN  UP") 
+    print(f"   Actual DOWN: {test_cm[0,0]:4d} {test_cm[0,1]:3d}")
+    print(f"   Actual UP:   {test_cm[1,0]:4d} {test_cm[1,1]:3d}")
+    
     metrics = {
-        'accuracy': accuracy_score(y_test, preds),
-        'precision': precision_score(y_test, preds, zero_division=0),
-        'recall': recall_score(y_test, preds, zero_division=0),
-        'f1_score': f1_score(y_test, preds, zero_division=0),
-        'roc_auc': roc_auc_score(y_test, probs)
+        'validation': val_metrics,
+        'test': test_metrics
     }
     
     return model, metrics
@@ -402,14 +586,21 @@ def main():
     all_metrics = {}
     models = {}
     
-    for h in CONFIG['horizons']:
-        print(f"\n--- Training for {h}m horizon ---")
+    print(f"\n🚀 Training {len(CONFIG['horizons'])} Medium-Term LightGBM models: {CONFIG['horizons']}")
+    
+    for i, h in enumerate(CONFIG['horizons'], 1):
+        print(f"\n--- Training for {h}m horizon ({i}/{len(CONFIG['horizons'])}) ---")
         model, metrics = train_and_evaluate(train_df, val_df, test_df, h, CONFIG['lgb_params'])
-        all_metrics[f'{h}m'] = metrics
-        models[f'{h}m'] = model
         
-        print(f"  Accuracy: {metrics['accuracy']:.2%}")
-        print(f"  ROC AUC: {metrics['roc_auc']:.2%}")
+        if model is not None:
+            all_metrics[f'{h}m'] = metrics['test']  # Use test metrics for plot
+            models[f'{h}m'] = model
+            
+            print(f"  🎯 Accuracy: {metrics['test']['accuracy']:.2%}")
+            print(f"  📈 ROC AUC: {metrics['test']['roc_auc']:.2%}")
+            print(f"✅ Horizon {h}m completed!")
+        else:
+            print(f"❌ Horizon {h}m failed - insufficient data")
 
     # Save models
     for horizon, model in models.items():

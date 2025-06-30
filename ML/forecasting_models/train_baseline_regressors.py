@@ -121,9 +121,23 @@ def train_and_evaluate(horizon: int, model_type: str):
                              objective='reg:squarederror', random_state=42, n_jobs=-1)
         scaled_inputs = False  # scaling not critical but we already used scaled data; still fine
 
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    metrics = regression_metrics(y_test, y_pred)
+    print(f"Training {model_type.upper()} model on {len(X_train):,} samples for {horizon}m forecast...")
+    
+    # Training with progress indication
+    with tqdm(total=1, desc=f"Training {model_type.upper()} model") as pbar:
+        model.fit(X_train, y_train)
+        pbar.update(1)
+    
+    # Prediction with progress indication
+    print(f"Making predictions on {len(X_test):,} test samples...")
+    with tqdm(total=1, desc=f"Predicting with {model_type.upper()}") as pbar:
+        y_pred = model.predict(X_test)
+        pbar.update(1)
+    
+    # Evaluation with progress indication
+    with tqdm(total=1, desc="Calculating metrics") as pbar:
+        metrics = regression_metrics(y_test, y_pred)
+        pbar.update(1)
 
     # Save artefacts
     out_dir = CONFIG['results_dir'] / f'{model_type}_{horizon}m'
@@ -143,7 +157,7 @@ def train_and_evaluate(horizon: int, model_type: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--horizon', type=int, default=60, help='Forecast horizon in minutes')
+    parser.add_argument('--horizon', type=int, default=15, help='Forecast horizon in minutes')
     parser.add_argument('--model', type=str, choices=['linear', 'xgb', 'both'], default='both')
     args = parser.parse_args()
 

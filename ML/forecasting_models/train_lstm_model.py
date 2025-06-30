@@ -20,6 +20,16 @@ from tqdm import tqdm
 import json
 import warnings
 warnings.filterwarnings('ignore')
+# Add option to use Winsorizer
+import sys
+sys.path.append(str(Path(__file__).parent.parent.parent))
+try:
+    from ML.utils.winsorizer import Winsorizer
+    from ML.utils.training_plots import plot_training_curves, create_learning_summary
+    WINSORIZER_AVAILABLE = True
+except ImportError:
+    WINSORIZER_AVAILABLE = False
+    print("Warning: Winsorizer not available, using StandardScaler")
 
 
 # ================== DATASET CLASS ==================
@@ -30,7 +40,8 @@ class MemecoinDataset(Dataset):
                  data_paths: List[Path], 
                  lookback: int = 60, 
                  forecast_horizon: int = 15,
-                 scaler: Optional[StandardScaler] = None):
+                 scaler = None,
+                 use_winsorizer: bool = True):
         
         self.lookback = lookback
         self.forecast_horizon = forecast_horizon
@@ -38,8 +49,18 @@ class MemecoinDataset(Dataset):
         self.labels = []
         self.metadata = []
         
-        self.scaler = scaler if scaler else StandardScaler()
-        self.fit_scaler = scaler is None
+        # Use Winsorizer if available and requested
+        if scaler is None:
+            if use_winsorizer and WINSORIZER_AVAILABLE:
+                self.scaler = Winsorizer(lower_percentile=0.005, upper_percentile=0.995)
+                print("Using Winsorizer for scaling (better for crypto data)")
+            else:
+                self.scaler = StandardScaler()
+                print("Using StandardScaler")
+            self.fit_scaler = True
+        else:
+            self.scaler = scaler
+            self.fit_scaler = False
         
         self._load_data(data_paths)
     
@@ -283,13 +304,18 @@ def train_model(model: nn.Module,
     val_losses = []
     best_val_loss = float('inf')
     
-    print(f"\nTraining on {device}...")
+    print(f"\nTraining LSTM Forecasting on {device}...")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     for epoch in range(num_epochs):
         # Training phase
         model.train()
         train_loss = 0
-        for batch_x, batch_y in train_loader:
+        
+        # Add progress bar for training
+        from tqdm import tqdm
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")
+        for batch_x, batch_y in train_pbar:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             
             optimizer.zero_grad()
@@ -299,16 +325,19 @@ def train_model(model: nn.Module,
             optimizer.step()
             
             train_loss += loss.item()
+            train_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
         
         # Validation phase
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for batch_x, batch_y in val_loader:
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation", leave=False)
+            for batch_x, batch_y in val_pbar:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 outputs = model(batch_x)
                 loss = criterion(outputs, batch_y)
                 val_loss += loss.item()
+                val_pbar.set_postfix({'Val Loss': f'{loss.item():.4f}'})
         
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
@@ -329,7 +358,17 @@ def train_model(model: nn.Module,
     # Load best model
     model.load_state_dict(torch.load('best_model_checkpoint.pth'))
     
-    return train_losses, val_losses
+    # Find best epoch
+    best_epoch = val_losses.index(best_val_loss) + 1
+    
+    training_history = {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss
+    }
+    
+    return model, training_history
 
 
 # ================== EVALUATION METRICS ==================
@@ -347,7 +386,9 @@ def evaluate_model(model: nn.Module,
     all_targets = []
     
     with torch.no_grad():
-        for batch_x, batch_y in test_loader:
+        from tqdm import tqdm
+        test_pbar = tqdm(test_loader, desc="Evaluating forecasting model")
+        for batch_x, batch_y in test_pbar:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             predictions = model(batch_x)
             
@@ -599,7 +640,7 @@ def main():
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # 6. Train model
-    train_losses, val_losses = train_model(
+    model, training_history = train_model(
         model, train_loader, val_loader, 
         num_epochs=CONFIG['num_epochs'],
         learning_rate=CONFIG['learning_rate']
@@ -626,15 +667,28 @@ def main():
         'model_state_dict': model.state_dict(),
         'config': CONFIG,
         'scaler': train_dataset.scaler,
-        'metrics': metrics
+        'metrics': metrics,
+        'training_history': training_history
     }, model_path)
     
     print(f"\nModel saved to: {model_path}")
     
     # 9. Create plots
-    fig1 = plot_training_history(train_losses, val_losses)
+    # Original plot
+    fig1 = plot_training_history(training_history['train_losses'], training_history['val_losses'])
     training_plot_path = CONFIG['results_dir'] / 'training_history.html'
     fig1.write_html(training_plot_path)
+    
+    # Enhanced learning curves if available
+    if WINSORIZER_AVAILABLE:
+        enhanced_fig = plot_training_curves(
+            training_history['train_losses'],
+            training_history['val_losses'],
+            title="LSTM Forecasting Model Training Progress"
+        )
+        enhanced_plot_path = CONFIG['results_dir'] / 'enhanced_training_curves.html'
+        enhanced_fig.write_html(enhanced_plot_path)
+        print(f"  - Enhanced training curves: {enhanced_plot_path}")
     
     fig2 = plot_evaluation_metrics(metrics)
     metrics_plot_path = CONFIG['results_dir'] / 'evaluation_metrics.html'

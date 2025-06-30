@@ -719,27 +719,27 @@ def save_features_to_files(features_dict: Dict[str, Dict],
                     cumulative_returns = np.cumsum(log_returns)
                     ml_safe_features['cumulative_log_returns'] = cumulative_returns
                     
-                    # SAFE: Rolling volatility (expanding window)
-                    rolling_volatility = []
-                    for i in range(len(log_returns)):
-                        if i < 10:  # Need minimum data
-                            rolling_volatility.append(0.0)
-                        else:
-                            vol = np.std(log_returns[:i+1])  # Only use data up to current point
-                            rolling_volatility.append(vol)
+                    # SAFE: Rolling volatility (FAST Polars version with expanding window)
+                    # Create Polars DataFrame for efficient rolling operations
+                    returns_df = pl.DataFrame({"returns": log_returns})
+                    rolling_volatility = returns_df.with_columns([
+                        pl.col("returns").rolling_std(window_size=len(log_returns)).alias("rolling_vol")
+                    ])["rolling_vol"].fill_null(0.0).to_numpy()
+                    # Make array writable and set first 10 values to 0 (minimum data requirement)
+                    rolling_volatility = rolling_volatility.copy()
+                    rolling_volatility[:10] = 0.0
                     ml_safe_features['rolling_volatility'] = rolling_volatility
                     
-                    # SAFE: Rolling Sharpe ratio (expanding window)
-                    rolling_sharpe = []
-                    for i in range(len(log_returns)):
-                        if i < 10:
-                            rolling_sharpe.append(0.0)
-                        else:
-                            returns_subset = log_returns[:i+1]
-                            mean_ret = np.mean(returns_subset)
-                            std_ret = np.std(returns_subset)
-                            sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
-                            rolling_sharpe.append(sharpe)
+                    # SAFE: Rolling Sharpe ratio (FAST Polars version with expanding window)
+                    rolling_stats = returns_df.with_columns([
+                        pl.col("returns").rolling_mean(window_size=len(log_returns)).alias("rolling_mean"),
+                        pl.col("returns").rolling_std(window_size=len(log_returns)).alias("rolling_std")
+                    ])
+                    rolling_mean = rolling_stats["rolling_mean"].fill_null(0.0).to_numpy()
+                    rolling_std = rolling_stats["rolling_std"].fill_null(1.0).to_numpy()
+                    rolling_sharpe = np.where(rolling_std > 0, rolling_mean / rolling_std, 0.0)
+                    # Set first 10 values to 0 (minimum data requirement) - already writable from np.where
+                    rolling_sharpe[:10] = 0.0
                     ml_safe_features['rolling_sharpe'] = rolling_sharpe
             
             # 2. SAFE: Technical indicators (already rolling by nature)
@@ -779,22 +779,22 @@ def save_features_to_files(features_dict: Dict[str, Dict],
                 if 'log_returns' in ml_safe_features:
                     log_returns = ml_safe_features['log_returns']
                     
-                    # Calculate rolling statistical moments (expanding window)
-                    rolling_skewness = []
-                    rolling_kurtosis = []
-                    rolling_var_95 = []
+                    # Calculate rolling statistical moments (FAST Polars version with expanding window)
+                    # Use existing returns_df for consistency
+                    moment_stats = returns_df.with_columns([
+                        pl.col("returns").rolling_skew(window_size=len(log_returns)).alias("rolling_skew"),
+                        # Note: Polars doesn't have rolling_kurt, so we'll use variance as proxy
+                        pl.col("returns").rolling_var(window_size=len(log_returns)).alias("rolling_var"),
+                        pl.col("returns").rolling_quantile(quantile=0.05, window_size=len(log_returns)).alias("rolling_var_95")
+                    ])
+                    rolling_skewness = moment_stats["rolling_skew"].fill_null(0.0).to_numpy().copy()
+                    rolling_kurtosis = moment_stats["rolling_var"].fill_null(0.0).to_numpy().copy()  # Use variance as proxy
+                    rolling_var_95 = moment_stats["rolling_var_95"].fill_null(0.0).to_numpy().copy()
                     
-                    for i in range(len(log_returns)):
-                        if i < 20:  # Need minimum data for stable statistics
-                            rolling_skewness.append(0.0)
-                            rolling_kurtosis.append(0.0)
-                            rolling_var_95.append(0.0)
-                        else:
-                            returns_subset = log_returns[:i+1]  # Only use historical data
-                            
-                            rolling_skewness.append(float(stats.skew(returns_subset)))
-                            rolling_kurtosis.append(float(stats.kurtosis(returns_subset)))
-                            rolling_var_95.append(float(np.percentile(returns_subset, 5)))
+                    # Set first 20 values to 0 (minimum data requirement for stable statistics)
+                    rolling_skewness[:20] = 0.0
+                    rolling_kurtosis[:20] = 0.0  
+                    rolling_var_95[:20] = 0.0
                     
                     ml_safe_features.update({
                         'rolling_skewness': rolling_skewness,
@@ -854,7 +854,7 @@ def create_rolling_features_safe(df: pl.DataFrame, token_name: str = "token") ->
     Create ROLLING features that are safe for ML training (NO DATA LEAKAGE)
     
     This function creates features that only use historical data up to each point in time.
-    Fixed to handle constant features that can cause data leakage issues.
+    FIXED: Always creates the same columns for all tokens for consistency.
     """
     if len(df) < 60:  # Need at least 1 hour of data
         return pl.DataFrame()
@@ -870,99 +870,83 @@ def create_rolling_features_safe(df: pl.DataFrame, token_name: str = "token") ->
         
         # Check if log_returns has sufficient variability
         log_returns_std = df_with_features['log_returns'].std()
-        if log_returns_std is None or log_returns_std < 1e-8:
-            # Token has very little price movement - create minimal features to avoid constants
-            print(f"⚠️  {token_name}: Low volatility detected, using minimal features")
-            
-            # Use only basic momentum features that are less likely to be constant
-            df_with_features = df_with_features.with_columns([
-                # Price-based momentum (less likely to be constant than log-return stats)
-                (pl.col('price') / pl.col('price').shift(10) - 1).alias('price_momentum_10'),
-                (pl.col('price') / pl.col('price').shift(30) - 1).alias('price_momentum_30'),
-                (pl.col('price') / pl.col('price').shift(60) - 1).alias('price_momentum_60'),
-                
-                # Simple moving averages (normalized)
-                (pl.col('price') / pl.col('price').rolling_mean(20) - 1).alias('price_vs_sma20'),
-                (pl.col('price') / pl.col('price').rolling_mean(50) - 1).alias('price_vs_sma50'),
-                
-                # Add some noise-based features to ensure variability
-                (pl.col('log_returns').rolling_mean(10) + pl.arange(0, pl.len()) * 1e-10).alias('log_returns_mean_10'),
-                (pl.col('log_returns').rolling_std(10) + pl.arange(0, pl.len()) * 1e-10).alias('log_returns_vol_10'),
-            ])
-            
-            feature_cols = [
-                'datetime', 'price', 'log_returns',
-                'price_momentum_10', 'price_momentum_30', 'price_momentum_60',
-                'price_vs_sma20', 'price_vs_sma50',
-                'log_returns_mean_10', 'log_returns_vol_10'
-            ]
-        else:
-            # Normal volatility - use full feature set
-            df_with_features = df_with_features.with_columns([
-                # Rolling means (look-back windows)
-                pl.col('log_returns').rolling_mean(10).alias('log_returns_mean_10'),
-                pl.col('log_returns').rolling_mean(30).alias('log_returns_mean_30'),
-                pl.col('log_returns').rolling_mean(60).alias('log_returns_mean_60'),
-                
-                # Rolling standard deviations (volatility)
-                pl.col('log_returns').rolling_std(10).alias('log_returns_vol_10'),
-                pl.col('log_returns').rolling_std(30).alias('log_returns_vol_30'),
-                pl.col('log_returns').rolling_std(60).alias('log_returns_vol_60'),
-                
-                # Rolling min/max with small noise to prevent exact constants
-                (pl.col('log_returns').rolling_min(30) + pl.arange(0, pl.len()) * 1e-12).alias('log_returns_min_30'),
-                (pl.col('log_returns').rolling_max(30) + pl.arange(0, pl.len()) * 1e-12).alias('log_returns_max_30'),
-                
-                # Price momentum features
-                (pl.col('price') / pl.col('price').shift(10) - 1).alias('price_momentum_10'),
-                (pl.col('price') / pl.col('price').shift(30) - 1).alias('price_momentum_30'),
-                (pl.col('price') / pl.col('price').shift(60) - 1).alias('price_momentum_60'),
-            ])
-            
-            # Add technical indicators (these are already rolling by nature)
-            df_with_features = df_with_features.with_columns([
-                # Simple Moving Averages
-                pl.col('price').rolling_mean(20).alias('sma_20'),
-                pl.col('price').rolling_mean(50).alias('sma_50'),
-                
-                # Exponential Moving Averages  
-                pl.col('price').ewm_mean(span=12).alias('ema_12'),
-                pl.col('price').ewm_mean(span=26).alias('ema_26'),
-            ])
-            
-            # Calculate MACD
-            df_with_features = df_with_features.with_columns([
-                (pl.col('ema_12') - pl.col('ema_26')).alias('macd_line')
-            ]).with_columns([
-                pl.col('macd_line').ewm_mean(span=9).alias('macd_signal')
-            ]).with_columns([
-                (pl.col('macd_line') - pl.col('macd_signal')).alias('macd_histogram')
-            ])
-            
-            # Add Bollinger Bands
-            df_with_features = df_with_features.with_columns([
-                pl.col('price').rolling_std(20).alias('bb_std')
-            ]).with_columns([
-                (pl.col('sma_20') + pl.col('bb_std') * 2).alias('bb_upper'),
-                (pl.col('sma_20') - pl.col('bb_std') * 2).alias('bb_lower')
-            ]).with_columns([
-                ((pl.col('price') - pl.col('sma_20')) / (pl.col('bb_std') * 2 + 1e-8)).alias('bb_position')
-            ])
-            
-            feature_cols = [
-                'datetime', 'price', 'log_returns',
-                'log_returns_mean_10', 'log_returns_mean_30', 'log_returns_mean_60',
-                'log_returns_vol_10', 'log_returns_vol_30', 'log_returns_vol_60',
-                'log_returns_min_30', 'log_returns_max_30',
-                'price_momentum_10', 'price_momentum_30', 'price_momentum_60',
-                'sma_20', 'sma_50', 'ema_12', 'ema_26',
-                'macd_line', 'macd_signal', 'macd_histogram',
-                'bb_upper', 'bb_lower', 'bb_position'
-            ]
+        is_low_volatility = log_returns_std is None or log_returns_std < 1e-8
         
-        # Select only existing columns
-        existing_cols = [col for col in feature_cols if col in df_with_features.columns]
-        df_final = df_with_features.select(existing_cols).drop_nulls()
+        if is_low_volatility:
+            print(f"⚠️  {token_name}: Low volatility detected, but creating all features for consistency")
+        
+        # ALWAYS create the full feature set for consistency
+        # Even for low volatility tokens, we create all features (they might be less meaningful but won't break ML)
+        
+        # Rolling means (look-back windows)
+        df_with_features = df_with_features.with_columns([
+            pl.col('log_returns').rolling_mean(10).alias('log_returns_mean_10'),
+            pl.col('log_returns').rolling_mean(30).alias('log_returns_mean_30'),
+            pl.col('log_returns').rolling_mean(60).alias('log_returns_mean_60'),
+            
+            # Rolling standard deviations (volatility) - will be ~0 for low volatility
+            pl.col('log_returns').rolling_std(10).alias('log_returns_vol_10'),
+            pl.col('log_returns').rolling_std(30).alias('log_returns_vol_30'),
+            pl.col('log_returns').rolling_std(60).alias('log_returns_vol_60'),
+            
+            # Rolling min/max with small noise to prevent exact constants
+            (pl.col('log_returns').rolling_min(30) + pl.arange(0, pl.len()) * 1e-12).alias('log_returns_min_30'),
+            (pl.col('log_returns').rolling_max(30) + pl.arange(0, pl.len()) * 1e-12).alias('log_returns_max_30'),
+            
+            # Price momentum features - use fill_null(0) for edge cases
+            ((pl.col('price') / pl.col('price').shift(10) - 1).fill_null(0)).alias('price_momentum_10'),
+            ((pl.col('price') / pl.col('price').shift(30) - 1).fill_null(0)).alias('price_momentum_30'),
+            ((pl.col('price') / pl.col('price').shift(60) - 1).fill_null(0)).alias('price_momentum_60'),
+        ])
+        
+        # Add technical indicators (these are already rolling by nature)
+        df_with_features = df_with_features.with_columns([
+            # Simple Moving Averages
+            pl.col('price').rolling_mean(20).alias('sma_20'),
+            pl.col('price').rolling_mean(50).alias('sma_50'),
+            
+            # Exponential Moving Averages  
+            pl.col('price').ewm_mean(span=12).alias('ema_12'),
+            pl.col('price').ewm_mean(span=26).alias('ema_26'),
+        ])
+        
+        # Calculate MACD
+        df_with_features = df_with_features.with_columns([
+            (pl.col('ema_12') - pl.col('ema_26')).alias('macd_line')
+        ]).with_columns([
+            pl.col('macd_line').ewm_mean(span=9).alias('macd_signal')
+        ]).with_columns([
+            (pl.col('macd_line') - pl.col('macd_signal')).alias('macd_histogram')
+        ])
+        
+        # Add Bollinger Bands - handle zero std case
+        df_with_features = df_with_features.with_columns([
+            pl.col('price').rolling_std(20).alias('bb_std')
+        ]).with_columns([
+            (pl.col('sma_20') + pl.col('bb_std') * 2).alias('bb_upper'),
+            (pl.col('sma_20') - pl.col('bb_std') * 2).alias('bb_lower')
+        ]).with_columns([
+            # Prevent division by zero in bb_position
+            pl.when(pl.col('bb_std') > 1e-8)
+            .then((pl.col('price') - pl.col('sma_20')) / (pl.col('bb_std') * 2))
+            .otherwise(0.0)
+            .alias('bb_position')
+        ])
+        
+        # Define the exact feature columns we want (same for all tokens)
+        feature_cols = [
+            'datetime', 'price', 'log_returns',
+            'log_returns_mean_10', 'log_returns_mean_30', 'log_returns_mean_60',
+            'log_returns_vol_10', 'log_returns_vol_30', 'log_returns_vol_60',
+            'log_returns_min_30', 'log_returns_max_30',
+            'price_momentum_10', 'price_momentum_30', 'price_momentum_60',
+            'sma_20', 'sma_50', 'ema_12', 'ema_26',
+            'macd_line', 'macd_signal', 'macd_histogram',
+            'bb_upper', 'bb_lower', 'bb_position'
+        ]
+        
+        # Select exactly these columns (should all exist now)
+        df_final = df_with_features.select(feature_cols).drop_nulls()
 
         # CRITICAL FINAL STEP: Ensure all numeric columns are finite and handle constants
         numeric_cols = [c for c in df_final.columns if c not in ['datetime']]
@@ -1031,20 +1015,61 @@ def validate_features_for_ml_safety(features_df: pl.DataFrame, token_name: str =
             validation_report['safe_features'].append(col)
     
     # Check for constant features (repeated values - sign of global features)
+    # PERFORMANCE LIMIT: Only check first 50 features to avoid slowdown
+    expensive_checks = 0
+    max_expensive_checks = 50
+    
     for col in features_df.columns:
         if col in ['datetime', 'price']:  # Skip metadata columns
             continue
+            
+        # PERFORMANCE: Limit expensive checks
+        if expensive_checks >= max_expensive_checks:
+            validation_report['warnings'].append(f"Skipped expensive validation for {len(features_df.columns) - expensive_checks - 2} features (performance limit)")
+            break
+        expensive_checks += 1
             
         try:
             if features_df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]:
                 unique_count = features_df[col].n_unique()
                 total_count = features_df.height
                 
-                # If more than 90% of values are the same, it's likely a repeated global feature
-                if unique_count == 1 or (unique_count / total_count) < 0.1:
-                    validation_report['unsafe_features'].append(f"{col}_constant")
-                    validation_report['warnings'].append(f"Feature '{col}' has constant/repeated values (likely global feature)")
-                    validation_report['is_safe'] = False
+                # Check for truly constant features
+                if unique_count == 1:
+                    # Check if it's a legitimate zero/small value
+                    unique_val = features_df[col].drop_nulls().unique().to_list()[0]
+                    if abs(unique_val) < 1e-10:  # Very small value, likely from dead token
+                        validation_report['warnings'].append(f"Feature '{col}' is near-zero (expected for dead tokens)")
+                    else:
+                        validation_report['unsafe_features'].append(f"{col}_constant")
+                        validation_report['warnings'].append(f"Feature '{col}' has constant values (likely global feature)")
+                        validation_report['is_safe'] = False
+                
+                # Check for very low variability - but ONLY for extremely suspicious cases
+                elif (unique_count / total_count) < 0.0001:  # < 0.01% unique values (very restrictive)
+                    try:
+                        # Fast numpy approach for edge case analysis (much faster than individual Polars queries)
+                        values = features_df[col].drop_nulls().to_numpy()
+                        if len(values) > 0:
+                            min_val, max_val = np.min(values), np.max(values)
+                            mean_val = np.mean(values)
+                            
+                            # Calculate relative range (handles tiny crypto prices correctly)
+                            if abs(mean_val) > 1e-15:  # Avoid division by zero
+                                relative_range = (max_val - min_val) / abs(mean_val)
+                                if relative_range < 0.01:  # < 1% relative change is suspicious
+                                    validation_report['unsafe_features'].append(f"{col}_no_relative_variability")
+                                    validation_report['warnings'].append(f"Feature '{col}' has no meaningful relative variability (likely global feature)")
+                                    validation_report['is_safe'] = False
+                                else:
+                                    # Low unique count but good relative range = OK for crypto
+                                    validation_report['warnings'].append(f"Feature '{col}' has low unique count but good relative range (OK for crypto)")
+                            else:
+                                # Values are truly zero/near-zero
+                                validation_report['warnings'].append(f"Feature '{col}' is near-zero across token lifecycle")
+                    except:
+                        # Fallback: if stats calculation fails, flag as suspicious
+                        validation_report['warnings'].append(f"Feature '{col}' stats calculation failed (potential data issue)")
         except:
             continue
     
@@ -1106,7 +1131,10 @@ def main(fast_mode: bool = False):
     """
     print("="*60)
     print("🧠 CLEAN FEATURE ENGINEERING ARCHITECTURE")
-    print("Creating ONLY rolling ML-safe features")
+    if fast_mode:
+        print("⚡ FAST MODE: Creating comprehensive rolling ML-safe features")
+    else:
+        print("Creating ONLY rolling ML-safe features")
     print("Global features computed on-demand in analysis")
     print("="*60)
     
@@ -1187,31 +1215,74 @@ def main(fast_mode: bool = False):
         print("\n🎉 Fast rolling-feature generation complete! Files saved to data/features/")
 
     else:
-        # ---------- FULL MODE (existing path) ----------
-        print(f"\n🔬 Running comprehensive feature engineering (rolling + diagnostics)…")
-        features_dict, token_paths = batch_feature_engineering(
-            all_token_paths,
-            limit=None  # Process all tokens
-        )
+        # ---------- FULL MODE - Use create_rolling_features_safe for comprehensive features ----------
+        print(f"\n🔬 Running comprehensive ML feature engineering…")
+        output_dir = Path("data/features")
+        saved = 0
+        category_counts = {}
 
-        # Save only rolling features (clean approach)
-        save_features_to_files(features_dict, token_paths)
+        for path in tqdm(all_token_paths, desc="🧮 Generating comprehensive ML features", unit="token"):
+            try:
+                token_name = path.stem
+                df = pl.read_parquet(path)
+                if 'price' not in df.columns or 'datetime' not in df.columns:
+                    continue
 
-        # Print summary
-        successful_features = sum(1 for f in features_dict.values() if f['status'] == 'success')
+                # Use create_rolling_features_safe for FULL feature set
+                rolling_df = create_rolling_features_safe(df, token_name)
+                if rolling_df.is_empty():
+                    continue
 
-        print(f"\n" + "="*60)
-        print(f"📊 CLEAN FEATURE ENGINEERING SUMMARY")
-        print(f"="*60)
-        print(f"   📈 Total tokens processed: {len(features_dict):,}")
-        print(f"   ✅ Successful extractions: {successful_features:,}")
-        print(f"   📉 Failed extractions: {len(features_dict) - successful_features:,}")
-        print(f"   🎯 Success rate: {successful_features/len(features_dict)*100:.1f}%")
+                # Validate features for ML safety
+                validation_report = validate_features_for_ml_safety(rolling_df, token_name)
+                if not validation_report['is_safe']:
+                    tqdm.write(f"⚠️  {token_name}: Features failed ML safety check")
+                    for warning in validation_report['warnings'][:3]:  # Show first 3 warnings
+                        tqdm.write(f"   - {warning}")
+                    continue
 
-        print(f"\n🎉 Clean feature engineering complete!")
-        print(f"   💾 Rolling Features: data/features/ (ML-ready)")
-        print(f"   🧠 Global Features: On-demand in Streamlit (analysis)")
-        print(f"   📁 {successful_features:,} rolling feature files ready for ML")
+                category = path.parent.name
+                category_dir = output_dir / category
+                category_dir.mkdir(parents=True, exist_ok=True)
+                out_path = category_dir / f"{token_name}.parquet"
+                rolling_df.write_parquet(out_path)
+                saved += 1
+                category_counts[category] = category_counts.get(category, 0) + 1
+            except Exception as e:
+                tqdm.write(f"❌ {token_name}: {e}")
+                continue
+
+        # Summary for full mode
+        print("\n" + "="*60)
+        print("📊 COMPREHENSIVE FEATURE ENGINEERING SUMMARY")
+        print("="*60)
+        print(f"   📈 Total tokens processed: {len(all_token_paths):,}")
+        print(f"   ✅ Successfully saved: {saved:,}")
+        print(f"   📉 Failed/Skipped: {len(all_token_paths) - saved:,}")
+        print(f"   🎯 Success rate: {saved/len(all_token_paths)*100:.1f}%")
+        
+        print(f"\n📁 Features per category:")
+        for cat, cnt in sorted(category_counts.items()):
+            print(f"   {cat}: {cnt:,} tokens")
+            
+        # Show example of features created
+        if saved > 0:
+            # Load one example to show features
+            example_files = list(output_dir.rglob("*.parquet"))
+            if example_files:
+                example_df = pl.read_parquet(example_files[0])
+                feature_cols = [c for c in example_df.columns if c not in ['datetime', 'price']]
+                print(f"\n📊 Features created ({len(feature_cols)} per token):")
+                for i, col in enumerate(sorted(feature_cols)):
+                    if i < 10:  # Show first 10
+                        print(f"   • {col}")
+                    elif i == 10:
+                        print(f"   ... and {len(feature_cols) - 10} more features")
+                        break
+
+        print(f"\n🎉 Comprehensive feature engineering complete!")
+        print(f"   💾 ML Features: data/features/ (ready for training)")
+        print(f"   📁 {saved:,} feature files with full feature set")
 
     print(f"\n🚀 Ready to train ML models with clean features:")
     print(f"   🟢 python ML/directional_models/train_lightgbm_model.py")

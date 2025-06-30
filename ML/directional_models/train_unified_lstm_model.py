@@ -16,8 +16,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import RobustScaler
+from ML.utils.winsorizer import Winsorizer
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from ML.utils.metrics_helpers import financial_classification_metrics
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import plotly.graph_objects as go
@@ -26,6 +27,7 @@ from tqdm import tqdm
 import json
 import warnings
 warnings.filterwarnings('ignore')
+from ML.utils.training_plots import plot_training_curves, create_learning_summary
 
 # --- Configuration ---
 CONFIG = {
@@ -172,12 +174,12 @@ class UnifiedDirectionalDataset(Dataset):
                 feature_matrix = features_df[feature_cols].to_numpy()
                 prices = features_df['price'].to_numpy()
                 
-                # Create per-token scaler for features - key improvement!
-                scaler = RobustScaler()
-                scaler.fit(feature_matrix)
-                self.token_scalers[token_id] = scaler
+                # Create per-token winsorizer for features - better for crypto!
+                winsorizer = Winsorizer(lower_percentile=0.005, upper_percentile=0.995)
+                winsorizer.fit(feature_matrix)
+                self.token_scalers[token_id] = winsorizer
                 
-                self._create_sequences(feature_matrix, prices, token_id, scaler)
+                self._create_sequences(feature_matrix, prices, token_id, winsorizer)
                 
             except Exception as e:
                 print(f"Error processing features for {path.name}: {e}")
@@ -191,9 +193,9 @@ class UnifiedDirectionalDataset(Dataset):
         else:
             print("WARNING: No feature sequences were created! Check feature engineering output.")
     
-    def _create_sequences(self, feature_matrix: np.ndarray, prices: np.ndarray, token_id: str, scaler: RobustScaler):
+    def _create_sequences(self, feature_matrix: np.ndarray, prices: np.ndarray, token_id: str, winsorizer: Winsorizer):
         """Create sequences from pre-engineered features."""
-        features_norm = scaler.transform(feature_matrix)
+        features_norm = winsorizer.transform(feature_matrix)
         
         # Create overlapping sequences
         max_horizon = max(self.horizons)
@@ -314,7 +316,7 @@ class FocalLoss(nn.Module):
         return focal_loss.mean()
 
 def train_model(model, train_loader, val_loader, config):
-    """Train the unified directional prediction model."""
+    """Train the unified directional prediction model with loss tracking."""
     # Use MPS (Apple Silicon GPU) if available, then CUDA, then CPU
     if torch.backends.mps.is_available():
         device = 'mps'
@@ -333,33 +335,74 @@ def train_model(model, train_loader, val_loader, config):
     # Add learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
     
-    print(f"\nTraining on {device}...")
-    for epoch in range(config['num_epochs']):
+    # Track losses for plotting
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    best_epoch = 0
+    
+    print(f"\nTraining Unified LSTM on {device}...")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    for epoch in range(config['epochs']):
         model.train()
-        for batch_x, batch_y in train_loader:
+        train_loss = 0
+        
+        # Add progress bar for training batches
+        from tqdm import tqdm
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']} - Training")
+        for batch_x, batch_y in train_pbar:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             optimizer.zero_grad()
             outputs = model(batch_x)
             loss = criterion(outputs, batch_y)
             loss.backward()
             optimizer.step()
+            train_loss += loss.item()
+            
+            # Update progress bar with current loss
+            train_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+        
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
         
         # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for batch_x, batch_y in val_loader:
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['epochs']} - Validation", leave=False)
+            for batch_x, batch_y in val_pbar:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 outputs = model(batch_x)
-                val_loss += criterion(outputs, batch_y).item()
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                val_pbar.set_postfix({'Val Loss': f'{loss.item():.4f}'})
         
         avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        # Track best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_epoch = epoch + 1
+        
         scheduler.step(avg_val_loss)
         
         if (epoch + 1) % 5 == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            print(f'Epoch [{epoch+1}/{config["num_epochs"]}], Val Loss: {avg_val_loss:.4f}, LR: {current_lr:.6f}')
-    return model
+            print(f'Epoch [{epoch+1}/{config["epochs"]}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {current_lr:.6f}')
+    
+    print(f"\nBest validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+    
+    # Return model and training history
+    training_history = {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss
+    }
+    
+    return model, training_history
 
 def evaluate_model(model, test_loader, horizons):
     """Evaluate using classification metrics for each horizon."""
@@ -373,9 +416,11 @@ def evaluate_model(model, test_loader, horizons):
     model.eval()
     all_preds, all_targets = [], []
     with torch.no_grad():
-        for batch_x, batch_y in test_loader:
+        test_pbar = tqdm(test_loader, desc="Evaluating on test set")
+        for batch_x, batch_y in test_pbar:
             batch_x = batch_x.to(device)
-            all_preds.append(model(batch_x).cpu().numpy())
+            predictions = model(batch_x)
+            all_preds.append(predictions.cpu().numpy())
             all_targets.append(batch_y.numpy())
             
     predictions = np.vstack(all_preds)
@@ -500,6 +545,11 @@ def main():
     val_dataset = UnifiedDirectionalDataset(val_paths, CONFIG['sequence_length'], CONFIG['horizons'])
     test_dataset = UnifiedDirectionalDataset(test_paths, CONFIG['sequence_length'], CONFIG['horizons'])
     
+    print(f"\n📊 Dataset sizes:")
+    print(f"  Training: {len(train_dataset):,} sequences")
+    print(f"  Validation: {len(val_dataset):,} sequences") 
+    print(f"  Test: {len(test_dataset):,} sequences")
+    
     # Determine input size from first batch
     sample_sequence, _ = train_dataset[0]
     input_size = sample_sequence.shape[1]  # Number of features per timestep
@@ -519,7 +569,7 @@ def main():
         'horizons': CONFIG['horizons']
     }
     model = UnifiedLSTMPredictor(**model_params)
-    model = train_model(model, train_loader, val_loader, CONFIG)
+    model, training_history = train_model(model, train_loader, val_loader, CONFIG)
     
     # Evaluate
     print("\nEvaluating on test set...")
@@ -538,15 +588,26 @@ def main():
         'config': CONFIG,
         'token_scalers': train_dataset.token_scalers,
         'metrics': metrics,
-        'input_size': input_size
+        'input_size': input_size,
+        'training_history': training_history
     }, model_path)
     print(f"\nModel saved to: {model_path}")
     
-    # Create and save plot
+    # Create and save performance metrics plot
     fig = plot_metrics(metrics)
     metrics_path = CONFIG['results_dir'] / 'unified_lstm_metrics.html'
     fig.write_html(metrics_path)
     print(f"Metrics plot saved to: {metrics_path}")
+    
+    # Create and save training curves
+    training_fig = plot_training_curves(
+        training_history['train_losses'],
+        training_history['val_losses'],
+        title="Unified LSTM Training Progress"
+    )
+    training_path = CONFIG['results_dir'] / 'training_curves.html'
+    training_fig.write_html(training_path)
+    print(f"Training curves saved to: {training_path}")
     
     # Save metrics as JSON for easy analysis
     metrics_json_path = CONFIG['results_dir'] / 'metrics.json'

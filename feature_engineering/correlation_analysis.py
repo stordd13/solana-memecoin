@@ -36,6 +36,7 @@ class TokenCorrelationAnalyzer:
                                  method: str = 'pearson',
                                  min_overlap: int = 100,
                                  use_log_returns: bool = True,
+                                 use_log_prices: bool = False,
                                  use_robust_scaling: bool = False,
                                  use_rolling: bool = False,
                                  rolling_window: Optional[int] = None,
@@ -60,12 +61,14 @@ class TokenCorrelationAnalyzer:
                     token_data, 
                     lifecycle_minutes,
                     use_log_returns, 
+                    use_log_prices,
                     use_robust_scaling
                 )
             else:
                 sync_data = self._synchronize_token_data(
                     token_data, 
                     use_log_returns, 
+                    use_log_prices,
                     use_robust_scaling
                 )
             
@@ -108,7 +111,7 @@ class TokenCorrelationAnalyzer:
                 'summary_stats': self._generate_correlation_summary(correlation_matrices['main']),
                 'rolling_analysis': use_rolling,
                 'rolling_window': rolling_window,
-                'scaling_method': 'robust_scaler' if use_robust_scaling else 'simple_normalization' if not use_log_returns else 'log_returns',
+                'scaling_method': 'robust_scaler' if use_robust_scaling else 'log_prices' if use_log_prices else 'simple_normalization' if not use_log_returns else 'log_returns',
                 'sync_method': 'lifecycle' if use_lifecycle_sync else 'temporal',
                 'lifecycle_minutes': lifecycle_minutes if use_lifecycle_sync else None
             }
@@ -119,6 +122,7 @@ class TokenCorrelationAnalyzer:
     def _synchronize_token_data(self, 
                                token_data: Dict[str, pl.DataFrame],
                                use_log_returns: bool = True,
+                               use_log_prices: bool = False,
                                use_robust_scaling: bool = False) -> Optional[pl.DataFrame]:
         """Synchronize token data to common timeframe using Polars - IMPROVED VERSION"""
         
@@ -128,7 +132,7 @@ class TokenCorrelationAnalyzer:
         prepared_dfs = []
         
         # If using robust scaling, fit scaler on all price data first
-        if use_robust_scaling and not use_log_returns:
+        if use_robust_scaling and not use_log_returns and not use_log_prices:
             # Collect all prices for fitting the scaler
             all_prices = []
             for df in token_data.values():
@@ -191,6 +195,18 @@ class TokenCorrelationAnalyzer:
                     df_sync = df_with_returns.select([
                         pl.col('datetime'),
                         pl.col('returns').alias(token_name)
+                    ])
+                
+                elif use_log_prices:
+                    # Calculate log prices - NEW FEATURE
+                    df_with_log_prices = df_filtered.with_columns([
+                        pl.col('price').log().alias('log_price')
+                    ]).drop_nulls('log_price')
+                    
+                    # Rename the column to include token name
+                    df_sync = df_with_log_prices.select([
+                        pl.col('datetime'),
+                        pl.col('log_price').alias(token_name)
                     ])
                 
                 elif use_robust_scaling:
@@ -499,6 +515,7 @@ class TokenCorrelationAnalyzer:
                                     token_data: Dict[str, pl.DataFrame],
                                     lifecycle_minutes: int = 240,
                                     use_log_returns: bool = True,
+                                    use_log_prices: bool = False,
                                     use_robust_scaling: bool = False) -> Optional[pl.DataFrame]:
         """
         NEW: Synchronize tokens by lifecycle position rather than absolute time
@@ -511,7 +528,7 @@ class TokenCorrelationAnalyzer:
         prepared_dfs = []
         
         # If using robust scaling, fit scaler on all price data first
-        if use_robust_scaling and not use_log_returns:
+        if use_robust_scaling and not use_log_returns and not use_log_prices:
             all_prices = []
             for df in token_data.values():
                 prices = df['price'].to_numpy()
@@ -550,6 +567,16 @@ class TokenCorrelationAnalyzer:
                     df_sync = df_with_returns.select([
                         pl.col('lifecycle_minute'),
                         pl.col('returns').alias(token_name)
+                    ])
+                
+                elif use_log_prices:
+                    df_with_log_prices = df_with_index.with_columns([
+                        pl.col('price').log().alias('log_price')
+                    ]).drop_nulls('log_price')
+                    
+                    df_sync = df_with_log_prices.select([
+                        pl.col('lifecycle_minute'),
+                        pl.col('log_price').alias(token_name)
                     ])
                 
                 elif use_robust_scaling:
@@ -885,28 +912,44 @@ class TokenCorrelationAnalyzer:
                              df: pl.DataFrame, 
                              analysis_column: str,
                              window_length: int,
-                             overlap_pct: float) -> Dict:
-        """Perform FFT analysis on a given column of a DataFrame."""
+                             overlap_pct: float,
+                             detrend_method: str = 'linear') -> Dict:
+        """Enhanced FFT analysis with improved spectral analysis and visualization data."""
         try:
-            # Prepare data
+            from scipy.signal import detrend, spectrogram, welch
+            from scipy.fft import fft, fftfreq
+            
+            # Prepare data based on analysis type
             if analysis_column == 'Log Returns':
-                series = np.log(df['price']).diff().drop_nans()
+                # Calculate log returns
+                prices = df['price'].to_numpy()
+                log_prices = np.log(prices)
+                series = np.diff(log_prices)
+                series = series[~np.isnan(series)]
             elif analysis_column == 'Detrended Prices':
-                from scipy.signal import detrend
-                series = pl.Series(detrend(df['price'].to_numpy()))
+                prices = df['price'].to_numpy()
+                if detrend_method == 'linear':
+                    series = detrend(prices, type='linear')
+                elif detrend_method == 'constant':
+                    series = detrend(prices, type='constant')
+                else:
+                    series = prices
             elif analysis_column == 'Volume':
                 if 'volume' not in df.columns:
                     return {'status': 'error', 'reason': 'Volume column not available'}
-                series = df['volume']
+                series = df['volume'].to_numpy()
             else: # Prices
-                series = df['price']
+                series = df['price'].to_numpy()
 
-            series = series.fill_nan(0).to_numpy()
+            # Remove NaN values and ensure we have valid data
+            series = series[~np.isnan(series)]
+            if len(series) == 0:
+                return {'status': 'error', 'reason': 'No valid data after cleaning'}
             
             if len(series) < window_length:
-                return {'status': 'error', 'reason': 'Not enough data for the specified window length'}
+                return {'status': 'error', 'reason': f'Not enough data: {len(series)} points < {window_length} required'}
 
-            # Perform FFT on sliding windows
+            # 1. Basic FFT Analysis
             step = int(window_length * (1 - overlap_pct / 100))
             all_freqs = []
             
@@ -916,173 +959,344 @@ class TokenCorrelationAnalyzer:
                 # Apply Hanning window to reduce spectral leakage
                 window = window * np.hanning(len(window))
                 
-                fft_result = np.fft.fft(window)
-                fft_freq = np.fft.fftfreq(len(window))
+                fft_result = fft(window)
+                fft_freq = fftfreq(len(window))
                 
-                # Get positive frequencies
+                # Get positive frequencies only
                 positive_mask = fft_freq > 0
                 all_freqs.append(pd.DataFrame({
                     'freq': fft_freq[positive_mask],
-                    'amplitude': np.abs(fft_result[positive_mask])
+                    'amplitude': np.abs(fft_result[positive_mask]),
+                    'phase': np.angle(fft_result[positive_mask])
                 }))
             
             if not all_freqs:
                 return {'status': 'error', 'reason': 'FFT analysis did not produce results'}
 
             # Average the frequencies across all windows
-            avg_freqs = pd.concat(all_freqs).groupby('freq').amplitude.mean().reset_index()
+            combined_freqs = pd.concat(all_freqs)
+            avg_freqs = combined_freqs.groupby('freq').agg({
+                'amplitude': 'mean',
+                'phase': 'mean'
+            }).reset_index()
             
-            # Find dominant frequencies
-            dominant_freqs = avg_freqs.nlargest(10, 'amplitude')
+            # 2. Power Spectral Density using Welch's method
+            frequencies, psd = welch(series, nperseg=min(len(series)//4, 256), 
+                                   noverlap=None, return_onesided=True)
+            
+            # 3. Spectrogram for time-frequency analysis
+            f_spec, t_spec, Sxx = spectrogram(series, nperseg=min(len(series)//8, 64), 
+                                             noverlap=None, return_onesided=True)
+            
+            # Find dominant frequencies and their periods
+            dominant_freqs = avg_freqs.nlargest(15, 'amplitude').copy()
             dominant_freqs['period_minutes'] = 1 / dominant_freqs['freq']
+            dominant_freqs['period_hours'] = dominant_freqs['period_minutes'] / 60
+            
+            # Classify frequency types
+            def classify_period(period_min):
+                if period_min < 5:
+                    return 'High-frequency noise'
+                elif period_min < 30:
+                    return 'Short-term cycles'
+                elif period_min < 120:
+                    return 'Medium-term patterns'
+                elif period_min < 480:
+                    return 'Long-term trends'
+                else:
+                    return 'Very long-term patterns'
+            
+            dominant_freqs['pattern_type'] = dominant_freqs['period_minutes'].apply(classify_period)
+            
+            # Statistical analysis
+            total_power = np.sum(avg_freqs['amplitude'])
+            dominant_power = np.sum(dominant_freqs.head(5)['amplitude'])
+            power_concentration = dominant_power / total_power if total_power > 0 else 0
             
             return {
                 'status': 'success',
+                'analysis_type': analysis_column,
+                'data_points': len(series),
+                'window_length': window_length,
+                'overlap_pct': overlap_pct,
+                'detrend_method': detrend_method,
+                
+                # Frequency domain results
                 'avg_spectrum': avg_freqs,
-                'dominant_freqs': dominant_freqs
+                'dominant_freqs': dominant_freqs,
+                'power_concentration': power_concentration,
+                
+                # Power spectral density
+                'psd_frequencies': frequencies,
+                'psd_values': psd,
+                
+                # Spectrogram data for time-frequency plot
+                'spectrogram_freq': f_spec,
+                'spectrogram_time': t_spec,
+                'spectrogram_power': Sxx,
+                
+                # Summary statistics
+                'dominant_period': float(dominant_freqs.iloc[0]['period_minutes']) if len(dominant_freqs) > 0 else None,
+                'num_significant_peaks': len(dominant_freqs[dominant_freqs['amplitude'] > np.percentile(avg_freqs['amplitude'], 95)]),
+                'frequency_range': {
+                    'min': float(avg_freqs['freq'].min()),
+                    'max': float(avg_freqs['freq'].max())
+                }
             }
             
         except Exception as e:
             return {'status': 'error', 'reason': str(e)}
 
     def create_fft_visualization(self, fft_results: Dict) -> go.Figure:
-        """Create visualization for FFT analysis results."""
+        """Create comprehensive visualization for enhanced FFT analysis results."""
         if fft_results['status'] != 'success':
             return None
 
         avg_spectrum = fft_results['avg_spectrum']
         dominant_freqs = fft_results['dominant_freqs']
         
+        # Create 4-panel visualization
         fig = make_subplots(
-            rows=2, cols=1,
-            subplot_titles=('Full Frequency Spectrum', 'Top 10 Dominant Frequencies (Cycles)'),
-            vertical_spacing=0.15
+            rows=2, cols=2,
+            subplot_titles=(
+                'Frequency Spectrum (Full Range)', 
+                'Power Spectral Density (Welch Method)',
+                'Dominant Cyclical Patterns', 
+                'Time-Frequency Spectrogram'
+            ),
+            specs=[[{"type": "scatter"}, {"type": "scatter"}],
+                   [{"type": "bar"}, {"type": "heatmap"}]],
+            vertical_spacing=0.12,
+            horizontal_spacing=0.1
         )
         
-        # Plot 1: Full spectrum
+        # Plot 1: Full frequency spectrum
         fig.add_trace(go.Scatter(
             x=avg_spectrum['freq'],
             y=avg_spectrum['amplitude'],
             mode='lines',
-            name='Spectrum',
-            line=dict(color='blue')
+            name='FFT Spectrum',
+            line=dict(color='blue', width=1.5),
+            hovertemplate='Frequency: %{x:.4f}<br>Amplitude: %{y:.2f}<extra></extra>'
         ), row=1, col=1)
         
-        # Plot 2: Dominant frequencies as bar chart
+        # Highlight dominant frequencies
+        top_5_freqs = dominant_freqs.head(5)
+        fig.add_trace(go.Scatter(
+            x=top_5_freqs['freq'],
+            y=top_5_freqs['amplitude'],
+            mode='markers',
+            name='Dominant Peaks',
+            marker=dict(color='red', size=8, symbol='star'),
+            hovertemplate='Peak Freq: %{x:.4f}<br>Period: %{customdata:.1f} min<br>Amplitude: %{y:.2f}<extra></extra>',
+            customdata=top_5_freqs['period_minutes']
+        ), row=1, col=1)
+        
+        # Plot 2: Power Spectral Density
+        if 'psd_frequencies' in fft_results and 'psd_values' in fft_results:
+            fig.add_trace(go.Scatter(
+                x=fft_results['psd_frequencies'],
+                y=fft_results['psd_values'],
+                mode='lines',
+                name='PSD',
+                line=dict(color='green', width=1.5),
+                hovertemplate='Frequency: %{x:.4f}<br>Power: %{y:.2e}<extra></extra>'
+            ), row=1, col=2)
+        
+        # Plot 3: Dominant frequencies with pattern classification
+        # Create color mapping for pattern types
+        pattern_colors = {
+            'High-frequency noise': '#ff7f7f',
+            'Short-term cycles': '#7f7fff', 
+            'Medium-term patterns': '#7fff7f',
+            'Long-term trends': '#ffff7f',
+            'Very long-term patterns': '#ff7fff'
+        }
+        
+        colors = [pattern_colors.get(pt, '#cccccc') for pt in dominant_freqs['pattern_type']]
+        
         fig.add_trace(go.Bar(
-            x=[f"{p:.1f} min" for p in dominant_freqs['period_minutes']],
+            x=[f"{p:.1f}m ({pt})" for p, pt in zip(dominant_freqs['period_minutes'], dominant_freqs['pattern_type'])],
             y=dominant_freqs['amplitude'],
-            text=[f"{p:.1f} min" for p in dominant_freqs['period_minutes']],
+            marker_color=colors,
+            text=[f"{p:.1f}m" for p in dominant_freqs['period_minutes']],
             textposition='outside',
-            name='Dominant Cycles'
+            name='Dominant Patterns',
+            hovertemplate='Period: %{text}<br>Type: %{customdata}<br>Amplitude: %{y:.2f}<extra></extra>',
+            customdata=dominant_freqs['pattern_type']
         ), row=2, col=1)
         
+        # Plot 4: Spectrogram (time-frequency analysis)
+        if all(k in fft_results for k in ['spectrogram_freq', 'spectrogram_time', 'spectrogram_power']):
+            fig.add_trace(go.Heatmap(
+                x=fft_results['spectrogram_time'],
+                y=fft_results['spectrogram_freq'],
+                z=10 * np.log10(fft_results['spectrogram_power'] + 1e-10),  # Convert to dB
+                colorscale='Viridis',
+                name='Spectrogram',
+                hovertemplate='Time: %{x:.1f}<br>Frequency: %{y:.4f}<br>Power (dB): %{z:.1f}<extra></extra>'
+            ), row=2, col=2)
+        
+        # Update layout and axes
         fig.update_layout(
-            height=700,
-            title_text="FFT Analysis: Cyclical Pattern Detection",
-            showlegend=False
+            height=900,
+            title_text=f"Enhanced FFT Analysis: {fft_results.get('analysis_type', 'Unknown')} "
+                      f"({fft_results.get('data_points', 0)} points)",
+            showlegend=False,
+            font=dict(size=11)
         )
+        
+        # Customize axes
         fig.update_xaxes(title_text="Frequency (cycles/minute)", row=1, col=1)
         fig.update_yaxes(title_text="Amplitude", row=1, col=1)
-        fig.update_xaxes(title_text="Period of Dominant Cycle", row=2, col=1)
+        
+        fig.update_xaxes(title_text="Frequency (cycles/minute)", row=1, col=2)
+        fig.update_yaxes(title_text="Power Spectral Density", row=1, col=2, type="log")
+        
+        fig.update_xaxes(title_text="Cyclical Patterns", row=2, col=1, tickangle=45)
         fig.update_yaxes(title_text="Amplitude", row=2, col=1)
+        
+        fig.update_xaxes(title_text="Time", row=2, col=2)
+        fig.update_yaxes(title_text="Frequency", row=2, col=2)
         
         return fig
 
     def create_correlation_network(self, correlation_matrix: pl.DataFrame, threshold: float = 0.5) -> go.Figure:
         """Create an interactive network graph of token correlations."""
-
-        # Get token names and correlation values
-        token_names = correlation_matrix['token'].to_list()
-        corr_values = correlation_matrix.select([col for col in correlation_matrix.columns if col != 'token']).to_numpy()
         
-        # Build the graph
-        G = nx.Graph()
-        for i, token_name in enumerate(token_names):
-            G.add_node(token_name)
+        try:
+            # Debug: Print correlation matrix info
+            print(f"Correlation matrix shape: {correlation_matrix.shape}")
+            print(f"Correlation matrix columns: {correlation_matrix.columns}")
             
-        for i in range(len(token_names)):
-            for j in range(i + 1, len(token_names)):
-                correlation = corr_values[i, j]
-                if abs(correlation) >= threshold:
-                    G.add_edge(token_names[i], token_names[j], weight=correlation)
+            # Get token names and correlation values
+            token_names = correlation_matrix['token'].to_list()
+            numeric_cols = [col for col in correlation_matrix.columns if col != 'token']
+            corr_values = correlation_matrix.select(numeric_cols).to_numpy()
+            
+            print(f"Token names: {token_names}")
+            print(f"Correlation values shape: {corr_values.shape}")
+            print(f"Threshold: {threshold}")
+            
+            # Validate that we have a square correlation matrix
+            if len(token_names) != len(numeric_cols):
+                print(f"Warning: Token names count ({len(token_names)}) != numeric columns count ({len(numeric_cols)})")
+                
+            # Build the graph
+            G = nx.Graph()
+            for token_name in token_names:
+                G.add_node(token_name)
+                
+            edges_added = 0
+            for i in range(len(token_names)):
+                for j in range(i + 1, len(token_names)):
+                    if i < corr_values.shape[0] and j < corr_values.shape[1]:
+                        correlation = corr_values[i, j]
+                        if not np.isnan(correlation) and abs(correlation) >= threshold:
+                            G.add_edge(token_names[i], token_names[j], weight=correlation)
+                            edges_added += 1
+                            
+            print(f"Edges added: {edges_added}")
                     
-        if G.number_of_edges() == 0:
-            return go.Figure(layout=dict(title='No correlations above threshold to display.'))
+            if G.number_of_edges() == 0:
+                return go.Figure().add_annotation(
+                    text=f"No correlations above threshold {threshold:.2f} found.<br>Try lowering the threshold.",
+                    xref="paper", yref="paper", x=0.5, y=0.5,
+                    xanchor='center', yanchor='middle',
+                    showarrow=False, font=dict(size=16)
+                ).update_layout(
+                    title=f"Network Graph: No Correlations Above {threshold:.2f}",
+                    xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                    yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+                )
 
-        # Get positions for the nodes
-        pos = nx.spring_layout(G, k=0.8, iterations=50)
+            # Get positions for the nodes
+            pos = nx.spring_layout(G, k=0.8, iterations=50)
 
-        # Create edge traces
-        edge_x, edge_y = [], []
-        edge_colors, edge_widths = [], []
-        for edge in G.edges(data=True):
-            x0, y0 = pos[edge[0]]
-            x1, y1 = pos[edge[1]]
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
+            # Create edge traces
+            edge_x, edge_y = [], []
+            edge_colors, edge_widths = [], []
+            for edge in G.edges(data=True):
+                x0, y0 = pos[edge[0]]
+                x1, y1 = pos[edge[1]]
+                edge_x.extend([x0, x1, None])
+                edge_y.extend([y0, y1, None])
+                
+                weight = edge[2]['weight']
+                edge_colors.append('red' if weight < 0 else 'green')
+                edge_widths.append(1 + (abs(weight) - threshold) * 10)
+
+            edge_trace = go.Scatter(
+                x=edge_x, y=edge_y,
+                line=dict(width=0.5, color='#888'),
+                hoverinfo='none',
+                mode='lines')
+                
+            # Create node traces
+            node_x, node_y, node_text = [], [], []
+            for node in G.nodes():
+                x, y = pos[node]
+                node_x.append(x)
+                node_y.append(y)
+                node_text.append(node)
+
+            node_trace = go.Scatter(
+                x=node_x, y=node_y,
+                mode='markers+text',
+                hoverinfo='text',
+                text=node_text,
+                textposition="top center",
+                marker=dict(
+                    showscale=True,
+                    colorscale='YlGnBu',
+                    reversescale=True,
+                    color=[],
+                    size=15,
+                    colorbar=dict(
+                        thickness=15,
+                        title='Node Connections'
+                    ),
+                    line_width=2))
+
+            # Color nodes by number of connections
+            node_adjacencies = []
+            for node, adjacencies in enumerate(G.adjacency()):
+                node_adjacencies.append(len(adjacencies[1]))
+            node_trace.marker.color = node_adjacencies
             
-            weight = edge[2]['weight']
-            edge_colors.append('red' if weight < 0 else 'green')
-            edge_widths.append(1 + (abs(weight) - threshold) * 10)
-
-        edge_trace = go.Scatter(
-            x=edge_x, y=edge_y,
-            line=dict(width=0.5, color='#888'),
-            hoverinfo='none',
-            mode='lines')
+            # Create figure
+            fig = go.Figure(data=[edge_trace, node_trace])
             
-        # Create node traces
-        node_x, node_y, node_text = [], [], []
-        for node in G.nodes():
-            x, y = pos[node]
-            node_x.append(x)
-            node_y.append(y)
-            node_text.append(node)
-
-        node_trace = go.Scatter(
-            x=node_x, y=node_y,
-            mode='markers+text',
-            hoverinfo='text',
-            text=node_text,
-            textposition="top center",
-            marker=dict(
-                showscale=True,
-                colorscale='YlGnBu',
-                reversescale=True,
-                color=[],
-                size=15,
-                colorbar=dict(
-                    thickness=15,
-                    title='Node Connections',
-                    xanchor='left',
-                    titleside='right'
-                ),
-                line_width=2))
-
-        # Color nodes by number of connections
-        node_adjacencies = []
-        for node, adjacencies in enumerate(G.adjacency()):
-            node_adjacencies.append(len(adjacencies[1]))
-        node_trace.marker.color = node_adjacencies
-        
-        # Create figure
-        fig = go.Figure(data=[edge_trace, node_trace],
-             layout=go.Layout(
+            # Update layout separately to avoid parameter conflicts
+            fig.update_layout(
                 title='<br>Token Correlation Network',
                 titlefont_size=16,
                 showlegend=False,
-                hovermode='closest',
+                hovermode=False,
                 margin=dict(b=20,l=5,r=5,t=40),
-                annotations=[ dict(
+                annotations=[dict(
                     text=f"Correlations > {threshold}",
                     showarrow=False,
                     xref="paper", yref="paper",
-                    x=0.005, y=-0.002 ) ],
+                    x=0.005, y=-0.002
+                )],
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
-                )
-        return fig
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+            )
+            return fig
+            
+        except Exception as e:
+            print(f"Error creating network graph: {str(e)}")
+            return go.Figure().add_annotation(
+                text=f"Error creating network graph:<br>{str(e)}",
+                xref="paper", yref="paper", x=0.5, y=0.5,
+                xanchor='center', yanchor='middle',
+                showarrow=False, font=dict(size=14, color="red")
+            ).update_layout(
+                title="Network Graph Error",
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+            )
 
 
 def load_tokens_for_correlation(data_paths: List[Path], 
