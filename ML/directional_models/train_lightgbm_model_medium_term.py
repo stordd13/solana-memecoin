@@ -24,6 +24,7 @@ from tqdm import tqdm
 import joblib
 import json
 import sys
+import numpy as np
 
 # Add project root to path for ML imports
 current_dir = Path(__file__).resolve()
@@ -537,88 +538,210 @@ def plot_metrics(metrics: Dict):
 
 # --- Main Pipeline ---
 def main():
-    """Main training pipeline for the medium-term LightGBM model."""
-    print("="*50)
-    print("🛡️  Training Medium-Term LightGBM Directional Model")
-    print("USING SAFE PRE-ENGINEERED FEATURES (NO DATA LEAKAGE)")
-    print("Horizons: 2h, 4h, 6h, 12h")
-    print("="*50)
+    """Main training pipeline for LightGBM medium-term directional model with walk-forward validation"""
     
-    # Check if feature engineering has been run
-    if not CONFIG['features_dir'].exists():
-        print(f"\n❌ ERROR: Features directory not found: {CONFIG['features_dir']}")
-        print("\n🔧 REQUIRED STEP: Run feature engineering first!")
-        print("   python feature_engineering/advanced_feature_engineering.py")
-        print("\nThis will create the pre-engineered features needed for training.")
-        return
+    print("="*60)
+    print("🔬 LightGBM Medium-Term Directional Prediction Training")
+    print("Long horizons: 2h, 4h, 6h, 8h, 12h, 16h, 24h")
+    print("WITH WALK-FORWARD VALIDATION")
+    print("="*60)
     
     # Create results directory
-    CONFIG['results_dir'].mkdir(parents=True, exist_ok=True)
-    print(f"Results will be saved to: {CONFIG['results_dir']}")
+    results_dir = Path("ML/results/lightgbm_medium_term")
+    results_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load paths using the same stratified split logic
+    # Load data paths
+    base_dir = Path("data/features")
+    categories = [
+        "normal_behavior_tokens",
+        "tokens_with_extremes", 
+        "dead_tokens",
+    ]
+    
     all_paths = []
-    for category in CONFIG['categories']:
-        cat_dir = CONFIG['base_dir'] / category
+    for category in categories:
+        cat_dir = base_dir / category
         if cat_dir.exists():
-            all_paths.extend(list(cat_dir.glob("*.parquet")))
+            paths = list(cat_dir.glob("*.parquet"))
+            all_paths.extend(paths)
+            print(f"Found {len(paths)} files in {category}")
     
     if not all_paths:
-        print(f"ERROR: No files found in {CONFIG['base_dir']}. Exiting.")
+        print("ERROR: No feature files found!")
         return
-
-    # Note: Token deduplication is now handled upstream in data_analysis
-    # Each token should appear in exactly one category folder
-
-    # FIXED: Use temporal splitting within tokens instead of random token splits
-    print("\n🔧 LOADING PRE-ENGINEERED FEATURES with temporal splitting")
     
-    # Use all paths for temporal splitting within each token
-    train_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'train')
-    val_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'val')
-    test_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'test')
-
-    if train_df.is_empty() or val_df.is_empty() or test_df.is_empty():
-        print("ERROR: One or more data splits are empty. Check feature engineering output.")
-        return
-
-    # Train a model for each horizon
-    all_metrics = {}
-    models = {}
+    print(f"\nTotal files: {len(all_paths)}")
     
-    print(f"\n🚀 Training {len(CONFIG['horizons'])} Medium-Term LightGBM models: {CONFIG['horizons']}")
+    # Import walk-forward splitter
+    from ML.utils.walk_forward_splitter import WalkForwardSplitter
     
-    for i, h in enumerate(CONFIG['horizons'], 1):
-        print(f"\n--- Training for {h}m horizon ({i}/{len(CONFIG['horizons'])}) ---")
-        model, metrics = train_and_evaluate(train_df, val_df, test_df, h, CONFIG['lgb_params'])
-        
-        if model is not None:
-            all_metrics[f'{h}m'] = metrics['test']  # Use test metrics for plot
-            models[f'{h}m'] = model
+    print("\n🔄 Using Walk-Forward Validation for Medium-Term LightGBM")
+    
+    # Load all data first to prepare for walk-forward splitting
+    print("\n📊 Loading all feature data for walk-forward validation...")
+    
+    all_data_frames = []
+    for path in tqdm(all_paths, desc="Loading feature files"):
+        try:
+            df = pl.read_parquet(path)
+            if len(df) < 400:  # Minimum token length
+                continue
             
-            print(f"  🎯 Accuracy: {metrics['test']['accuracy']:.2%}")
-            print(f"  📈 ROC AUC: {metrics['test']['roc_auc']:.2%}")
-            print(f"✅ Horizon {h}m completed!")
-        else:
-            print(f"❌ Horizon {h}m failed - insufficient data")
-
-    # Save models
-    for horizon, model in models.items():
-        model_path = CONFIG['results_dir'] / f'lightgbm_model_{horizon}.joblib'
-        joblib.dump(model, model_path)
-    print(f"\nModels saved to: {CONFIG['results_dir']}/lightgbm_model_*.joblib")
+            # Add token identifier
+            df = df.with_columns(pl.lit(path.stem).alias('token_id'))
+            all_data_frames.append(df)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
     
-    # Save metrics
-    metrics_path = CONFIG['results_dir'] / 'lightgbm_metrics.json'
+    if not all_data_frames:
+        print("ERROR: No valid feature files found!")
+        return
+    
+    # Combine all data
+    combined_data = pl.concat(all_data_frames)
+    print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
+    
+    # Setup walk-forward splitter
+    splitter = WalkForwardSplitter(config='medium')  # Good for 400-2000 minute tokens
+    
+    # For LightGBM, use global splits across all tokens (better for cross-token learning)
+    print("\n🔀 Creating global walk-forward splits...")
+    global_splits = splitter.get_global_splits(combined_data, time_column='datetime')
+    
+    print(f"Created {len(global_splits)} walk-forward folds")
+    
+    # Process each fold and collect metrics for medium-term horizons
+    horizons = [120, 240, 360, 480, 720, 960, 1440]  # 2h, 4h, 6h, 8h, 12h, 16h, 24h
+    all_fold_metrics = {h: [] for h in horizons}
+    
+    for fold_idx, (train_df, test_df) in enumerate(global_splits):
+        print(f"\n📈 Processing fold {fold_idx + 1}/{len(global_splits)}")
+        print(f"  Train: {len(train_df):,} samples, {train_df['token_id'].n_unique()} tokens")
+        print(f"  Test: {len(test_df):,} samples, {test_df['token_id'].n_unique()} tokens")
+        
+        # Prepare data for this fold
+        try:
+            # Add labels
+            train_df = create_labels_for_horizons(train_df, horizons)
+            test_df = create_labels_for_horizons(test_df, horizons)
+            
+            # Split into 80% train, 20% validation from train_df
+            train_tokens = train_df['token_id'].unique()
+            np.random.shuffle(train_tokens.to_list())
+            
+            n_train_tokens = int(len(train_tokens) * 0.8)
+            fold_train_tokens = train_tokens[:n_train_tokens]
+            fold_val_tokens = train_tokens[n_train_tokens:]
+            
+            fold_train_df = train_df.filter(pl.col('token_id').is_in(fold_train_tokens))
+            fold_val_df = train_df.filter(pl.col('token_id').is_in(fold_val_tokens))
+            
+            print(f"  Fold train: {len(fold_train_df):,} samples")
+            print(f"  Fold val: {len(fold_val_df):,} samples")
+            
+            # Train and evaluate for each horizon
+            fold_metrics = {}
+            for horizon in horizons:
+                print(f"\n  Training horizon {horizon}min...")
+                
+                try:
+                    # Use stronger regularization for medium-term prediction
+                    params = {
+                        'objective': 'binary',
+                        'metric': 'binary_logloss',
+                        'boosting_type': 'gbdt',
+                        'num_leaves': 64,
+                        'learning_rate': 0.03,  # Lower learning rate for stability
+                        'feature_fraction': 0.7,  # More feature subsampling
+                        'bagging_fraction': 0.7,  # More data subsampling
+                        'bagging_freq': 5,
+                        'min_child_samples': 30,  # Higher minimum samples
+                        'reg_alpha': 0.1,  # L1 regularization
+                        'reg_lambda': 0.1,  # L2 regularization
+                        'random_state': 42,
+                        'verbose': -1
+                    }
+                    
+                    metrics = train_and_evaluate(fold_train_df, fold_val_df, test_df, horizon, params)
+                    fold_metrics[f"{horizon}min"] = metrics
+                    all_fold_metrics[horizon].append(metrics)
+                    
+                    print(f"    Accuracy: {metrics.get('accuracy', 0):.2%}")
+                    print(f"    AUC: {metrics.get('roc_auc', 0):.2%}")
+                    
+                except Exception as e:
+                    print(f"    Error training horizon {horizon}: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"  Error processing fold {fold_idx}: {e}")
+            continue
+    
+    # Aggregate metrics across all folds
+    print("\n📊 Aggregating metrics across walk-forward folds...")
+    
+    final_metrics = {}
+    for horizon in horizons:
+        horizon_name = f"{horizon}min"
+        fold_metrics_list = all_fold_metrics[horizon]
+        
+        if not fold_metrics_list:
+            print(f"No valid metrics for horizon {horizon_name}")
+            continue
+            
+        # Average metrics across folds
+        aggregated = {}
+        metric_names = fold_metrics_list[0].keys()
+        
+        for metric_name in metric_names:
+            values = [m.get(metric_name, 0) for m in fold_metrics_list if metric_name in m]
+            if values:
+                aggregated[f"{metric_name}"] = np.mean(values)
+                aggregated[f"{metric_name}_std"] = np.std(values)
+        
+        aggregated['num_folds'] = len(fold_metrics_list)
+        final_metrics[horizon_name] = aggregated
+    
+    # Print final results
+    print("\n" + "="*60)
+    print("MEDIUM-TERM WALK-FORWARD VALIDATION RESULTS")
+    print("="*60)
+    
+    for horizon, metrics in final_metrics.items():
+        horizon_hours = int(horizon.replace('min', '')) / 60
+        print(f"\nHorizon {horizon} ({horizon_hours:.1f}h) - {metrics.get('num_folds', 0)} folds:")
+        print(f"  Accuracy: {metrics.get('accuracy', 0):.2%} ± {metrics.get('accuracy_std', 0):.2%}")
+        print(f"  Precision: {metrics.get('precision', 0):.2%} ± {metrics.get('precision_std', 0):.2%}")
+        print(f"  Recall: {metrics.get('recall', 0):.2%} ± {metrics.get('recall_std', 0):.2%}")
+        print(f"  F1 Score: {metrics.get('f1_score', 0):.2%} ± {metrics.get('f1_std', 0):.2%}")
+        print(f"  ROC AUC: {metrics.get('roc_auc', 0):.2%} ± {metrics.get('roc_auc_std', 0):.2%}")
+    
+    # Save results
+    print(f"\n💾 Saving results to {results_dir}")
+    
+    # Save metrics JSON
+    metrics_path = results_dir / 'metrics_walkforward.json'
     with open(metrics_path, 'w') as f:
-        json.dump(all_metrics, f, indent=4)
-    print(f"Metrics saved to: {metrics_path}")
-
-    # Create and save plot
-    fig = plot_metrics(all_metrics)
-    plot_path = CONFIG['results_dir'] / 'lightgbm_medium_term_metrics.html'
-    fig.write_html(plot_path)
-    print(f"Metrics plot saved to: {plot_path}")
+        json.dump(final_metrics, f, indent=2)
+    
+    # Create and save plots
+    if final_metrics:
+        # Performance plot
+        metrics_fig = plot_metrics(final_metrics)
+        metrics_fig.update_layout(title="LightGBM Medium-Term Performance (Walk-Forward Validation)")
+        metrics_plot_path = results_dir / 'performance_metrics_walkforward.html'
+        metrics_fig.write_html(metrics_plot_path)
+        
+        print(f"  📊 Performance plot: {metrics_plot_path}")
+        print(f"  📋 Metrics JSON: {metrics_path}")
+    
+    print("\n✅ LightGBM medium-term walk-forward validation training complete!")
+    print(f"   More realistic metrics due to temporal validation")
+    print(f"   Results averaged across {len(global_splits)} walk-forward folds")
+    print(f"   Focused on longer horizons (2-24 hours) for extended predictions")
+    
+    return final_metrics
 
 
 if __name__ == "__main__":

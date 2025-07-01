@@ -17,12 +17,12 @@ import json
 from pathlib import Path
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).parent
+PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from data_analysis.data_quality import DataQualityAnalyzer
-from data_analysis.data_loader import DataLoader
-from data_cleaning.clean_tokens import clean_all_categories_with_investigation
+from ..data_analysis.data_quality import DataQualityAnalyzer
+from ..data_analysis.data_loader import DataLoader
+from ..data_cleaning.clean_tokens import clean_all_categories_with_investigation
 
 
 def main():

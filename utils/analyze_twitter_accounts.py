@@ -245,8 +245,8 @@ def main():
     
     # Define data directories
     data_dirs = [
-        Path("data/raw/dataset"),
-        Path("data/raw/dataset-fresh")
+        Path("../data/raw/dataset"),
+        Path("../data/raw/dataset-fresh")
     ]
     
     print("🐦 Twitter Account Analysis for Memecoin Dataset")

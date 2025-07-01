@@ -304,6 +304,7 @@ class AdvancedHybridLSTMForecasting(nn.Module):
     2. Expanding window with attention
     3. Cross-attention between scales
     4. Multi-horizon price prediction heads
+    5. Batch normalization for improved training
     """
     
     def __init__(self,
@@ -321,7 +322,7 @@ class AdvancedHybridLSTMForecasting(nn.Module):
         self.num_layers = num_layers
         self.forecast_horizons = forecast_horizons
         
-        # Multi-scale fixed window LSTMs
+        # Multi-scale fixed window LSTMs with batch norm
         self.fixed_lstms = nn.ModuleDict({
             str(window): nn.LSTM(
                 input_size=input_size,
@@ -332,7 +333,13 @@ class AdvancedHybridLSTMForecasting(nn.Module):
             ) for window in fixed_windows
         })
         
-        # Expanding window LSTM (larger capacity)
+        # Batch normalization for fixed window features
+        self.fixed_bns = nn.ModuleDict({
+            str(window): nn.BatchNorm1d(hidden_size // len(fixed_windows))
+            for window in fixed_windows
+        })
+        
+        # Expanding window LSTM (larger capacity) with batch norm
         self.expanding_lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -340,46 +347,53 @@ class AdvancedHybridLSTMForecasting(nn.Module):
             dropout=dropout if num_layers > 1 else 0,
             batch_first=True
         )
+        self.expanding_bn = nn.BatchNorm1d(hidden_size)
         
-        # Self-attention for expanding window
+        # Self-attention for expanding window with batch norm
         self.self_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
             num_heads=attention_heads,
             dropout=dropout,
             batch_first=True
         )
+        self.self_attention_bn = nn.BatchNorm1d(hidden_size)
         
-        # Cross-attention between fixed and expanding features
+        # Cross-attention between fixed and expanding features with batch norm
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
             num_heads=attention_heads,
             dropout=dropout,
             batch_first=True
         )
+        self.cross_attention_bn = nn.BatchNorm1d(hidden_size)
         
-        # Feature fusion layer
+        # Feature fusion layer with batch norm
         self.fusion_layer = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # Final feature extraction
+        # Final feature extraction with batch norm
         self.feature_extractor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, hidden_size // 2),
+            nn.BatchNorm1d(hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # Multi-horizon prediction heads (regression)
+        # Multi-horizon prediction heads (regression) with batch norm
         self.horizon_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_size // 2, hidden_size // 4),
+                nn.BatchNorm1d(hidden_size // 4),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_size // 4, 1)
@@ -389,13 +403,15 @@ class AdvancedHybridLSTMForecasting(nn.Module):
     def forward(self, fixed_sequences, expanding_sequence, expanding_lengths):
         batch_size = expanding_sequence.shape[0]
         
-        # Process fixed window sequences
+        # Process fixed window sequences with batch norm
         fixed_features = []
         for window in self.fixed_windows:
             seq = fixed_sequences[window]
             lstm_out, (h_n, _) = self.fixed_lstms[str(window)](seq)
-            # Use last hidden state
-            fixed_features.append(h_n[-1])
+            # Use last hidden state and apply batch norm
+            h_n_last = h_n[-1]
+            h_n_norm = self.fixed_bns[str(window)](h_n_last)
+            fixed_features.append(h_n_norm)
         
         # Concatenate fixed features
         fixed_combined = torch.cat(fixed_features, dim=-1)
@@ -428,9 +444,12 @@ class AdvancedHybridLSTMForecasting(nn.Module):
             expanding_final.append(attended_exp[i, length-1])
         expanding_final = torch.stack(expanding_final)
         
+        # Apply batch norm to self-attention output
+        expanding_final = self.self_attention_bn(expanding_final)
+        
         # Cross-attention: expanding queries, fixed keys/values
         fixed_expanded = fixed_combined.unsqueeze(1)  # (batch, 1, hidden)
-        expanding_query = expanding_final.unsqueeze(1)  # (batch, 1, hidden)
+        expanding_query = expanding_final.unsqueeze(1)
         
         cross_attended, _ = self.cross_attention(
             expanding_query,
@@ -438,6 +457,9 @@ class AdvancedHybridLSTMForecasting(nn.Module):
             fixed_expanded
         )
         cross_attended = cross_attended.squeeze(1)
+        
+        # Apply batch norm to cross-attention output
+        cross_attended = self.cross_attention_bn(cross_attended)
         
         # Fusion of all features
         fused_features = self.fusion_layer(
@@ -678,11 +700,12 @@ def evaluate_forecasting_model(model, test_loader, price_scaler, horizons, devic
 
 # --- Main Training Pipeline ---
 def main():
-    """Main training pipeline for advanced hybrid LSTM forecasting"""
+    """Main training pipeline for advanced hybrid LSTM forecasting with walk-forward validation"""
     
     print("="*60)
     print("🚀 Advanced Hybrid LSTM Forecasting Training")
-    print("Features: Multi-scale extraction, Attention, Price prediction")
+    print("Features: Multi-scale extraction, Attention, Hybrid windows")
+    print("WITH WALK-FORWARD VALIDATION")
     print("="*60)
     
     # Create results directory
@@ -703,10 +726,109 @@ def main():
     
     print(f"\nTotal files: {len(all_paths)}")
     
-    # Smart data split
-    from ML.forecasting_models.train_lstm_model import smart_data_split
-    train_paths, val_paths, test_paths = smart_data_split(all_paths)
+    # Import walk-forward splitter
+    from ML.utils.walk_forward_splitter import WalkForwardSplitter
     
+    print("\n🔄 Using Walk-Forward Validation for Advanced Hybrid LSTM Forecasting")
+    
+    # Load all data first to prepare for walk-forward splitting
+    print("\n📊 Loading all feature data for walk-forward validation...")
+    
+    all_data_frames = []
+    for path in tqdm(all_paths, desc="Loading feature files"):
+        try:
+            df = pl.read_parquet(path)
+            if len(df) < 400:  # Minimum token length
+                continue
+            
+            # Add token identifier
+            df = df.with_columns(pl.lit(path.stem).alias('token_id'))
+            all_data_frames.append(df)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
+    
+    if not all_data_frames:
+        print("ERROR: No valid feature files found!")
+        return
+    
+    # Combine all data
+    combined_data = pl.concat(all_data_frames)
+    print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
+    
+    # Setup walk-forward splitter
+    splitter = WalkForwardSplitter(config='medium')  # Good for 400-2000 minute tokens
+    
+    # For LSTM forecasting, use per-token splits (better for sequence learning)
+    print("\n🔀 Creating per-token walk-forward splits...")
+    token_splits = splitter.split_by_token(
+        combined_data, 
+        token_column='token_id',
+        time_column='datetime',
+        min_token_length=400
+    )
+    
+    print(f"Created walk-forward splits for {len(token_splits)} tokens")
+    
+    # Collect all folds for training
+    all_train_data = []
+    all_val_data = []  
+    all_test_data = []
+    
+    # Use first N-1 folds for training/validation, last fold for testing
+    for token_id, folds in token_splits.items():
+        if len(folds) < 2:
+            continue  # Need at least 2 folds
+            
+        # Use last fold as test, split remaining into train/val
+        *train_val_folds, test_fold = folds
+        test_train_df, test_test_df = test_fold
+        all_test_data.append(test_test_df)
+        
+        # Split train_val_folds into train and validation
+        n_train_folds = max(1, int(len(train_val_folds) * 0.8))
+        
+        for i, (fold_train_df, fold_test_df) in enumerate(train_val_folds):
+            if i < n_train_folds:
+                all_train_data.append(fold_test_df)  # Use 'test' part of fold for training
+            else:
+                all_val_data.append(fold_test_df)    # Use for validation
+    
+    print(f"\n📈 Walk-forward data split:")
+    print(f"  Train folds: {len(all_train_data)} DataFrames")
+    print(f"  Val folds: {len(all_val_data)} DataFrames")  
+    print(f"  Test folds: {len(all_test_data)} DataFrames")
+    
+    # Create datasets from walk-forward splits
+    print("\nCreating datasets with walk-forward splits...")
+    
+    # Convert DataFrames back to paths for compatibility with existing dataset code
+    # Save temporary files for each split
+    temp_dir = CONFIG['results_dir'] / 'temp_splits'
+    temp_dir.mkdir(exist_ok=True)
+    
+    train_paths = []
+    val_paths = []
+    test_paths = []
+    
+    # Save train splits
+    for i, df in enumerate(all_train_data):
+        temp_path = temp_dir / f'train_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        train_paths.append(temp_path)
+    
+    # Save val splits
+    for i, df in enumerate(all_val_data):
+        temp_path = temp_dir / f'val_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        val_paths.append(temp_path)
+        
+    # Save test splits
+    for i, df in enumerate(all_test_data):
+        temp_path = temp_dir / f'test_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        test_paths.append(temp_path)
+
     # Create datasets
     print("\nCreating advanced hybrid forecasting datasets...")
     train_dataset = AdvancedHybridForecastingDataset(
@@ -733,7 +855,7 @@ def main():
         CONFIG['forecast_horizons']
     )
     
-    print(f"\nDataset sizes:")
+    print(f"\nDataset sizes (walk-forward):")
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Val: {len(val_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
@@ -784,45 +906,46 @@ def main():
     )
     
     # Train model
-    model, training_history = train_forecasting_model(
+    model, training_history, price_scaler = train_forecasting_model(
         model, train_loader, val_loader, CONFIG
     )
     
     # Evaluate on test set
-    print("\nEvaluating on test set...")
+    print("\nEvaluating on test set (walk-forward)...")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if torch.backends.mps.is_available():
         device = 'mps'
     model = model.to(device)
     
     metrics = evaluate_forecasting_model(
-        model, test_loader, train_dataset.global_price_scaler, 
-        CONFIG['forecast_horizons'], device
+        model, test_loader, price_scaler, CONFIG['forecast_horizons'], device
     )
     
     # Print results
     print("\n" + "="*60)
-    print("TEST SET RESULTS")
+    print("FORECASTING RESULTS (Walk-Forward Validation)")
     print("="*60)
     
     for horizon, m in metrics.items():
         print(f"\nHorizon {horizon}:")
-        print(f"  MSE: {m['mse']:.4f}")
-        print(f"  MAE: {m['mae']:.4f}")
-        print(f"  R²: {m['r2']:.4f}")
-        print(f"  Direction Accuracy: {m['direction_accuracy']:.2%}")
-        print(f"  Mean Price Error: {m['mean_price_error_pct']:.1f}%")
+        print(f"  RMSE: {m.get('rmse', 0):.6f}")
+        print(f"  MAE: {m.get('mae', 0):.6f}")
+        print(f"  MAPE: {m.get('mape', 0):.2f}%")
+        print(f"  R²: {m.get('r2', 0):.4f}")
+        if 'directional_accuracy' in m:
+            print(f"  Directional Accuracy: {m['directional_accuracy']:.2%}")
     
     # Save model and results
-    model_path = CONFIG['results_dir'] / 'advanced_hybrid_lstm_forecasting_model.pth'
+    model_path = CONFIG['results_dir'] / 'advanced_hybrid_lstm_forecasting_walkforward.pth'
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': CONFIG,
+        'price_scaler': price_scaler,
         'token_winsorizers': train_dataset.token_winsorizers,
-        'global_price_scaler': train_dataset.global_price_scaler,
         'metrics': metrics,
         'input_size': input_size,
-        'training_history': training_history
+        'training_history': training_history,
+        'validation_method': 'walk_forward'
     }, model_path)
     
     print(f"\nModel saved to: {model_path}")
@@ -832,22 +955,24 @@ def main():
     training_fig = plot_training_curves(
         training_history['train_losses'],
         training_history['val_losses'],
-        title="Advanced Hybrid LSTM Forecasting Training Progress"
+        title="Advanced Hybrid LSTM Forecasting Progress (Walk-Forward)"
     )
-    training_path = CONFIG['results_dir'] / 'training_curves.html'
+    training_path = CONFIG['results_dir'] / 'training_curves_walkforward.html'
     training_fig.write_html(training_path)
     
     # 2. Save metrics JSON
-    metrics_json_path = CONFIG['results_dir'] / 'metrics.json'
+    metrics_json_path = CONFIG['results_dir'] / 'forecasting_metrics_walkforward.json'
     with open(metrics_json_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     
-    # Clean up
-    if os.path.exists('best_forecasting_model.pth'):
-        os.remove('best_forecasting_model.pth')
+    # Clean up temporary files
+    import shutil
+    shutil.rmtree(temp_dir)
+    print("Cleaned up temporary split files")
     
     print(f"\nResults saved to: {CONFIG['results_dir']}")
-    print("\n✅ Advanced Hybrid LSTM Forecasting training complete!")
+    print("\n✅ Advanced Hybrid LSTM forecasting training complete with walk-forward validation!")
+    print(f"   More realistic forecasting metrics due to temporal validation")
     
     return model, metrics
 

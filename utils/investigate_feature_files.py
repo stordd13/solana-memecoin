@@ -2,7 +2,7 @@ import polars as pl
 from pathlib import Path
 from tqdm import tqdm
 
-FEATURE_DIR = Path('data/features')
+FEATURE_DIR = Path('../data/features')
 CATEGORIES = [
     'normal_behavior_tokens',
     'tokens_with_extremes',
