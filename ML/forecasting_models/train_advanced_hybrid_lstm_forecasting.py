@@ -756,19 +756,31 @@ def main():
     combined_data = pl.concat(all_data_frames)
     print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
     
-    # Setup walk-forward splitter
-    splitter = WalkForwardSplitter(config='medium')  # Good for 400-2000 minute tokens
+    # Setup smart memecoin-aware walk-forward splitter
+    splitter = WalkForwardSplitter()  # Auto-adapts to data length
     
-    # For LSTM forecasting, use per-token splits (better for sequence learning)
-    print("\n🔀 Creating per-token walk-forward splits...")
-    token_splits = splitter.split_by_token(
+    # Use smart splits that adapt to memecoin data characteristics
+    print("\n🔀 Creating smart memecoin-aware walk-forward splits...")
+    global_splits, feasible_horizons = splitter.smart_split_for_memecoins(
         combined_data, 
-        token_column='token_id',
-        time_column='datetime',
-        min_token_length=400
+        horizons=CONFIG['forecast_horizons'],
+        time_column='datetime'
     )
     
-    print(f"Created walk-forward splits for {len(token_splits)} tokens")
+    print(f"Created {len(global_splits)} walk-forward folds")
+    print(f"Original horizons: {CONFIG['forecast_horizons']}")
+    print(f"Feasible horizons: {feasible_horizons}")
+    
+    if len(feasible_horizons) < len(CONFIG['forecast_horizons']):
+        skipped = [h for h in CONFIG['forecast_horizons'] if h not in feasible_horizons]
+        print(f"⚠️  Skipped horizons (too long for data): {skipped}")
+    
+    if not global_splits or not feasible_horizons:
+        print("❌ No valid folds or feasible horizons!")
+        return
+    
+    # Update config to use only feasible horizons
+    CONFIG['forecast_horizons'] = feasible_horizons
     
     # Collect all folds for training
     all_train_data = []
@@ -776,23 +788,23 @@ def main():
     all_test_data = []
     
     # Use first N-1 folds for training/validation, last fold for testing
-    for token_id, folds in token_splits.items():
-        if len(folds) < 2:
-            continue  # Need at least 2 folds
-            
-        # Use last fold as test, split remaining into train/val
-        *train_val_folds, test_fold = folds
-        test_train_df, test_test_df = test_fold
-        all_test_data.append(test_test_df)
+    if len(global_splits) < 2:
+        print("❌ Need at least 2 global folds for training!")
+        return
         
-        # Split train_val_folds into train and validation
-        n_train_folds = max(1, int(len(train_val_folds) * 0.8))
-        
-        for i, (fold_train_df, fold_test_df) in enumerate(train_val_folds):
-            if i < n_train_folds:
-                all_train_data.append(fold_test_df)  # Use 'test' part of fold for training
-            else:
-                all_val_data.append(fold_test_df)    # Use for validation
+    # Use last fold as test, split remaining into train/val
+    *train_val_folds, test_fold = global_splits
+    test_train_df, test_test_df = test_fold
+    all_test_data.append(test_test_df)
+    
+    # Split train_val_folds into train and validation (80/20)
+    n_train_folds = max(1, int(len(train_val_folds) * 0.8))
+    
+    for i, (fold_train_df, fold_test_df) in enumerate(train_val_folds):
+        if i < n_train_folds:
+            all_train_data.append(fold_test_df)  # Use 'test' part of fold for training
+        else:
+            all_val_data.append(fold_test_df)    # Use for validation
     
     print(f"\n📈 Walk-forward data split:")
     print(f"  Train folds: {len(all_train_data)} DataFrames")

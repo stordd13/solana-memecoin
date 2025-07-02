@@ -532,7 +532,10 @@ def main():
     print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
     
     # Setup walk-forward splitter
-    splitter = WalkForwardSplitter(config='medium')  # Good for 400-2000 minute tokens
+    splitter = WalkForwardSplitter(
+        config='medium',  # Good for 400-2000 minute tokens
+        horizon_buffer=720  # 12 hours buffer for longest horizon
+    )
     
     # Split by token (per-token walk-forward)
     print("\n🔀 Creating per-token walk-forward splits...")

@@ -193,7 +193,7 @@ class DataQualityAnalyzer:
             price_stats = pa._calculate_price_stats(df)
             volatility_metrics = pa._calculate_volatility_metrics(df)
             total_return = price_stats['total_return']
-            price_range = (price_stats['max_price'] - price_stats['min_price']) / price_stats['min_price'] if price_stats['min_price'] else 0
+            price_range = (price_stats['max_price'] - price_stats['min_price']) / price_stats['min_price'] if price_stats.get('min_price') and price_stats['min_price'] > 0 else 0
             avg_volatility = volatility_metrics['avg_volatility']
             # Extreme if > 100x (10,000%)
             has_extreme_volatility = avg_volatility > 100

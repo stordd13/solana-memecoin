@@ -42,6 +42,26 @@ def financial_classification_metrics(y_true, y_pred, returns, y_prob=None):
     y_pred = np.array(y_pred)
     returns = np.array(returns)
     
+    # ADDED: Winsorize returns to handle extreme memecoin gains/losses
+    # Cap at 0.5% and 99.5% percentiles to remove outliers
+    if len(returns) > 0:
+        lower_bound = np.percentile(returns, 0.5)
+        upper_bound = np.percentile(returns, 99.5)
+        returns_winsorized = np.clip(returns, lower_bound, upper_bound)
+        
+        # Store both for comparison
+        metrics['returns_winsorized_applied'] = True
+        metrics['returns_raw_min'] = float(np.min(returns))
+        metrics['returns_raw_max'] = float(np.max(returns))
+        metrics['returns_winsorized_min'] = float(np.min(returns_winsorized))
+        metrics['returns_winsorized_max'] = float(np.max(returns_winsorized))
+    else:
+        returns_winsorized = returns
+        metrics['returns_winsorized_applied'] = False
+    
+    # Use winsorized returns for financial calculations
+    returns = returns_winsorized
+    
     # Financial-weighted metrics
     try:
         # Calculate return-weighted recall

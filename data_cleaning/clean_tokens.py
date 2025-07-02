@@ -28,8 +28,9 @@ CATEGORIES = {
 
 class CategoryAwareTokenCleaner:
     """
-    Advanced token cleaner that applies different strategies based on token category
-    and distinguishes between data artifacts and legitimate market movements
+    Advanced token cleaner that applies universal data quality checks to all tokens,
+    then category-specific refinements. This ensures consistent data quality across
+    all categories while preserving legitimate market movements.
     """
     
     def __init__(self):
@@ -87,9 +88,33 @@ class CategoryAwareTokenCleaner:
                 log['status'] = 'invalid_data_structure'
                 return log
             
+            # Initialize modifications list
+            modifications = []
+            
+            # Calculate returns if not present
+            if 'returns' not in df.columns:
+                df = self._calculate_returns(df)
+                modifications.append({
+                    'type': 'returns_calculated',
+                    'description': 'Calculated returns from price data'
+                })
+            
+            # UNIVERSAL DATA QUALITY CHECKS (apply to ALL tokens regardless of category)
+            df, universal_mods = self._universal_data_quality_checks(df, token_name)
+            if universal_mods:
+                modifications.extend(universal_mods)
+            
+            # If token was deemed completely invalid by universal checks, exclude it
+            if df is None:
+                log['status'] = 'excluded_by_universal_quality_checks'
+                log['modifications'] = modifications
+                return log
+            
             # Apply category-specific cleaning strategy
             strategy = CATEGORIES.get(category, 'gentle')
-            df_cleaned, modifications = self.cleaning_strategies[strategy](df, token_name)
+            df_cleaned, category_modifications = self.cleaning_strategies[strategy](df, token_name)
+            if category_modifications:
+                modifications.extend(category_modifications)
             
             if df_cleaned is None:
                 log['status'] = 'excluded_due_to_severe_issues'
@@ -101,7 +126,9 @@ class CategoryAwareTokenCleaner:
             output_dir.mkdir(exist_ok=True)
             output_path = output_dir / f"{token_name}.parquet"
             
-            df_cleaned.write_parquet(output_path)
+            df_cleaned.write_parquet(output_path, 
+                                     compression="zstd", 
+                                     compression_level=3)
             
             log.update({
                 'final_rows': df_cleaned.height,
@@ -121,6 +148,26 @@ class CategoryAwareTokenCleaner:
                 'status': 'error',
                 'error': str(e)
             }
+
+    def _calculate_returns(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Calculate returns from price data.
+        Returns = (price_t - price_t-1) / price_t-1
+        """
+        # Sort by datetime to ensure proper order
+        df = df.sort('datetime')
+        
+        # Calculate returns using polars expression
+        df = df.with_columns([
+            (pl.col('price').pct_change()).alias('returns')
+        ])
+        
+        # Replace the first NaN with 0 (no return for first observation)
+        df = df.with_columns([
+            pl.col('returns').fill_null(0.0)
+        ])
+        
+        return df
 
     def _validate_data_structure(self, df: pl.DataFrame) -> bool:
         """Validate that the dataframe has required columns and structure"""
@@ -254,15 +301,274 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
+    def _universal_data_quality_checks(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Universal data quality checks that apply to ALL tokens regardless of category.
+        These catch fundamental data corruption issues that affect model training.
+        
+        Checks:
+        1. Remove constant death periods (ALL categories need this)
+        2. Detect and remove staircase artifacts (vertical + horizontal patterns)
+        3. Remove tokens with extreme price ratios (>50,000x likely data errors)
+        4. Handle NaN values and infinite prices
+        5. Remove tokens that are too short after cleaning
+        """
+        modifications = []
+        original_length = df.height
+        
+        if original_length < 60:  # Less than 1 hour of data
+            return None, [{'type': 'excluded_too_short', 'original_length': original_length}]
+        
+        # 1. Remove NaN and infinite values FIRST
+        df, nan_mods = self._handle_nan_and_infinite_values(df)
+        if nan_mods:
+            modifications.extend(nan_mods)
+        
+        if df is None or df.height < 30:
+            return None, modifications + [{'type': 'excluded_too_many_invalid_values'}]
+        
+        # 2. UNIVERSAL: Remove death periods (applies to ALL categories!)
+        df, death_mods = self._remove_death_period(df, token_name)
+        if death_mods:
+            modifications.extend(death_mods)
+        
+        if df.height < 30:
+            return None, modifications + [{'type': 'excluded_mostly_death_period'}]
+        
+        # 3. Check for extreme price ratios (likely data corruption)
+        prices = df['price'].to_numpy()
+        if len(prices) > 0:
+            finite_prices = prices[np.isfinite(prices)]
+            if len(finite_prices) > 0:
+                min_price = np.min(finite_prices)
+                max_price = np.max(finite_prices)
+                if min_price > 0:
+                    price_ratio = max_price / min_price
+                    if price_ratio > 1000:  # >1,000x price ratio is unrealistic
+                        return None, modifications + [{
+                            'type': 'excluded_extreme_price_ratio',
+                            'price_ratio': price_ratio,
+                            'min_price': min_price,
+                            'max_price': max_price
+                        }]
+        
+        # 4. Detect and remove staircase artifacts
+        df, staircase_mods = self._detect_and_remove_staircase_artifacts(df, token_name)
+        if staircase_mods:
+            modifications.extend(staircase_mods)
+        
+        if df is None or df.height < 30:
+            return None, modifications + [{'type': 'excluded_staircase_artifact'}]
+        
+        # 5. Additional check for extreme returns in remaining data
+        if df.height > 0:
+            returns = df['returns'].to_numpy()
+            finite_returns = returns[np.isfinite(returns)]
+            if len(finite_returns) > 0:
+                max_abs_return = np.max(np.abs(finite_returns))
+                if max_abs_return > 1000:  # >100,000% return is unrealistic
+                    return None, modifications + [{
+                        'type': 'excluded_extreme_returns',
+                        'max_return': max_abs_return
+                    }]
+
+        # 6. Check price variability to filter "straight line" tokens
+        df, variability_mods = self._check_price_variability(df, token_name)
+        if variability_mods:
+            modifications.extend(variability_mods)
+        
+        if df is None:
+            return None, modifications + [{'type': 'excluded_low_variability'}]
+
+        # 7. Final length check
+        if df.height < 60:  # After all cleaning, ensure minimum viable length
+            return None, modifications + [{'type': 'excluded_too_short_after_cleaning', 'final_length': df.height}]
+        
+        if len(modifications) > 0:
+            print(f"🧹 UNIVERSAL: {token_name} - Applied {len(modifications)} universal quality fixes")
+        
+        return df, modifications
+
+    def _handle_nan_and_infinite_values(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """Handle NaN and infinite values in price data"""
+        modifications = []
+        original_length = df.height
+        
+        # Remove rows with NaN or infinite prices
+        df_clean = df.filter(pl.col('price').is_finite())
+        
+        removed_count = original_length - df_clean.height
+        if removed_count > 0:
+            modifications.append({
+                'type': 'nan_infinite_values_removed',
+                'count': removed_count,
+                'percentage': (removed_count / original_length) * 100
+            })
+        
+        # If more than 50% of data was NaN/infinite, reject the token
+        if removed_count > (original_length * 0.5):
+            return None, modifications
+        
+        return df_clean, modifications
+
+    def _check_price_variability(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Analyze price variability to identify and filter "straight line" tokens.
+        Uses multiple metrics to distinguish real market variations from artificial patterns.
+        """
+        modifications = []
+        prices = df['price'].to_numpy()
+        
+        if len(prices) < 30:
+            return df, modifications
+        
+        # Convert to log prices to better analyze relative movements
+        log_prices = np.log(prices + 1e-10)  # Add small epsilon to avoid log(0)
+        
+        # 1. Coefficient of Variation (CV) - measures relative variability
+        price_cv = np.std(prices) / np.mean(prices) if np.mean(prices) > 0 else 0
+        log_price_cv = np.std(log_prices) / np.abs(np.mean(log_prices)) if np.mean(log_prices) != 0 else 0
+        
+        # 2. Rolling variability - detect periods of constant price
+        window_size = min(60, len(prices) // 4)  # 1-hour windows or 25% of data
+        rolling_std = []
+        
+        for i in range(0, len(prices) - window_size + 1, window_size // 2):
+            window_prices = prices[i:i + window_size]
+            rolling_std.append(np.std(window_prices) / np.mean(window_prices) if np.mean(window_prices) > 0 else 0)
+        
+        # 3. Fraction of time spent in "flat" periods
+        flat_threshold = 0.001  # 0.1% price change considered flat
+        returns = np.abs(np.diff(prices) / prices[:-1])
+        flat_periods = np.sum(returns < flat_threshold) / len(returns) if len(returns) > 0 else 1.0
+        
+        # 4. Price range efficiency - how much of the total range is covered by meaningful moves
+        price_range = np.max(prices) - np.min(prices)
+        meaningful_moves = np.sum(np.abs(np.diff(prices)) > np.mean(prices) * 0.01)  # >1% moves
+        range_efficiency = meaningful_moves / len(prices) if len(prices) > 0 else 0
+        
+        # 5. Entropy-based measure - information content in price movements
+        # Discretize returns into bins and calculate entropy
+        if len(returns) > 10:
+            bins = min(10, len(returns) // 5)
+            hist, _ = np.histogram(returns, bins=bins)
+            hist = hist[hist > 0]  # Remove empty bins
+            if len(hist) > 1:
+                prob = hist / np.sum(hist)
+                entropy = -np.sum(prob * np.log2(prob))
+                max_entropy = np.log2(len(hist))
+                normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+            else:
+                normalized_entropy = 0
+        else:
+            normalized_entropy = 0
+        
+        # Define thresholds for "straight line" detection
+        is_low_variability = (
+            price_cv < 0.05 and              # Very low relative price variation
+            log_price_cv < 0.1 and           # Very low log price variation  
+            flat_periods > 0.8 and           # >80% of time spent flat
+            range_efficiency < 0.1 and       # <10% meaningful moves
+            normalized_entropy < 0.3          # Low information content
+        )
+        
+        # Log the analysis for monitoring
+        variability_metrics = {
+            'price_cv': price_cv,
+            'log_price_cv': log_price_cv,
+            'flat_periods_fraction': flat_periods,
+            'range_efficiency': range_efficiency,
+            'normalized_entropy': normalized_entropy,
+            'is_low_variability': is_low_variability
+        }
+        
+        if is_low_variability:
+            print(f"📏 LOW_VAR: {token_name} - CV:{price_cv:.4f}, Flat:{flat_periods:.2f}, Entropy:{normalized_entropy:.3f}")
+            return None, modifications + [{
+                'type': 'excluded_low_variability',
+                'metrics': variability_metrics,
+                'reason': 'Token shows minimal price variation (straight line pattern)'
+            }]
+        else:
+            # Token has acceptable variability
+            modifications.append({
+                'type': 'variability_analysis_passed',
+                'metrics': variability_metrics
+            })
+        
+        return df, modifications
+
+    def _detect_and_remove_staircase_artifacts(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Detect and remove staircase artifacts: sudden vertical jump followed by flat horizontal line.
+        These are usually data errors, not real market movements.
+        """
+        modifications = []
+        prices = df['price'].to_numpy()
+        
+        if len(prices) < 20:
+            return df, modifications
+        
+        # Calculate returns
+        returns = np.diff(prices) / prices[:-1]
+        
+        # Find extreme jumps (>1000% in one minute) 
+        extreme_jump_indices = np.where(np.abs(returns) > 10.0)[0]
+        
+        artifacts_found = 0
+        removal_ranges = []
+        
+        for jump_idx in extreme_jump_indices:
+            if jump_idx < len(prices) - 10:  # Need at least 10 points after jump
+                # Check if price stays very flat after the jump
+                post_jump_start = jump_idx + 1
+                post_jump_end = min(jump_idx + 31, len(prices))  # Check next 30 minutes
+                post_jump_prices = prices[post_jump_start:post_jump_end]
+                
+                if len(post_jump_prices) > 5:
+                    # Calculate coefficient of variation
+                    cv = np.std(post_jump_prices) / np.mean(post_jump_prices) if np.mean(post_jump_prices) > 0 else 1
+                    
+                    # If variation is extremely low after extreme jump = staircase artifact
+                    if cv < 0.005:  # Less than 0.5% variation
+                        artifacts_found += 1
+                        # Mark this range for removal (from jump onwards)
+                        removal_ranges.append((post_jump_start, len(prices)))
+                        print(f"🪜 STAIRCASE: {token_name} - Found staircase artifact at minute {jump_idx} (CV: {cv:.6f})")
+        
+        if artifacts_found > 0:
+            # Remove the staircase artifacts (keep data up to first artifact)
+            earliest_artifact = min([r[0] for r in removal_ranges])
+            df_clean = df.head(earliest_artifact)
+            
+            modifications.append({
+                'type': 'staircase_artifacts_removed',
+                'count': artifacts_found,
+                'original_length': len(prices),
+                'final_length': df_clean.height,
+                'removed_minutes': len(prices) - df_clean.height
+            })
+            
+            return df_clean, modifications
+        
+        return df, modifications
+
     def _preserve_extremes_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         Preserve extremes cleaning for tokens with extreme movements
         - Keep ALL legitimate extreme movements (this is their defining characteristic!)
         - Only remove obvious data corruption
         - Be very conservative about what constitutes an "error"
+        - BUT still remove constant death periods to prevent data leakage
         """
         modifications = []
         df = df.clone()
+        
+        # CRITICAL: Remove constant price periods at the end (even for extreme tokens!)
+        # This prevents data leakage in ML models
+        df, death_mods = self._remove_death_period(df, token_name)
+        if death_mods:
+            modifications.extend(death_mods)
         
         # Only remove the most obvious data corruption (not extreme movements!)
         # 1. Remove only impossible values (negative prices, exact zeros from data errors)
@@ -410,11 +716,15 @@ class CategoryAwareTokenCleaner:
 
     def _fix_extreme_data_corruption(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Fix only extreme data corruption (>1,000,000% moves)
+        Improved corruption detection that distinguishes between:
+        1. Legitimate massive gains over several minutes (KEEP)
+        2. Instant staircase artifacts: extreme jump + flat period (REMOVE)
+        
+        This preserves real 1,000,000%+ pumps while removing obvious data errors.
         """
         modifications = []
         
-        if df.height < 2:
+        if df.height < 10:  # Need at least 10 points for pattern analysis
             return df, modifications
         
         # Calculate returns if not present
@@ -423,30 +733,90 @@ class CategoryAwareTokenCleaner:
                 pl.col('price').pct_change().alias('returns')
             ])
         
-        # Only fix absolutely extreme corruption (>1,000,000%)
-        corruption_threshold = 10000  # 1,000,000%
-        extreme_corruption = df.filter(pl.col('returns').abs() > corruption_threshold)
+        # Convert to numpy for analysis
+        prices = df['price'].to_numpy()
+        returns = df['returns'].to_numpy()
         
-        if extreme_corruption.height > 0:
-            # Remove these corrupted points
-            corruption_indices = extreme_corruption.with_row_count()['row_nr'].to_list()
+        # Find extreme single-minute moves (>1000% in one minute)
+        extreme_threshold = 10.0  # 1000%
+        extreme_indices = np.where(np.abs(returns) > extreme_threshold)[0]
+        
+        staircase_artifacts = []
+        legitimate_pumps = []
+        
+        for idx in extreme_indices:
+            if idx < len(returns) - 10:  # Need 10 minutes after for pattern analysis
+                
+                # Analyze the 10 minutes following the extreme move
+                post_move_returns = returns[idx+1:idx+11]
+                post_move_prices = prices[idx+1:idx+11]
+                
+                # Calculate post-move volatility metrics
+                post_move_abs_returns = np.abs(post_move_returns[np.isfinite(post_move_returns)])
+                
+                if len(post_move_abs_returns) > 0:
+                    avg_post_volatility = np.mean(post_move_abs_returns)
+                    max_post_volatility = np.max(post_move_abs_returns)
+                    cv_post_prices = np.std(post_move_prices) / np.mean(post_move_prices) if np.mean(post_move_prices) > 0 else 0
+                    
+                    # STAIRCASE CRITERIA: Extreme jump followed by very low volatility
+                    is_staircase = (
+                        avg_post_volatility < 0.005 and  # <0.5% average volatility after extreme move
+                        cv_post_prices < 0.01 and        # <1% coefficient of variation
+                        max_post_volatility < 0.02       # <2% max volatility in 10 minutes
+                    )
+                    
+                    if is_staircase:
+                        staircase_artifacts.append({
+                            'idx': idx,
+                            'return': returns[idx],
+                            'post_volatility': avg_post_volatility,
+                            'cv': cv_post_prices
+                        })
+                        print(f"🪜 STAIRCASE DETECTED: Minute {idx}, {returns[idx]*100:.1f}% return, "
+                              f"then avg volatility {avg_post_volatility*100:.2f}%")
+                    else:
+                        legitimate_pumps.append({
+                            'idx': idx,
+                            'return': returns[idx],
+                            'post_volatility': avg_post_volatility
+                        })
+                        print(f"🚀 LEGITIMATE PUMP: Minute {idx}, {returns[idx]*100:.1f}% return, "
+                              f"continued volatility {avg_post_volatility*100:.2f}%")
+        
+        # Remove only staircase artifacts
+        if staircase_artifacts:
+            artifact_indices = [a['idx'] for a in staircase_artifacts]
             
-            df = df.with_row_count().with_columns([
-                pl.when(pl.col('row_nr').is_in(corruption_indices))
-                .then(None)
-                .otherwise(pl.col('price'))
-                .alias('price_clean')
-            ])
-            
-            df = df.with_columns([
-                pl.col('price_clean').interpolate().alias('price')
-            ]).drop(['price_clean', 'row_nr'])
+            # Remove staircase artifacts and everything after them
+            # (since the flat period is usually where the token "dies")
+            earliest_artifact = min(artifact_indices)
+            df_clean = df.head(earliest_artifact)
             
             modifications.append({
-                'type': 'extreme_data_corruption_fixed',
-                'count': len(corruption_indices),
-                'threshold_used': corruption_threshold
+                'type': 'staircase_artifacts_removed',
+                'count': len(staircase_artifacts),
+                'legitimate_pumps_preserved': len(legitimate_pumps),
+                'artifacts_data': staircase_artifacts,
+                'original_length': len(prices),
+                'final_length': df_clean.height,
+                'method': 'temporal_pattern_analysis'
             })
+            
+            print(f"📊 CORRUPTION ANALYSIS: Removed {len(staircase_artifacts)} staircase artifacts, "
+                  f"preserved {len(legitimate_pumps)} legitimate pumps")
+            
+            return df_clean, modifications
+        
+        # No staircase artifacts found, keep all data including legitimate extreme moves
+        if legitimate_pumps:
+            modifications.append({
+                'type': 'extreme_moves_analysis',
+                'legitimate_pumps_preserved': len(legitimate_pumps),
+                'staircase_artifacts_found': 0,
+                'method': 'temporal_pattern_analysis'
+            })
+            print(f"✅ PRESERVED: {len(legitimate_pumps)} legitimate extreme pumps (no staircase artifacts)")
         
         return df, modifications
 

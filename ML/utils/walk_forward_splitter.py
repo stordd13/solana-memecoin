@@ -67,13 +67,44 @@ class WalkForwardSplitter:
             step_size=240,       # 4 hour step
             test_size=240,       # 4 hour test
             strategy='expanding'
+        ),
+        'memecoin_micro': WalkForwardConfig(
+            min_train_size=60,   # 1 hour - minimal but workable
+            step_size=30,        # 30 minute step
+            test_size=30,        # 30 minute test
+            strategy='expanding'
+        ),
+        'memecoin_short': WalkForwardConfig(
+            min_train_size=120,  # 2 hours - good balance
+            step_size=30,        # 30 minute step
+            test_size=30,        # 30 minute test
+            strategy='expanding'
+        ),
+        'memecoin_medium': WalkForwardConfig(
+            min_train_size=180,  # 3 hours - conservative but reasonable
+            step_size=60,        # 1 hour step
+            test_size=60,        # 1 hour test
+            strategy='expanding'
+        ),
+        'lightgbm_short_term': WalkForwardConfig(
+            min_train_size=120,  # REDUCED from 360 to 120 (2 hours)
+            step_size=60,        # 1 hour step
+            test_size=60,        # 1 hour test
+            strategy='expanding'
+        ),
+        'lightgbm_medium_term': WalkForwardConfig(
+            min_train_size=240,  # REDUCED from 720 to 240 (4 hours)
+            step_size=120,       # 2 hour step
+            test_size=120,       # 2 hour test
+            strategy='expanding'
         )
     }
     
     def __init__(self, 
                  config: Optional[Union[str, WalkForwardConfig]] = None,
                  min_folds: int = 2,
-                 max_folds: int = 10):
+                 max_folds: int = 10,
+                 horizon_buffer: int = 0):
         """
         Initialize the splitter.
         
@@ -82,6 +113,7 @@ class WalkForwardSplitter:
                    or a custom WalkForwardConfig
             min_folds: Minimum number of folds to generate
             max_folds: Maximum number of folds to generate
+            horizon_buffer: Buffer to leave at the end for creating labels (e.g., 720 for 12h horizon)
         """
         if isinstance(config, str):
             self.config = self.CONFIGS[config]
@@ -92,6 +124,7 @@ class WalkForwardSplitter:
             
         self.min_folds = min_folds
         self.max_folds = max_folds
+        self.horizon_buffer = horizon_buffer
         
     def get_adaptive_config(self, data_length: int) -> WalkForwardConfig:
         """
@@ -103,8 +136,13 @@ class WalkForwardSplitter:
         Returns:
             WalkForwardConfig appropriate for the data length
         """
-        if data_length < 600:  # Less than 10 hours
-            config = self.CONFIGS['short']
+        # NEW: Memecoin-aware adaptive configuration
+        if data_length < 200:    # Less than 3.3 hours - very short memecoins
+            config = self.CONFIGS['memecoin_micro']
+        elif data_length < 400:  # Less than 6.7 hours - typical short memecoins  
+            config = self.CONFIGS['memecoin_short']
+        elif data_length < 600:  # Less than 10 hours - medium memecoins
+            config = self.CONFIGS['memecoin_medium']
         elif data_length < 1200:  # Less than 20 hours
             config = self.CONFIGS['medium']
         elif data_length < 1800:  # Less than 30 hours
@@ -151,11 +189,14 @@ class WalkForwardSplitter:
         # Get configuration
         config = self.config or self.get_adaptive_config(n_samples)
         
+        # Adjust effective data length to account for horizon buffer
+        effective_n_samples = n_samples - self.horizon_buffer
+        
         # Generate folds
         fold_count = 0
         current_train_end = config.min_train_size
         
-        while current_train_end + config.test_size <= n_samples and fold_count < self.max_folds:
+        while current_train_end + config.test_size <= effective_n_samples and fold_count < self.max_folds:
             if config.strategy == 'expanding':
                 train_start = 0
             else:  # sliding
@@ -163,14 +204,14 @@ class WalkForwardSplitter:
                 
             train_indices = np.arange(train_start, current_train_end)
             test_indices = np.arange(current_train_end, 
-                                   min(current_train_end + config.test_size, n_samples))
+                                   min(current_train_end + config.test_size, effective_n_samples))
             
             yield train_indices, test_indices
             
             current_train_end += config.step_size
             fold_count += 1
             
-        logger.info(f"Generated {fold_count} folds for {n_samples} samples")
+        logger.info(f"Generated {fold_count} folds for {n_samples} samples (with {self.horizon_buffer} buffer)")
         
     def split_by_token(self,
                        data: pl.DataFrame,
@@ -270,6 +311,93 @@ class WalkForwardSplitter:
             fold_count += 1
             
         return fold_info
+
+    def get_adaptive_horizon_buffer(self, data_length: int, max_horizon: int = 720) -> int:
+        """
+        Get adaptive horizon buffer based on data length and max prediction horizon.
+        
+        For short tokens, we can't afford to reserve 12h (720min) at the end.
+        Instead, we use a smaller buffer or only predict shorter horizons.
+        
+        Args:
+            data_length: Number of time steps in the data
+            max_horizon: Maximum prediction horizon in minutes
+            
+        Returns:
+            Appropriate horizon buffer size
+        """
+        # For very short tokens, use minimal buffer
+        if data_length < 300:  # Less than 5 hours
+            return min(60, max_horizon)  # 1h buffer max
+        elif data_length < 600:  # Less than 10 hours  
+            return min(240, max_horizon)  # 4h buffer max
+        elif data_length < 1200:  # Less than 20 hours
+            return min(480, max_horizon)  # 8h buffer max
+        else:
+            return max_horizon  # Full buffer for long tokens
+    
+    def get_available_horizons(self, data_length: int, horizons: List[int]) -> List[int]:
+        """
+        Get horizons that are feasible given the data length.
+        
+        Args:
+            data_length: Number of time steps in the data
+            horizons: List of desired horizons in minutes
+            
+        Returns:
+            List of feasible horizons
+        """
+        # Reserve 25% of data for horizon buffer as maximum
+        max_feasible_horizon = int(data_length * 0.25)
+        
+        return [h for h in horizons if h <= max_feasible_horizon]
+
+    def smart_split_for_memecoins(self,
+                                  data: pl.DataFrame,
+                                  horizons: List[int],
+                                  time_column: str = 'datetime') -> Tuple[List[Tuple[pl.DataFrame, pl.DataFrame]], List[int]]:
+        """
+        Smart split that automatically adapts to memecoin data characteristics.
+        
+        - Uses adaptive horizon buffer based on data length
+        - Filters horizons to only feasible ones
+        - Uses memecoin-appropriate configurations
+        
+        Args:
+            data: Polars DataFrame
+            horizons: Desired prediction horizons in minutes
+            time_column: Column for time ordering
+            
+        Returns:
+            Tuple of (splits, feasible_horizons)
+        """
+        data_length = len(data)
+        
+        # Get adaptive horizon buffer
+        adaptive_buffer = self.get_adaptive_horizon_buffer(data_length, max(horizons))
+        
+        # Get feasible horizons
+        feasible_horizons = self.get_available_horizons(data_length, horizons)
+        
+        if not feasible_horizons:
+            print(f"⚠️  No feasible horizons for {data_length}-minute token!")
+            return [], []
+        
+        print(f"📊 Token length: {data_length} minutes")
+        print(f"🎯 Feasible horizons: {feasible_horizons} (filtered from {horizons})")
+        print(f"🛡️  Adaptive buffer: {adaptive_buffer} minutes (instead of {max(horizons)})")
+        
+        # Temporarily override horizon buffer
+        original_buffer = self.horizon_buffer
+        self.horizon_buffer = adaptive_buffer
+        
+        try:
+            # Get splits with adaptive buffer
+            splits = self.get_global_splits(data, time_column)
+            return splits, feasible_horizons
+        finally:
+            # Restore original buffer
+            self.horizon_buffer = original_buffer
 
 
 def create_walk_forward_splits(data: Union[pl.DataFrame, np.ndarray],
