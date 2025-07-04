@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore')
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/features"),
+    'base_dir': Path("data/features_with_targets"),
     'results_dir': Path("ML/results/advanced_hybrid_lstm"),
     'categories': [
         "normal_behavior_tokens",

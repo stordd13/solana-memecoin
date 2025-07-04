@@ -31,8 +31,8 @@ from ML.utils.training_plots import plot_training_curves, create_learning_summar
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
-    'features_dir': Path("data/features"),  # Pre-engineered features directory
+    'base_dir': Path("data/features_with_targets"),  # CHANGED: Read from features_with_targets dir
+    'features_dir': Path("data/features_with_targets"),  # Pre-engineered features with targets directory
     'results_dir': Path("ML/results/unified_lstm"),
     'categories': [
         "normal_behavior_tokens",      # Highest quality for training
@@ -86,7 +86,8 @@ class UnifiedDirectionalDataset(Dataset):
         for path in tqdm(data_paths, desc="1/2 Validating feature files"):
             try:
                 token_name = path.stem
-                features_path = CONFIG['features_dir'] / f"{token_name}_features.parquet"
+                # Features are now organized by category - path already points to the correct file
+                features_path = path
                 
                 if not features_path.exists():
                     continue
@@ -727,9 +728,9 @@ def prepare_data_fixed(data_paths: List[Path],
             # which is the actual feature file - no need to reconstruct the path
             token_name = path.stem
             
-            # Since we're already reading from features dir, just load directly
+            # Since we're already reading from features_with_targets dir, just load directly
             if path.exists() and path.suffix == '.parquet':
-                features_df = load_features_from_file(path)
+                features_df = pl.read_parquet(path)
             else:
                 print(f"Feature file not found: {path}")
                 continue
@@ -737,8 +738,7 @@ def prepare_data_fixed(data_paths: List[Path],
             if features_df is None or len(features_df) == 0:
                 continue
             
-            # Create directional labels
-            features_df = create_labels_for_horizons(features_df, horizons)
+            # Labels are already created in pipeline - no need to create them again
             
             # CRITICAL FIX: Split FIRST, then create sequences
             n_rows = len(features_df) if hasattr(features_df, '__len__') else features_df.height

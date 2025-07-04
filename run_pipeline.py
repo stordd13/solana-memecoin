@@ -25,6 +25,8 @@ from data_analysis.data_loader import DataLoader
 from data_analysis.data_quality import DataQualityAnalyzer
 from data_cleaning.clean_tokens import clean_all_categories
 from feature_engineering.advanced_feature_engineering import main as run_feature_engineering
+from feature_engineering.create_directional_targets import create_directional_targets
+import polars as pl
 
 # Data folders you want to include under data/raw/
 RAW_SUBFOLDERS = [
@@ -161,6 +163,75 @@ def run_feature_engineering_step(fast_mode: bool = False):
         return False
 
 
+def run_target_creation():
+    """Run target creation on features data"""
+    print("\n" + "="*60)
+    print("STEP 4: TARGET CREATION")
+    print("="*60)
+    
+    try:
+        features_path = Path("data/features")
+        output_path = Path("data/features_with_targets")
+        
+        if not features_path.exists():
+            logger.error("Features directory not found. Run feature engineering first.")
+            return False
+        
+        # Create output directory
+        output_path.mkdir(exist_ok=True)
+        
+        # Define horizons for directional targets
+        horizons = [15, 30, 60, 120, 240, 360, 720]
+        
+        # Process each category
+        processed_count = 0
+        error_count = 0
+        
+        for category_path in features_path.iterdir():
+            if not category_path.is_dir():
+                continue
+                
+            category_name = category_path.name
+            output_category_path = output_path / category_name
+            output_category_path.mkdir(exist_ok=True)
+            
+            print(f"\n📁 Processing category: {category_name}")
+            
+            # Process each token file in the category
+            for token_file in category_path.glob("*.parquet"):
+                try:
+                    # Load features data
+                    df = pl.read_parquet(token_file)
+                    
+                    # Create directional targets
+                    df_with_targets = create_directional_targets(df, horizons)
+                    
+                    # Save to output directory
+                    output_file = output_category_path / token_file.name
+                    df_with_targets.write_parquet(output_file)
+                    
+                    processed_count += 1
+                    
+                    if processed_count % 500 == 0:
+                        print(f"  Processed {processed_count} files...")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {token_file.name}: {e}")
+                    error_count += 1
+                    continue
+        
+        print(f"\n✅ Target creation completed:")
+        print(f"  Successfully processed: {processed_count} files")
+        print(f"  Errors: {error_count} files")
+        print(f"  Output directory: {output_path}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Target creation failed: {e}")
+        return False
+
+
 def main(fast_mode: bool = False):
     """Run the complete pipeline
     Parameters
@@ -180,7 +251,8 @@ def main(fast_mode: bool = False):
     pipeline_status = {
         'data_quality': False,
         'data_cleaning': False,
-        'feature_engineering': False
+        'feature_engineering': False,
+        'target_creation': False
     }
     
     # Step 1: Data Quality Analysis & Export
@@ -205,6 +277,15 @@ def main(fast_mode: bool = False):
     success = run_feature_engineering_step(fast_mode=fast_mode)
     pipeline_status['feature_engineering'] = success
     
+    if not success:
+        print("\n❌ Feature engineering failed. Stopping pipeline.")
+        return
+    
+    # Step 4: Target Creation
+    print("\n⏳ Proceeding to target creation...")
+    success = run_target_creation()
+    pipeline_status['target_creation'] = success
+    
     # Final summary
     end_time = datetime.now()
     duration = end_time - start_time
@@ -224,8 +305,10 @@ def main(fast_mode: bool = False):
         print("  - Categorized tokens: data/processed/")
         print("  - Cleaned data: data/cleaned/")
         print("  - Rolling features (ML-safe): data/features/")
+        print("  - Features with targets: data/features_with_targets/")
         print("\n🧠 Clean Architecture Benefits:")
         print("  - Rolling features: Saved to data/features/ (no data leakage)")
+        print("  - Directional targets: Created for all horizons [15, 30, 60, 120, 240, 360, 720]m")
         print("  - Global features: Computed on-demand in Streamlit")
         print("  - Clean separation: Impossible to accidentally use global features in ML")
         print("\n🚀 Ready to train ML models!")

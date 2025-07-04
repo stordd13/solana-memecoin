@@ -24,7 +24,7 @@ from ML.utils.winsorizer import Winsorizer
 
 # --- Configuration ---
 CONFIG = {
-    'features_dir': Path('data/features'),
+    'features_dir': Path('data/features_with_targets'),
     'results_dir': Path('ML/results/logreg_short_term'),
     'categories': [
         'normal_behavior_tokens',
@@ -37,15 +37,7 @@ CONFIG = {
 }
 
 # --- Label Creation ---
-def create_labels_for_horizons(df: pl.DataFrame, horizons: List[int]) -> pl.DataFrame:
-    """Creates labels and returns for multiple horizons."""
-    df = df.sort('datetime')
-    for h in horizons:
-        df = df.with_columns([
-            (pl.col('price').shift(-h) > pl.col('price')).cast(pl.Int32).alias(f'label_{h}m'),
-            ((pl.col('price').shift(-h) - pl.col('price')) / pl.col('price')).alias(f'return_{h}m')
-        ])
-    return df
+# Labels are now created in pipeline - this function is no longer needed
 
 # --- Plotting Functions ---
 def plot_metrics(metrics: Dict):
@@ -290,9 +282,7 @@ def main():
     models = {}
 
     for i, (train_df, test_df) in enumerate(tqdm(folds, desc="Processing Folds")):
-        # CRITICAL FIX: Create labels WITHIN each fold to prevent leakage
-        train_df = create_labels_for_horizons(train_df, feasible_horizons)
-        test_df = create_labels_for_horizons(test_df, feasible_horizons)
+        # Labels are already created in pipeline - no need to create them again
         
         # Fit winsorizer on first fold's training data
         if winsorizer is None:

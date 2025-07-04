@@ -412,7 +412,7 @@ def main():
                        default='per_fold',
                        help='Tuning strategy (default: per_fold)')
     parser.add_argument('--features_dir', type=str, 
-                       default='data/features',
+                       default='data/features_with_targets',
                        help='Directory containing pre-engineered features')
     
     args = parser.parse_args()

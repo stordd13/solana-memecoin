@@ -187,7 +187,7 @@ def tune_single_fold(X_train, y_train, X_val, y_val, returns_val,
     return best_params, result
 
 
-def tune_logistic_regression_per_fold(features_dir: Path, horizons: List[int], n_calls: int = 50):
+def tune_logistic_regression_per_fold(features_dir: Path, horizons: List[int], n_calls: int = 50, max_files: int = 10, sample_size: int = None):
     """
     Perform per-fold hyperparameter tuning for Logistic Regression directional model
     
@@ -212,6 +212,13 @@ def tune_logistic_regression_per_fold(features_dir: Path, horizons: List[int], n
             parquet_files = list(cat_dir.glob("*.parquet"))
             print(f"  Found {len(parquet_files)} files in {category}")
             
+            # Limit number of files for tuning to prevent memory issues
+            if max_files > 0:
+                parquet_files = parquet_files[:max_files]
+                print(f"  Using {len(parquet_files)} files for tuning (memory optimization)")
+            else:
+                print(f"  Using all {len(parquet_files)} files (no limit)")
+            
             for file_path in tqdm(parquet_files, desc=f"Loading {category}"):
                 try:
                     df = pl.read_parquet(file_path)
@@ -228,6 +235,12 @@ def tune_logistic_regression_per_fold(features_dir: Path, horizons: List[int], n
     combined_data = pl.concat(all_data_frames)
     print(f"📊 Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
     
+    # Sample data if requested for faster tuning
+    if sample_size and len(combined_data) > sample_size:
+        print(f"🎲 Sampling {sample_size:,} rows for faster tuning...")
+        combined_data = combined_data.sample(n=sample_size, seed=42)
+        print(f"📊 Using {len(combined_data):,} sampled rows")
+    
     # Create walk-forward splits
     print(f"\n🔄 Creating walk-forward splits...")
     splitter = WalkForwardSplitter()
@@ -243,10 +256,14 @@ def tune_logistic_regression_per_fold(features_dir: Path, horizons: List[int], n
     
     print(f"✅ Created {len(global_splits)} folds for horizons {feasible_horizons}")
     
-    # Prepare features and labels
-    target_cols = [f'target_{h}m' for h in horizons]
+    # Targets should already exist from the separate target creation script
+    print(f"🎯 Using pre-computed directional targets for horizons {feasible_horizons}...")
+    
+    # Prepare features and labels (use label_Xm format)
+    target_cols = [f'label_{h}m' for h in feasible_horizons]
+    return_cols = [f'return_{h}m' for h in feasible_horizons]
     feature_cols = [col for col in combined_data.columns 
-                   if col not in ['datetime', 'price', 'token_id'] + target_cols]
+                   if col not in ['datetime', 'price', 'token_id'] + target_cols + return_cols]
     
     print(f"🔧 Using {len(feature_cols)} features")
     
@@ -282,21 +299,30 @@ def tune_logistic_regression_per_fold(features_dir: Path, horizons: List[int], n
             print(f"  Val: {len(val_fold_df):,} samples")
             print(f"  Test: {len(test_df):,} samples")
             
-            # Check if target column exists for this horizon
-            target_col = f'target_{horizon}m'
+            # Check if target column exists for this horizon (use label_Xm format)
+            target_col = f'label_{horizon}m'
             if target_col not in train_fold_df.columns:
                 print(f"⚠️ Skipping fold {fold_idx + 1}, horizon {horizon}m: target column not found")
+                print(f"   Available columns: {train_fold_df.columns}")
+                continue
+            
+            # Filter out NaN values in targets first
+            train_valid = train_fold_df.filter(pl.col(target_col).is_not_null())
+            val_valid = val_fold_df.filter(pl.col(target_col).is_not_null())
+            
+            if len(train_valid) == 0 or len(val_valid) == 0:
+                print(f"⚠️ Skipping fold {fold_idx + 1}, horizon {horizon}m: no valid targets after NaN filtering")
                 continue
             
             # Prepare fold data
-            X_train = train_fold_df.select(feature_cols).to_numpy()
-            y_train = train_fold_df[target_col].to_numpy()
+            X_train = train_valid.select(feature_cols).to_numpy()
+            y_train = train_valid[target_col].to_numpy()
             
-            X_val = val_fold_df.select(feature_cols).to_numpy()
-            y_val = val_fold_df[target_col].to_numpy()
+            X_val = val_valid.select(feature_cols).to_numpy()
+            y_val = val_valid[target_col].to_numpy()
             
             # Calculate returns for financial metrics
-            returns_val = val_fold_df['price'].pct_change().shift(-horizon).fill_null(0).to_numpy()
+            returns_val = val_valid['price'].pct_change().shift(-horizon).fill_null(0).to_numpy()
             
             # Check for valid data
             if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
@@ -346,22 +372,38 @@ def tune_logistic_regression_per_fold(features_dir: Path, horizons: List[int], n
             print(f"🏆 Best performing fold for {horizon}m: {best_fold_idx + 1}")
             print(f"   Score: {all_scores[best_fold_idx]:.4f}")
             
-            # Save horizon-specific results
+            # Save horizon-specific results (convert numpy types for JSON compatibility)
+            def convert_numpy_types(obj):
+                """Convert numpy types to native Python types for JSON serialization"""
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                elif isinstance(obj, np.floating):
+                    return float(obj)
+                elif isinstance(obj, (bool, np.bool_)):
+                    return bool(obj)
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, dict):
+                    return {k: convert_numpy_types(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_numpy_types(v) for v in obj]
+                return obj
+            
             params_file = results_dir / f"logistic_regression_directional_{horizon}m_best_params.json"
             with open(params_file, 'w') as f:
-                json.dump(best_horizon_params, f, indent=2)
+                json.dump(convert_numpy_types(best_horizon_params), f, indent=2)
             print(f"💾 Best parameters for {horizon}m saved to: {params_file}")
             
             # Save all fold results for this horizon
             all_results_file = results_dir / f"logistic_regression_directional_{horizon}m_all_folds.json"
             with open(all_results_file, 'w') as f:
-                json.dump({
+                json.dump(convert_numpy_types({
                     'best_params_per_fold': all_best_params,
                     'scores_per_fold': all_scores,
-                    'best_fold_idx': best_fold_idx,
-                    'mean_score': np.mean(all_scores),
-                    'std_score': np.std(all_scores)
-                }, f, indent=2)
+                    'best_fold_idx': int(best_fold_idx),
+                    'mean_score': float(np.mean(all_scores)),
+                    'std_score': float(np.std(all_scores))
+                }), f, indent=2)
             
             horizon_best_params[horizon] = best_horizon_params
         else:
@@ -388,8 +430,12 @@ def main():
                        default='per_fold',
                        help='Tuning strategy (default: per_fold)')
     parser.add_argument('--features_dir', type=str, 
-                       default='data/features',
+                       default='data/features_with_targets',
                        help='Directory containing pre-engineered features')
+    parser.add_argument('--max_files', type=int, default=10,
+                       help='Maximum files per category to prevent memory issues (default: 10, use 0 for no limit)')
+    parser.add_argument('--sample_size', type=int, default=None,
+                       help='Sample only N rows from combined data for faster tuning')
     
     args = parser.parse_args()
     
@@ -404,7 +450,7 @@ def main():
         # Define horizons to match training scripts
         horizons = [15, 30, 60, 120, 240, 360, 720]  # 15min to 12h
         
-        tune_logistic_regression_per_fold(features_dir, horizons, args.n_calls)
+        tune_logistic_regression_per_fold(features_dir, horizons, args.n_calls, args.max_files, args.sample_size)
             
     except KeyboardInterrupt:
         print("\n⏹️ Tuning interrupted by user")

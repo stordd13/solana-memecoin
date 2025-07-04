@@ -41,8 +41,8 @@ from ML.utils.metrics_helpers import financial_classification_metrics
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
-    'features_dir': Path("data/features"),  # Pre-engineered features directory
+    'base_dir': Path("data/features_with_targets"),  # CHANGED: Read from features_with_targets dir
+    'features_dir': Path("data/features_with_targets"),  # Pre-engineered features with targets directory
     'results_dir': Path("ML/results/lightgbm_short_term"),
     'categories': [
         "normal_behavior_tokens",      # Highest quality for training
@@ -183,19 +183,7 @@ def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool
     return True
 
 
-def create_labels_for_horizons(df: pl.DataFrame, horizons: List[int]) -> pl.DataFrame:
-    """Create directional labels and returns for multiple horizons"""
-    if 'price' not in df.columns:
-        return df
-        
-    # Add labels and returns for each horizon
-    for h in horizons:
-        df = df.with_columns([
-            (pl.col('price').shift(-h) > pl.col('price')).cast(pl.Int32).alias(f'label_{h}m'),
-            ((pl.col('price').shift(-h) - pl.col('price')) / pl.col('price')).alias(f'return_{h}m')
-        ])
-    
-    return df
+# Labels are now created in pipeline - this function is no longer needed
 
 
 # --- Data Preparation ---
@@ -230,8 +218,7 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
                 print(f"⚠️  SKIPPING {token_name} due to unsafe features")
                 continue
             
-            # Create directional labels
-            features_df = create_labels_for_horizons(features_df, horizons)
+            # Labels are already created in pipeline - no need to create them again
             
             # CRITICAL FIX: Use EXPANDING WINDOW splits to preserve historical context
             # Handle both DataFrame and LazyFrame
@@ -672,7 +659,7 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
     
     # Load data paths
-    base_dir = Path("data/features")
+    base_dir = Path("data/features_with_targets")
     categories = [
         "normal_behavior_tokens",
         "tokens_with_extremes", 
@@ -756,9 +743,7 @@ def main():
         
         # Prepare data for this fold
         try:
-            # Add labels (only for feasible horizons)
-            train_df = create_labels_for_horizons(train_df, feasible_horizons)
-            test_df = create_labels_for_horizons(test_df, feasible_horizons)
+            # Labels are already created in pipeline - no need to create them again
             
             # Split into 80% train, 20% validation from train_df
             train_tokens = train_df['token_id'].unique().to_list()

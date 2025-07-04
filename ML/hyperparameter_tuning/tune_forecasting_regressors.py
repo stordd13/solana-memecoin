@@ -390,7 +390,7 @@ def main():
                        default='both',
                        help='Model type to tune (default: both)')
     parser.add_argument('--features_dir', type=str, 
-                       default='data/features',
+                       default='data/features_with_targets',
                        help='Directory containing pre-engineered features')
     
     args = parser.parse_args()
