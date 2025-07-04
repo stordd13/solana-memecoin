@@ -764,6 +764,10 @@ def show_individual_variability_analysis(selected_tokens):
                 if metric_name not in metrics:
                     st.warning(f"Missing metric '{metric_name}' for {token}, using default value 0.0")
                     metrics[metric_name] = 0.0
+            
+            # Add is_low_variability key if missing (use is_straight_line as fallback)
+            if 'is_low_variability' not in metrics:
+                metrics['is_low_variability'] = metrics.get('is_straight_line', False)
                 
             # Display metrics in columns
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -926,6 +930,10 @@ def show_batch_variability_comparison(selected_tokens):
                         if metric_name not in metrics:
                             metrics[metric_name] = 0.0
                     
+                    # Add is_low_variability key if missing (use is_straight_line as fallback)
+                    if 'is_low_variability' not in metrics:
+                        metrics['is_low_variability'] = metrics.get('is_straight_line', False)
+                    
                     metrics['token'] = token
                     results.append(metrics)
             except Exception as e:
@@ -1025,6 +1033,10 @@ def show_variability_distribution_analysis(selected_tokens):
                     for metric_name in required_metrics:
                         if metric_name not in metrics:
                             metrics[metric_name] = 0.0
+                    
+                    # Add is_low_variability key if missing (use is_straight_line as fallback)
+                    if 'is_low_variability' not in metrics:
+                        metrics['is_low_variability'] = metrics.get('is_straight_line', False)
                     
                     metrics['token'] = token
                     results.append(metrics)

@@ -89,7 +89,7 @@ def process_features_directory(input_dir: Path, output_dir: Path, horizons: List
                 
                 # Save to output directory
                 output_path = output_cat_dir / file_path.name
-                df_with_targets.write_parquet(output_path)
+                df_with_targets.write_parquet(output_path, compression="zstd", compression_level=3)
                 
             except Exception as e:
                 print(f"❌ Error processing {file_path.name}: {e}")

@@ -1373,7 +1373,7 @@ def run_batch_processing(data_loader, feature_engineer, available_tokens):
                         features_df = create_rolling_features_safe(df, symbol)
                         if features_df is not None and len(features_df) > 0:
                             output_file = output_path / f"{symbol}_features.parquet"
-                            features_df.write_parquet(output_file)
+                            features_df.write_parquet(output_file, compression="zstd", compression_level=3)
                         success_count += 1
                     else:
                         st.warning(f"⚠️ Feature engineering failed for {symbol}: {features_result.get('reason')}")
