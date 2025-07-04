@@ -758,32 +758,44 @@ def show_individual_variability_analysis(selected_tokens):
                 st.error(f"Could not analyze variability for {token}")
                 continue
                 
+            # Ensure all required metrics exist with default values
+            required_metrics = ['price_cv', 'log_price_cv', 'flat_periods_fraction', 'range_efficiency', 'normalized_entropy']
+            for metric_name in required_metrics:
+                if metric_name not in metrics:
+                    st.warning(f"Missing metric '{metric_name}' for {token}, using default value 0.0")
+                    metrics[metric_name] = 0.0
+                
             # Display metrics in columns
             col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
-                cv_status = "🔴" if metrics['price_cv'] < 0.05 else "🟢"
-                st.metric("Price CV", f"{metrics['price_cv']:.4f}", help="Coefficient of Variation")
+                price_cv = metrics.get('price_cv', 0.0)
+                cv_status = "🔴" if price_cv < 0.05 else "🟢"
+                st.metric("Price CV", f"{price_cv:.4f}", help="Coefficient of Variation")
                 st.write(f"{cv_status} Threshold: < 0.05")
             
             with col2:
-                log_cv_status = "🔴" if metrics['log_price_cv'] < 0.1 else "🟢"
-                st.metric("Log Price CV", f"{metrics['log_price_cv']:.4f}")
+                log_price_cv = metrics.get('log_price_cv', 0.0)
+                log_cv_status = "🔴" if log_price_cv < 0.1 else "🟢"
+                st.metric("Log Price CV", f"{log_price_cv:.4f}")
                 st.write(f"{log_cv_status} Threshold: < 0.1")
             
             with col3:
-                flat_status = "🔴" if metrics['flat_periods_fraction'] > 0.8 else "🟢"
-                st.metric("Flat Periods", f"{metrics['flat_periods_fraction']:.3f}")
+                flat_periods = metrics.get('flat_periods_fraction', 0.0)
+                flat_status = "🔴" if flat_periods > 0.8 else "🟢"
+                st.metric("Flat Periods", f"{flat_periods:.3f}")
                 st.write(f"{flat_status} Threshold: > 0.8")
             
             with col4:
-                range_status = "🔴" if metrics['range_efficiency'] < 0.1 else "🟢"
-                st.metric("Range Efficiency", f"{metrics['range_efficiency']:.3f}")
+                range_eff = metrics.get('range_efficiency', 0.0)
+                range_status = "🔴" if range_eff < 0.1 else "🟢"
+                st.metric("Range Efficiency", f"{range_eff:.3f}")
                 st.write(f"{range_status} Threshold: < 0.1")
             
             with col5:
-                entropy_status = "🔴" if metrics['normalized_entropy'] < 0.3 else "🟢"
-                st.metric("Entropy", f"{metrics['normalized_entropy']:.3f}")
+                norm_entropy = metrics.get('normalized_entropy', 0.0)
+                entropy_status = "🔴" if norm_entropy < 0.3 else "🟢"
+                st.metric("Entropy", f"{norm_entropy:.3f}")
                 st.write(f"{entropy_status} Threshold: < 0.3")
             
             # Overall decision
@@ -901,12 +913,21 @@ def show_batch_variability_comparison(selected_tokens):
                 result_df, modifications = st.session_state.token_cleaner._check_price_variability(df, token)
                 
                 # Extract metrics
+                metrics = None
                 for mod in modifications:
                     if 'metrics' in mod:
                         metrics = mod['metrics'].copy()
-                        metrics['token'] = token
-                        results.append(metrics)
                         break
+                        
+                if metrics:
+                    # Ensure all required metrics exist with default values
+                    required_metrics = ['price_cv', 'log_price_cv', 'flat_periods_fraction', 'range_efficiency', 'normalized_entropy']
+                    for metric_name in required_metrics:
+                        if metric_name not in metrics:
+                            metrics[metric_name] = 0.0
+                    
+                    metrics['token'] = token
+                    results.append(metrics)
             except Exception as e:
                 st.warning(f"Error analyzing {token}: {e}")
         
@@ -992,12 +1013,21 @@ def show_variability_distribution_analysis(selected_tokens):
                 result_df, modifications = st.session_state.token_cleaner._check_price_variability(df, token)
                 
                 # Extract metrics
+                metrics = None
                 for mod in modifications:
                     if 'metrics' in mod:
                         metrics = mod['metrics'].copy()
-                        metrics['token'] = token
-                        results.append(metrics)
                         break
+                        
+                if metrics:
+                    # Ensure all required metrics exist with default values
+                    required_metrics = ['price_cv', 'log_price_cv', 'flat_periods_fraction', 'range_efficiency', 'normalized_entropy']
+                    for metric_name in required_metrics:
+                        if metric_name not in metrics:
+                            metrics[metric_name] = 0.0
+                    
+                    metrics['token'] = token
+                    results.append(metrics)
             except Exception as e:
                 st.warning(f"Error analyzing {token}: {e}")
         
@@ -1007,8 +1037,8 @@ def show_variability_distribution_analysis(selected_tokens):
         st.error("No tokens could be analyzed.")
         return
     
-    # Convert to pandas for plotting
-    plot_df = pd.DataFrame(results)
+    # Convert to Polars DataFrame for plotting
+    plot_df = pl.DataFrame(results).to_pandas()
     
     # Create distribution plots
     fig = make_subplots(

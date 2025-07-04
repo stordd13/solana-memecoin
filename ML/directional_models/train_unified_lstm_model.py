@@ -42,15 +42,15 @@ CONFIG = {
     ],
     'sequence_length': 60,  # 1 hour lookback
     'horizons': [15, 30, 60, 120, 240, 360, 720],  # All prediction horizons
-    'batch_size': 128,
+    'batch_size': 16,
     'epochs': 50,
     'learning_rate': 0.001,
     'random_state': 42,
     'early_stopping_patience': 10,
     'val_size': 0.2,
     'test_size': 0.2,
-    'hidden_size': 32,   # Larger due to more horizons
-    'num_layers': 2,     # Deeper network
+    'hidden_size': 16,   # Larger due to more horizons
+    'num_layers': 1,     # Deeper network
     'dropout': 0.2,
     'focal_alpha': 0.25,
     'focal_gamma': 2.0,
@@ -554,7 +554,8 @@ def main():
     all_test_data = []
     
     # Use first N-1 folds for training/validation, last fold for testing
-    for token_id, folds in token_splits.items():
+    print("📊 Processing token folds for train/val/test splits...")
+    for token_id, folds in tqdm(token_splits.items(), desc="Processing token folds"):
         if len(folds) < 2:
             continue  # Need at least 2 folds
             
@@ -590,30 +591,37 @@ def main():
     test_paths = []
     
     # Save train splits
-    for i, df in enumerate(all_train_data):
+    print("💾 Saving train splits...")
+    for i, df in enumerate(tqdm(all_train_data, desc="Saving train folds")):
         temp_path = temp_dir / f'train_fold_{i}.parquet'
         df.write_parquet(temp_path)
         train_paths.append(temp_path)
     
     # Save val splits
-    for i, df in enumerate(all_val_data):
+    print("💾 Saving validation splits...")
+    for i, df in enumerate(tqdm(all_val_data, desc="Saving val folds")):
         temp_path = temp_dir / f'val_fold_{i}.parquet'
         df.write_parquet(temp_path)
         val_paths.append(temp_path)
         
     # Save test splits
-    for i, df in enumerate(all_test_data):
+    print("💾 Saving test splits...")
+    for i, df in enumerate(tqdm(all_test_data, desc="Saving test folds")):
         temp_path = temp_dir / f'test_fold_{i}.parquet'
         df.write_parquet(temp_path)
         test_paths.append(temp_path)
     
     # Create datasets using the saved splits
+    print("🔄 Creating training dataset from walk-forward splits...")
     train_dataset = UnifiedDirectionalDataset(train_paths, CONFIG['sequence_length'], CONFIG['horizons'])
     if len(train_dataset) == 0:
         print("ERROR: Training dataset is empty. Check feature engineering output.")
         return
 
+    print("🔄 Creating validation dataset...")
     val_dataset = UnifiedDirectionalDataset(val_paths, CONFIG['sequence_length'], CONFIG['horizons'])
+    
+    print("🔄 Creating test dataset...")
     test_dataset = UnifiedDirectionalDataset(test_paths, CONFIG['sequence_length'], CONFIG['horizons'])
     
     print(f"\n📊 Dataset sizes (walk-forward):")

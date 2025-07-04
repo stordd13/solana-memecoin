@@ -23,6 +23,10 @@ from typing import Dict, List, Tuple
 import plotly.graph_objects as go
 from tqdm import tqdm
 import joblib
+import optuna
+from optuna.samplers import TPESampler
+import warnings
+warnings.filterwarnings('ignore', category=optuna.exceptions.ExperimentalWarning)
 import json
 import sys
 
@@ -726,16 +730,16 @@ def main():
     print("\n🔀 Creating smart memecoin-aware global walk-forward splits...")
     global_splits, feasible_horizons = splitter.smart_split_for_memecoins(
         combined_data, 
-        horizons=[15, 30, 60, 120, 240, 360, 720],
+        horizons=[15, 30, 60, 120],
         time_column='datetime'
     )
     
     print(f"Created {len(global_splits)} walk-forward folds")
-    print(f"Original horizons: [15, 30, 60, 120, 240, 360, 720]")
+    print(f"Original horizons: [15, 30, 60, 120]")
     print(f"Feasible horizons: {feasible_horizons}")
     
     if len(feasible_horizons) < 7:
-        skipped = [h for h in [15, 30, 60, 120, 240, 360, 720] if h not in feasible_horizons]
+        skipped = [h for h in [15, 30, 60, 120] if h not in feasible_horizons]
         print(f"⚠️  Skipped horizons (too long for data): {skipped}")
     
     if not global_splits or not feasible_horizons:

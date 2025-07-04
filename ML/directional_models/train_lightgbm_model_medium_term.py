@@ -47,7 +47,7 @@ CONFIG = {
         "dead_tokens",                 # Complete token lifecycles
         # "tokens_with_gaps",          # EXCLUDED: Data quality issues
     ],
-    'horizons': [120, 240, 360, 480, 720, 960, 1380],  # 2h, 4h, 6h, 8h, 12h, 16h, 23h - medium-term trading
+    'horizons': [240, 360, 480, 720, 960, 1380],  # 2h, 4h, 6h, 8h, 12h, 16h, 23h - medium-term trading
     'n_estimators': 500,
     'random_state': 42,
     'test_size': 0.2,
@@ -520,8 +520,23 @@ def train_and_evaluate(train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl
     return model, metrics
 
 def plot_metrics(metrics: Dict):
-    """Plots key metrics for balanced classification (49% vs 51% is NOT imbalanced)."""
+    """
+    Plots key metrics for balanced classification (49% vs 51% is NOT imbalanced).
+    FIXED: Handles missing metrics gracefully for failed horizons.
+    """
     horizons = list(metrics.keys())
+    
+    # Filter out horizons that don't have valid metrics
+    valid_horizons = []
+    for h in horizons:
+        if isinstance(metrics[h], dict) and 'accuracy' in metrics[h]:
+            valid_horizons.append(h)
+    
+    if not valid_horizons:
+        print("⚠️  No valid metrics to plot!")
+        return go.Figure()
+    
+    print(f"📊 Plotting metrics for {len(valid_horizons)}/{len(horizons)} valid horizons: {valid_horizons}")
     
     # Show all meaningful metrics - accuracy IS important for balanced data
     key_metrics = ['accuracy', 'f1_score', 'precision', 'recall', 'roc_auc']
@@ -532,14 +547,27 @@ def plot_metrics(metrics: Dict):
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']  # Professional color scheme
     
     for i, (metric, label) in enumerate(zip(key_metrics, metric_labels)):
-        fig.add_trace(go.Bar(
-            name=label,
-            x=horizons,
-            y=[metrics[h][metric] for h in horizons],
-            text=[f"{metrics[h][metric]:.2f}" for h in horizons],
-            textposition='auto',
-            marker_color=colors[i]
-        ))
+        # Only use horizons that have this metric
+        metric_horizons = []
+        metric_values = []
+        metric_texts = []
+        
+        for h in valid_horizons:
+            if metric in metrics[h]:
+                metric_horizons.append(h)
+                value = metrics[h][metric]
+                metric_values.append(value)
+                metric_texts.append(f"{value:.2f}")
+        
+        if metric_horizons:  # Only add trace if we have data
+            fig.add_trace(go.Bar(
+                name=label,
+                x=metric_horizons,
+                y=metric_values,
+                text=metric_texts,
+                textposition='auto',
+                marker_color=colors[i]
+            ))
     
     # Add baseline line at 50% for reference
     fig.add_hline(
@@ -581,7 +609,7 @@ def main():
     
     print("="*60)
     print("🔬 LightGBM Medium-Term Directional Prediction Training")
-    print("Long horizons: 2h, 4h, 6h, 8h, 12h, 16h, 24h")
+    print("Long horizons: 4h, 6h, 8h, 12h, 16h, 24h")
     print("WITH WALK-FORWARD VALIDATION")
     print("="*60)
     
@@ -648,12 +676,12 @@ def main():
     print("\n🔀 Creating smart memecoin-aware global walk-forward splits...")
     global_splits, feasible_horizons = splitter.smart_split_for_memecoins(
         combined_data, 
-        horizons=[120, 240, 360, 480, 720, 960, 1380],  # 2h, 4h, 6h, 8h, 12h, 16h, 23h
+        horizons=[240, 360, 480, 720, 960, 1380],  # 2h, 4h, 6h, 8h, 12h, 16h, 23h
         time_column='datetime'
     )
     
     print(f"Created {len(global_splits)} walk-forward folds")
-    print(f"Original horizons: [120, 240, 360, 480, 720, 960, 1380]")
+    print(f"Original horizons: [240, 360, 480, 720, 960, 1380]")
     print(f"Feasible horizons: {feasible_horizons}")
     
     if len(feasible_horizons) < 7:

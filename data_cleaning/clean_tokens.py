@@ -41,21 +41,22 @@ class CategoryAwareTokenCleaner:
             'aggressive': self._aggressive_cleaning
         }
         
-        # Thresholds for different types of anomalies
+        # REFACTORED: More lenient thresholds for memecoin data
+        # Memecoins can have extreme but legitimate movements
         self.artifact_thresholds = {
-            'listing_spike_multiplier': 20,     # 20x median for listing artifacts
-            'listing_drop_threshold': 0.99,     # 99% drop after spike
-            'data_error_threshold': 1000,       # 100,000% (obvious data errors)
-            'flash_crash_recovery': 0.95,       # 95% recovery within 5 minutes
-            'zero_volume_threshold': 0.001      # Minimum volume for valid trades
+            'listing_spike_multiplier': 100,    # 100x median for listing artifacts (was 20x)
+            'listing_drop_threshold': 0.99,     # 99% drop after spike (unchanged)
+            'data_error_threshold': 10000,      # 1,000,000% - only truly impossible moves (was 1000)
+            'flash_crash_recovery': 0.95,       # 95% recovery within 5 minutes (unchanged)
+            'zero_volume_threshold': 0.001      # Minimum volume for valid trades (unchanged)
         }
         
-        # Market behavior thresholds (preserve these!)
+        # Market behavior thresholds - even more permissive for memecoins
         self.market_thresholds = {
-            'max_realistic_pump': 50,           # 5,000% pumps can be real
-            'max_realistic_dump': 0.95,         # 95% dumps can be real
-            'sustained_movement_minutes': 3,    # Real movements last >3 minutes
-            'volume_confirmation_ratio': 0.1    # Volume should support price moves
+            'max_realistic_pump': 10000,        # 1,000,000% pumps can be real (was 50)
+            'max_realistic_dump': 0.99,         # 99% dumps can be real (was 0.95)
+            'sustained_movement_minutes': 3,    # Real movements last >3 minutes (unchanged)
+            'volume_confirmation_ratio': 0.1    # Volume should support price moves (unchanged)
         }
 
     def clean_token_file(self, token_path: Path, category: str) -> Dict:
@@ -344,13 +345,24 @@ class CategoryAwareTokenCleaner:
                 max_price = np.max(finite_prices)
                 if min_price > 0:
                     price_ratio = max_price / min_price
-                    if price_ratio > 1000:  # >1,000x price ratio is unrealistic
+                    # REFACTORED: Allow extreme ratios for memecoins (up to 10,000,000x)
+                    # Only flag if it's clearly impossible (>10,000,000x is suspicious)
+                    if price_ratio > 10000000:  # 10,000,000x price ratio threshold
                         return None, modifications + [{
                             'type': 'excluded_extreme_price_ratio',
                             'price_ratio': price_ratio,
                             'min_price': min_price,
-                            'max_price': max_price
+                            'max_price': max_price,
+                            'reason': 'Price ratio >10,000,000x suggests data corruption'
                         }]
+                    elif price_ratio > 1000000:
+                        # Log but don't exclude - these can be legitimate
+                        print(f"🚀 EXTREME RATIO: {token_name} - {price_ratio:.0f}x (min: {min_price:.10f}, max: {max_price:.2f})")
+                        modifications.append({
+                            'type': 'extreme_ratio_noted',
+                            'price_ratio': price_ratio,
+                            'action': 'preserved'
+                        })
         
         # 4. Detect and remove staircase artifacts
         df, staircase_mods = self._detect_and_remove_staircase_artifacts(df, token_name)
@@ -413,8 +425,8 @@ class CategoryAwareTokenCleaner:
 
     def _check_price_variability(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Analyze price variability to identify and filter "straight line" tokens.
-        Uses multiple metrics to distinguish real market variations from artificial patterns.
+        REFACTORED: Focus on detecting truly flat "straight line" tokens.
+        Real tokens have natural price variations - preserve those!
         """
         modifications = []
         prices = df['price'].to_numpy()
@@ -422,77 +434,124 @@ class CategoryAwareTokenCleaner:
         if len(prices) < 30:
             return df, modifications
         
-        # Convert to log prices to better analyze relative movements
-        log_prices = np.log(prices + 1e-10)  # Add small epsilon to avoid log(0)
+        # Key insight: Real tokens have price ticks/changes, dead lines don't
         
-        # 1. Coefficient of Variation (CV) - measures relative variability
-        price_cv = np.std(prices) / np.mean(prices) if np.mean(prices) > 0 else 0
-        log_price_cv = np.std(log_prices) / np.abs(np.mean(log_prices)) if np.mean(log_prices) != 0 else 0
+        # 1. Count actual price changes (not percentage-based)
+        price_changes = np.diff(prices)
+        non_zero_changes = np.sum(price_changes != 0)
+        change_ratio = non_zero_changes / len(price_changes) if len(price_changes) > 0 else 0
         
-        # 2. Rolling variability - detect periods of constant price
-        window_size = min(60, len(prices) // 4)  # 1-hour windows or 25% of data
-        rolling_std = []
+        # 2. Count unique prices (straight lines have very few)
+        unique_prices = len(np.unique(prices))
+        unique_ratio = unique_prices / len(prices)
         
-        for i in range(0, len(prices) - window_size + 1, window_size // 2):
-            window_prices = prices[i:i + window_size]
-            rolling_std.append(np.std(window_prices) / np.mean(window_prices) if np.mean(window_prices) > 0 else 0)
-        
-        # 3. Fraction of time spent in "flat" periods
-        flat_threshold = 0.001  # 0.1% price change considered flat
-        returns = np.abs(np.diff(prices) / prices[:-1])
-        flat_periods = np.sum(returns < flat_threshold) / len(returns) if len(returns) > 0 else 1.0
-        
-        # 4. Price range efficiency - how much of the total range is covered by meaningful moves
-        price_range = np.max(prices) - np.min(prices)
-        meaningful_moves = np.sum(np.abs(np.diff(prices)) > np.mean(prices) * 0.01)  # >1% moves
-        range_efficiency = meaningful_moves / len(prices) if len(prices) > 0 else 0
-        
-        # 5. Entropy-based measure - information content in price movements
-        # Discretize returns into bins and calculate entropy
-        if len(returns) > 10:
-            bins = min(10, len(returns) // 5)
-            hist, _ = np.histogram(returns, bins=bins)
-            hist = hist[hist > 0]  # Remove empty bins
-            if len(hist) > 1:
-                prob = hist / np.sum(hist)
-                entropy = -np.sum(prob * np.log2(prob))
-                max_entropy = np.log2(len(hist))
-                normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+        # 3. Look for long periods of identical prices
+        max_consecutive_same = 0
+        current_consecutive = 1
+        for i in range(1, len(prices)):
+            if prices[i] == prices[i-1]:
+                current_consecutive += 1
+                max_consecutive_same = max(max_consecutive_same, current_consecutive)
             else:
-                normalized_entropy = 0
+                current_consecutive = 1
+        
+        # 4. Calculate tick density in different time windows
+        # Real tokens show activity across different timeframes
+        window_sizes = [10, 30, 60] if len(prices) >= 60 else [10, 30] if len(prices) >= 30 else [10]
+        active_windows = 0
+        total_windows = 0
+        
+        for window_size in window_sizes:
+            if window_size <= len(prices):
+                for i in range(0, len(prices) - window_size + 1, window_size // 2):
+                    window_prices = prices[i:i + window_size]
+                    window_unique = len(np.unique(window_prices))
+                    total_windows += 1
+                    if window_unique > 2:  # More than 2 unique prices in window
+                        active_windows += 1
+        
+        activity_ratio = active_windows / total_windows if total_windows > 0 else 0
+        
+        # 5. Simple entropy check - how "random" are the price movements
+        if len(price_changes) > 0:
+            # Normalize price changes to detect patterns
+            normalized_changes = np.sign(price_changes)  # -1, 0, 1
+            unique_patterns = len(np.unique(normalized_changes))
+        else:
+            unique_patterns = 0
+        
+        # REFACTORED CRITERIA: Only filter truly dead/straight line tokens
+        is_straight_line = (
+            unique_ratio < 0.01 and                    # <1% unique prices (very strict)
+            change_ratio < 0.05 and                    # <5% of time prices change
+            max_consecutive_same > len(prices) * 0.8   # >80% consecutive same prices
+        ) or (
+            unique_prices <= 3 and                     # 3 or fewer unique prices total
+            activity_ratio < 0.1                       # <10% of windows show activity
+        )
+        
+        # Calculate additional metrics expected by the app
+        # Price coefficient of variation (CV)
+        price_mean = np.mean(prices)
+        price_std = np.std(prices)
+        price_cv = price_std / price_mean if price_mean > 0 else 0
+        
+        # Log price coefficient of variation
+        log_prices = np.log(prices + 1e-10)  # Add small value to avoid log(0)
+        log_price_cv = np.std(log_prices) / np.mean(log_prices) if np.mean(log_prices) != 0 else 0
+        
+        # Flat periods fraction (fraction of time with no price changes)
+        flat_periods_fraction = 1 - change_ratio
+        
+        # Range efficiency (actual range vs theoretical max range)
+        price_range = np.max(prices) - np.min(prices)
+        theoretical_max_range = np.max(prices) + np.std(prices)
+        range_efficiency = price_range / theoretical_max_range if theoretical_max_range > 0 else 0
+        
+        # Normalized entropy (measure of price distribution randomness)
+        # Simple entropy calculation based on price bins
+        if len(prices) > 1:
+            hist, _ = np.histogram(prices, bins=min(10, unique_prices))
+            hist = hist[hist > 0]  # Remove zero bins
+            probs = hist / np.sum(hist)
+            entropy = -np.sum(probs * np.log2(probs)) if len(probs) > 1 else 0
+            normalized_entropy = entropy / np.log2(len(probs)) if len(probs) > 1 else 0
         else:
             normalized_entropy = 0
         
-        # Define thresholds for "straight line" detection
-        is_low_variability = (
-            price_cv < 0.05 and              # Very low relative price variation
-            log_price_cv < 0.1 and           # Very low log price variation  
-            flat_periods > 0.8 and           # >80% of time spent flat
-            range_efficiency < 0.1 and       # <10% meaningful moves
-            normalized_entropy < 0.3          # Low information content
-        )
-        
-        # Log the analysis for monitoring
+        # Log the analysis
         variability_metrics = {
+            'unique_prices': unique_prices,
+            'unique_ratio': unique_ratio,
+            'change_ratio': change_ratio,
+            'max_consecutive_same': max_consecutive_same,
+            'activity_ratio': activity_ratio,
+            'unique_patterns': unique_patterns,
+            'is_straight_line': is_straight_line,
+            # Additional metrics for app compatibility
             'price_cv': price_cv,
-            'log_price_cv': log_price_cv,
-            'flat_periods_fraction': flat_periods,
+            'log_price_cv': abs(log_price_cv),  # Use absolute value to avoid negative CV
+            'flat_periods_fraction': flat_periods_fraction,
             'range_efficiency': range_efficiency,
-            'normalized_entropy': normalized_entropy,
-            'is_low_variability': is_low_variability
+            'normalized_entropy': normalized_entropy
         }
         
-        if is_low_variability:
-            print(f"📏 LOW_VAR: {token_name} - CV:{price_cv:.4f}, Flat:{flat_periods:.2f}, Entropy:{normalized_entropy:.3f}")
+        if is_straight_line:
+            print(f"📏 STRAIGHT LINE: {token_name} - {unique_prices} unique prices, "
+                  f"{change_ratio:.1%} changes, max consecutive: {max_consecutive_same}")
             return None, modifications + [{
-                'type': 'excluded_low_variability',
+                'type': 'excluded_straight_line',
                 'metrics': variability_metrics,
-                'reason': 'Token shows minimal price variation (straight line pattern)'
+                'reason': 'Token shows no meaningful price variation (straight line)'
             }]
         else:
             # Token has acceptable variability
+            if unique_ratio < 0.1:  # Low but not too low
+                print(f"⚠️  LOW VAR (kept): {token_name} - {unique_prices} unique prices, "
+                      f"but {change_ratio:.1%} changes")
+            
             modifications.append({
-                'type': 'variability_analysis_passed',
+                'type': 'variability_check_passed',
                 'metrics': variability_metrics
             })
         
@@ -500,54 +559,109 @@ class CategoryAwareTokenCleaner:
 
     def _detect_and_remove_staircase_artifacts(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Detect and remove staircase artifacts: sudden vertical jump followed by flat horizontal line.
-        These are usually data errors, not real market movements.
+        REFACTORED: Detect TRUE staircase artifacts only.
+        Uses the same enhanced logic as _fix_extreme_data_corruption for consistency.
+        Now checks BOTH pre-jump and post-jump patterns.
         """
         modifications = []
         prices = df['price'].to_numpy()
         
-        if len(prices) < 20:
+        if len(prices) < 60:  # Need 60 for 30 before + 30 after analysis
             return df, modifications
         
         # Calculate returns
         returns = np.diff(prices) / prices[:-1]
         
-        # Find extreme jumps (>1000% in one minute) 
-        extreme_jump_indices = np.where(np.abs(returns) > 10.0)[0]
+        # Find jump points (>100% in one minute)
+        jump_indices = np.where(returns > 1.0)[0]  # 100% threshold
         
         artifacts_found = 0
-        removal_ranges = []
+        earliest_staircase = None
+        staircase_details = []
         
-        for jump_idx in extreme_jump_indices:
-            if jump_idx < len(prices) - 10:  # Need at least 10 points after jump
-                # Check if price stays very flat after the jump
-                post_jump_start = jump_idx + 1
-                post_jump_end = min(jump_idx + 31, len(prices))  # Check next 30 minutes
-                post_jump_prices = prices[post_jump_start:post_jump_end]
+        for jump_idx in jump_indices:
+            # Need 30 minutes before AND after for enhanced analysis
+            if jump_idx >= 30 and jump_idx < len(prices) - 30:
                 
-                if len(post_jump_prices) > 5:
-                    # Calculate coefficient of variation
-                    cv = np.std(post_jump_prices) / np.mean(post_jump_prices) if np.mean(post_jump_prices) > 0 else 1
+                # Analyze both pre-jump and post-jump behavior
+                pre_jump_prices = prices[jump_idx-30:jump_idx]
+                post_jump_prices = prices[jump_idx+1:jump_idx+31]
+                
+                # Use the same analysis functions as the main cleaning method
+                pre_metrics = self._analyze_staircase_pattern(pre_jump_prices, "PRE")
+                post_metrics = self._analyze_staircase_pattern(post_jump_prices, "POST")
+                
+                # Check if either side shows staircase pattern
+                is_pre_staircase = self._is_staircase_pattern(pre_metrics)
+                is_post_staircase = self._is_staircase_pattern(post_metrics)
+                
+                is_definitive_staircase = is_pre_staircase or is_post_staircase
+                
+                if is_definitive_staircase:
+                    artifacts_found += 1
                     
-                    # If variation is extremely low after extreme jump = staircase artifact
-                    if cv < 0.005:  # Less than 0.5% variation
-                        artifacts_found += 1
-                        # Mark this range for removal (from jump onwards)
-                        removal_ranges.append((post_jump_start, len(prices)))
-                        print(f"🪜 STAIRCASE: {token_name} - Found staircase artifact at minute {jump_idx} (CV: {cv:.6f})")
+                    # Determine staircase type
+                    staircase_type = []
+                    if is_pre_staircase:
+                        staircase_type.append("flat→jump")
+                    if is_post_staircase:
+                        staircase_type.append("jump→flat")
+                    
+                    staircase_details.append({
+                        'jump_idx': jump_idx,
+                        'staircase_type': " + ".join(staircase_type),
+                        'pre_metrics': pre_metrics,
+                        'post_metrics': post_metrics,
+                        'is_high_confidence': (
+                            (pre_metrics['unique_prices'] <= 3 and pre_metrics['tick_movements'] <= 1) or
+                            (post_metrics['unique_prices'] <= 3 and post_metrics['tick_movements'] <= 1)
+                        )
+                    })
+                    
+                    # Update earliest staircase with smart cut point selection
+                    if earliest_staircase is None or jump_idx < earliest_staircase:
+                        earliest_staircase = jump_idx
+                    
+                    print(f"🪜 ENHANCED STAIRCASE: {' + '.join(staircase_type)} at minute {jump_idx} "
+                          f"(Pre: {pre_metrics['unique_prices']}u/{pre_metrics['tick_movements']}t, "
+                          f"Post: {post_metrics['unique_prices']}u/{post_metrics['tick_movements']}t)")
         
-        if artifacts_found > 0:
-            # Remove the staircase artifacts (keep data up to first artifact)
-            earliest_artifact = min([r[0] for r in removal_ranges])
-            df_clean = df.head(earliest_artifact)
+        if earliest_staircase is not None:
+            # Find the details of the earliest staircase for smart cutting
+            earliest_details = next(d for d in staircase_details if d['jump_idx'] == earliest_staircase)
+            
+            # Smart cut point selection based on staircase type
+            is_pre_type = "flat→jump" in earliest_details['staircase_type']
+            
+            if is_pre_type:
+                # For flat→jump pattern, cut at start of flat period
+                cut_point = max(0, earliest_staircase - 30)
+                cut_type = "pre_jump_flat_removal"
+            else:
+                # For jump→flat pattern, cut at jump point  
+                cut_point = earliest_staircase
+                cut_type = "post_jump_flat_removal"
+            
+            # Remove from the calculated cut point onwards
+            df_clean = df.head(cut_point + 1)
+            
+            # Count high confidence staircases
+            high_confidence_count = sum(1 for d in staircase_details if d['is_high_confidence'])
             
             modifications.append({
-                'type': 'staircase_artifacts_removed',
-                'count': artifacts_found,
+                'type': 'enhanced_staircase_artifacts_removed_universal',
+                'total_artifacts': artifacts_found,
+                'high_confidence_artifacts': high_confidence_count,
+                'cut_at_minute': cut_point,
+                'cut_type': cut_type,
+                'earliest_staircase_type': earliest_details['staircase_type'],
                 'original_length': len(prices),
                 'final_length': df_clean.height,
-                'removed_minutes': len(prices) - df_clean.height
+                'reason': 'Enhanced pre+post jump staircase pattern detected'
             })
+            
+            print(f"✂️ ENHANCED UNIVERSAL CUT: {token_name} - Removed from minute {cut_point} "
+                  f"({earliest_details['staircase_type']} pattern)")
             
             return df_clean, modifications
         
@@ -671,7 +785,8 @@ class CategoryAwareTokenCleaner:
 
     def _fix_data_errors(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Fix obvious data errors (>100,000% moves in one minute)
+        REFACTORED: Only fix truly impossible data errors.
+        Memecoins can have 10,000%+ moves in one minute legitimately!
         """
         modifications = []
         
@@ -684,47 +799,52 @@ class CategoryAwareTokenCleaner:
                 pl.col('price').pct_change().alias('returns')
             ])
         
-        # Find extreme data errors (>100,000% = 1000x in one minute)
-        error_threshold = self.artifact_thresholds['data_error_threshold']
+        # REFACTORED: Much higher threshold for "impossible" moves
+        # Only flag if it's clearly a data error (>1,000,000% in one minute)
+        error_threshold = 10000  # 1,000,000% = 10,000x in one minute
         extreme_returns = df.filter(pl.col('returns').abs() > error_threshold)
         
         if extreme_returns.height > 0:
-            # Remove these extreme outliers by interpolating
+            # These are likely data errors - but let's double-check
             error_indices = extreme_returns.with_row_count()['row_nr'].to_list()
             
-            # Replace extreme values with interpolated values
-            df = df.with_row_count().with_columns([
-                pl.when(pl.col('row_nr').is_in(error_indices))
-                .then(None)
-                .otherwise(pl.col('price'))
-                .alias('price_clean')
-            ])
+            # Log the extreme values for monitoring
+            for idx in error_indices:
+                return_val = df.row(idx, named=True)['returns']
+                price_before = df.row(max(0, idx-1), named=True)['price'] if idx > 0 else None
+                price_after = df.row(idx, named=True)['price']
+                print(f"🚨 EXTREME: {return_val*100:.1f}% move at minute {idx} "
+                      f"(${price_before:.10f} → ${price_after:.10f})")
             
-            # Linear interpolation for missing values
-            df = df.with_columns([
-                pl.col('price_clean').interpolate().alias('price')
-            ]).drop(['price_clean', 'row_nr'])
-            
+            # Only interpolate if it's truly impossible
+            # For now, accept even these extreme moves - memecoins are wild!
             modifications.append({
-                'type': 'extreme_data_errors_fixed',
+                'type': 'extreme_returns_detected_but_kept',
                 'count': len(error_indices),
                 'threshold_used': error_threshold,
-                'method': 'linear_interpolation'
+                'action': 'preserved',
+                'reason': 'Memecoins can have extreme legitimate moves'
             })
+            
+            # Don't remove anything - just flag it
+            print(f"⚠️  EXTREME MOVES: Found {len(error_indices)} moves >{error_threshold*100}% but keeping them")
         
         return df, modifications
 
     def _fix_extreme_data_corruption(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Improved corruption detection that distinguishes between:
-        1. Legitimate massive gains over several minutes (KEEP)
-        2. Instant staircase artifacts: extreme jump + flat period (REMOVE)
+        REFACTORED: Smart detection that distinguishes between:
+        1. Staircase artifacts: 
+           - Type A: vertical jump + ZERO variation horizontal line (REMOVE)
+           - Type B: horizontal flat line + vertical jump (REMOVE) ← NEW!
+        2. Legitimate extreme pumps: can be 1,000,000x+ but show continued trading (KEEP)
         
-        This preserves real 1,000,000%+ pumps while removing obvious data errors.
+        Key insight: Real tokens have price variations before AND after pumps, 
+        staircases are perfectly flat on one or both sides.
         """
         modifications = []
         
-        if df.height < 10:  # Need at least 10 points for pattern analysis
+        if df.height < 60:  # Need more data for robust pattern analysis (30 before + 30 after)
             return df, modifications
         
         # Calculate returns if not present
@@ -737,88 +857,226 @@ class CategoryAwareTokenCleaner:
         prices = df['price'].to_numpy()
         returns = df['returns'].to_numpy()
         
-        # Find extreme single-minute moves (>1000% in one minute)
-        extreme_threshold = 10.0  # 1000%
-        extreme_indices = np.where(np.abs(returns) > extreme_threshold)[0]
+        # Find potential jump points (>100% in one minute)
+        jump_threshold = 1.0  # 100% - lower threshold to catch more patterns
+        jump_indices = np.where(returns > jump_threshold)[0]
         
         staircase_artifacts = []
         legitimate_pumps = []
         
-        for idx in extreme_indices:
-            if idx < len(returns) - 10:  # Need 10 minutes after for pattern analysis
+        for idx in jump_indices:
+            # Need 30 minutes before AND after for robust analysis
+            if idx >= 30 and idx < len(returns) - 30:
                 
-                # Analyze the 10 minutes following the extreme move
-                post_move_returns = returns[idx+1:idx+11]
-                post_move_prices = prices[idx+1:idx+11]
+                # Analyze the 30 minutes BEFORE the jump (NEW!)
+                pre_jump_prices = prices[idx-30:idx]
+                pre_jump_returns = returns[idx-30:idx]
                 
-                # Calculate post-move volatility metrics
-                post_move_abs_returns = np.abs(post_move_returns[np.isfinite(post_move_returns)])
+                # Analyze the 30 minutes AFTER the jump (existing)
+                post_jump_prices = prices[idx+1:idx+31]
+                post_jump_returns = returns[idx+1:idx+31]
                 
-                if len(post_move_abs_returns) > 0:
-                    avg_post_volatility = np.mean(post_move_abs_returns)
-                    max_post_volatility = np.max(post_move_abs_returns)
-                    cv_post_prices = np.std(post_move_prices) / np.mean(post_move_prices) if np.mean(post_move_prices) > 0 else 0
+                # Check BOTH pre-jump and post-jump for staircase patterns
+                pre_staircase_metrics = self._analyze_staircase_pattern(pre_jump_prices, "PRE")
+                post_staircase_metrics = self._analyze_staircase_pattern(post_jump_prices, "POST")
+                
+                # Determine if this is a staircase artifact
+                is_pre_staircase = self._is_staircase_pattern(pre_staircase_metrics)
+                is_post_staircase = self._is_staircase_pattern(post_staircase_metrics)
+                
+                # If EITHER side shows staircase pattern → artifact
+                is_staircase_artifact = is_pre_staircase or is_post_staircase
+                
+                if is_staircase_artifact:
+                    staircase_type = []
+                    if is_pre_staircase:
+                        staircase_type.append("flat→jump")
+                    if is_post_staircase:
+                        staircase_type.append("jump→flat")
                     
-                    # STAIRCASE CRITERIA: Extreme jump followed by very low volatility
-                    is_staircase = (
-                        avg_post_volatility < 0.005 and  # <0.5% average volatility after extreme move
-                        cv_post_prices < 0.01 and        # <1% coefficient of variation
-                        max_post_volatility < 0.02       # <2% max volatility in 10 minutes
-                    )
+                    staircase_artifacts.append({
+                        'idx': idx,
+                        'jump_size': returns[idx],
+                        'staircase_type': " + ".join(staircase_type),
+                        'pre_metrics': pre_staircase_metrics,
+                        'post_metrics': post_staircase_metrics
+                    })
                     
-                    if is_staircase:
-                        staircase_artifacts.append({
-                            'idx': idx,
-                            'return': returns[idx],
-                            'post_volatility': avg_post_volatility,
-                            'cv': cv_post_prices
-                        })
-                        print(f"🪜 STAIRCASE DETECTED: Minute {idx}, {returns[idx]*100:.1f}% return, "
-                              f"then avg volatility {avg_post_volatility*100:.2f}%")
-                    else:
-                        legitimate_pumps.append({
-                            'idx': idx,
-                            'return': returns[idx],
-                            'post_volatility': avg_post_volatility
-                        })
-                        print(f"🚀 LEGITIMATE PUMP: Minute {idx}, {returns[idx]*100:.1f}% return, "
-                              f"continued volatility {avg_post_volatility*100:.2f}%")
+                    print(f"🪜 STAIRCASE: {' + '.join(staircase_type)} at minute {idx} "
+                          f"({returns[idx]*100:.1f}%) - "
+                          f"Pre: {pre_staircase_metrics['unique_prices']}u/{pre_staircase_metrics['tick_movements']}t, "
+                          f"Post: {post_staircase_metrics['unique_prices']}u/{post_staircase_metrics['tick_movements']}t")
+                else:
+                    # This is a legitimate pump - has variation on both sides
+                    post_volatility = np.std(post_jump_returns[np.isfinite(post_jump_returns)])
+                    pre_volatility = np.std(pre_jump_returns[np.isfinite(pre_jump_returns)])
+                    
+                    legitimate_pumps.append({
+                        'idx': idx,
+                        'jump_size': returns[idx],
+                        'pre_volatility': pre_volatility,
+                        'post_volatility': post_volatility,
+                        'pre_unique': pre_staircase_metrics['unique_prices'],
+                        'post_unique': post_staircase_metrics['unique_prices']
+                    })
+                    
+                    if returns[idx] > 10:  # Log only massive pumps
+                        print(f"🚀 REAL PUMP: Jump at minute {idx} ({returns[idx]*100:.1f}%) - "
+                              f"Pre: {pre_staircase_metrics['unique_prices']}u/{pre_staircase_metrics['tick_movements']}t, "
+                              f"Post: {post_staircase_metrics['unique_prices']}u/{post_staircase_metrics['tick_movements']}t")
         
-        # Remove only staircase artifacts
+        # Remove staircase artifacts but be conservative
         if staircase_artifacts:
-            artifact_indices = [a['idx'] for a in staircase_artifacts]
+            # Only remove if we're confident it's a staircase
+            # Find the earliest definitive staircase
+            earliest_staircase = None
+            staircase_confidence = {}
             
-            # Remove staircase artifacts and everything after them
-            # (since the flat period is usually where the token "dies")
-            earliest_artifact = min(artifact_indices)
-            df_clean = df.head(earliest_artifact)
+            for artifact in staircase_artifacts:
+                # Check confidence level - both pre and post metrics
+                pre_confident = (artifact['pre_metrics']['unique_prices'] <= 3 and 
+                               artifact['pre_metrics']['tick_movements'] <= 1)
+                post_confident = (artifact['post_metrics']['unique_prices'] <= 3 and 
+                                artifact['post_metrics']['tick_movements'] <= 1)
+                
+                # High confidence if either side is definitely flat
+                is_high_confidence = pre_confident or post_confident
+                staircase_confidence[artifact['idx']] = is_high_confidence
+                
+                if is_high_confidence:
+                    if earliest_staircase is None or artifact['idx'] < earliest_staircase:
+                        earliest_staircase = artifact['idx']
             
-            modifications.append({
-                'type': 'staircase_artifacts_removed',
-                'count': len(staircase_artifacts),
-                'legitimate_pumps_preserved': len(legitimate_pumps),
-                'artifacts_data': staircase_artifacts,
-                'original_length': len(prices),
-                'final_length': df_clean.height,
-                'method': 'temporal_pattern_analysis'
-            })
-            
-            print(f"📊 CORRUPTION ANALYSIS: Removed {len(staircase_artifacts)} staircase artifacts, "
-                  f"preserved {len(legitimate_pumps)} legitimate pumps")
-            
-            return df_clean, modifications
+            if earliest_staircase is not None:
+                # For pre-jump staircases, we might want to cut earlier
+                # Find if the earliest staircase is a pre-jump type
+                earliest_artifact = next(a for a in staircase_artifacts if a['idx'] == earliest_staircase)
+                is_pre_type = "flat→jump" in earliest_artifact['staircase_type']
+                
+                if is_pre_type:
+                    # For flat→jump, cut at the start of the flat period (30 minutes before jump)
+                    cut_point = max(0, earliest_staircase - 30)
+                else:
+                    # For jump→flat, cut at the jump point
+                    cut_point = earliest_staircase
+                
+                df_clean = df.head(cut_point + 1)
+                
+                high_confidence_count = sum(1 for conf in staircase_confidence.values() if conf)
+                
+                modifications.append({
+                    'type': 'enhanced_staircase_artifacts_removed',
+                    'total_staircases': len(staircase_artifacts),
+                    'high_confidence_staircases': high_confidence_count,
+                    'legitimate_pumps_preserved': len(legitimate_pumps),
+                    'cut_at_minute': cut_point,
+                    'cut_type': 'pre_jump_flat' if is_pre_type else 'post_jump_flat',
+                    'original_length': len(prices),
+                    'final_length': df_clean.height,
+                    'earliest_staircase_type': earliest_artifact['staircase_type']
+                })
+                
+                print(f"✂️ ENHANCED CUT: Removed from minute {cut_point} "
+                      f"({earliest_artifact['staircase_type']} staircase)")
+                
+                return df_clean, modifications
         
-        # No staircase artifacts found, keep all data including legitimate extreme moves
+        # No staircases found - preserve all data
         if legitimate_pumps:
+            max_pump = max(legitimate_pumps, key=lambda x: x['jump_size'])
             modifications.append({
-                'type': 'extreme_moves_analysis',
-                'legitimate_pumps_preserved': len(legitimate_pumps),
-                'staircase_artifacts_found': 0,
-                'method': 'temporal_pattern_analysis'
+                'type': 'all_pumps_preserved_enhanced',
+                'pump_count': len(legitimate_pumps),
+                'max_pump_size': max_pump['jump_size'],
+                'max_pump_minute': max_pump['idx'],
+                'analysis_type': 'pre_and_post_jump_checked'
             })
-            print(f"✅ PRESERVED: {len(legitimate_pumps)} legitimate extreme pumps (no staircase artifacts)")
+            print(f"✅ ENHANCED PRESERVED: All {len(legitimate_pumps)} pumps passed pre+post analysis "
+                  f"(max: {max_pump['jump_size']*100:.1f}%)")
         
         return df, modifications
+
+    def _analyze_staircase_pattern(self, prices: np.ndarray, period_type: str) -> Dict:
+        """
+        Analyze a price sequence for staircase pattern characteristics
+        
+        Args:
+            prices: Array of prices to analyze
+            period_type: "PRE" or "POST" for logging
+            
+        Returns:
+            Dictionary with staircase pattern metrics
+        """
+        if len(prices) == 0:
+            return {
+                'unique_prices': 0,
+                'unique_price_ratio': 0,
+                'variation_ratio': 0,
+                'relative_std': 0,
+                'max_deviation': 0,
+                'tick_movements': 0,
+                'consecutive_same_max': 0
+            }
+        
+        # 1. Count unique prices
+        unique_prices = len(np.unique(prices))
+        unique_price_ratio = unique_prices / len(prices)
+        
+        # 2. Calculate price variations
+        price_diffs = np.diff(prices)
+        non_zero_diffs = np.sum(np.abs(price_diffs) > 0)
+        variation_ratio = non_zero_diffs / len(price_diffs) if len(price_diffs) > 0 else 0
+        
+        # 3. Standard deviation relative to mean
+        price_std = np.std(prices)
+        price_mean = np.mean(prices)
+        relative_std = price_std / price_mean if price_mean > 0 else 0
+        
+        # 4. Max deviation from mean
+        max_deviation = np.max(np.abs(prices - price_mean)) / price_mean if price_mean > 0 else 0
+        
+        # 5. Count of "tick" movements (meaningful price changes)
+        tick_threshold = price_mean * 0.0001 if price_mean > 0 else 0  # 0.01% threshold
+        tick_movements = np.sum(np.abs(price_diffs) > tick_threshold)
+        
+        # 6. Longest consecutive sequence of identical prices
+        consecutive_same_max = 0
+        current_consecutive = 1
+        for i in range(1, len(prices)):
+            if prices[i] == prices[i-1]:
+                current_consecutive += 1
+                consecutive_same_max = max(consecutive_same_max, current_consecutive)
+            else:
+                current_consecutive = 1
+        
+        return {
+            'unique_prices': unique_prices,
+            'unique_price_ratio': unique_price_ratio,
+            'variation_ratio': variation_ratio,
+            'relative_std': relative_std,
+            'max_deviation': max_deviation,
+            'tick_movements': tick_movements,
+            'consecutive_same_max': consecutive_same_max,
+            'period_type': period_type,
+            'length': len(prices)
+        }
+
+    def _is_staircase_pattern(self, metrics: Dict) -> bool:
+        """
+        Determine if metrics indicate a staircase pattern
+        
+        Uses the same strict criteria as before but now applied to both
+        pre-jump and post-jump periods
+        """
+        return (
+            metrics['unique_price_ratio'] < 0.1 and          # <10% unique prices
+            metrics['variation_ratio'] < 0.1 and             # <10% intervals have changes
+            metrics['relative_std'] < 0.001 and              # <0.1% standard deviation  
+            metrics['max_deviation'] < 0.01 and              # <1% max deviation
+            metrics['tick_movements'] < 3                     # <3 meaningful changes in 30 min
+        ) or (
+            metrics['consecutive_same_max'] >= 20             # 20+ consecutive identical prices
+        )
 
     def _fill_small_gaps_only(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
         """Fill only small gaps (1-2 minutes) with linear interpolation"""

@@ -3,7 +3,6 @@ LSTM Training Script for Memecoin Price Prediction
 Designed for category-aware cleaned data using Polars
 """
 
-import os
 import numpy as np
 import polars as pl
 import torch
@@ -12,8 +11,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 import plotly.graph_objects as go
 import plotly.subplots as sp
 from tqdm import tqdm
@@ -25,7 +23,6 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 try:
     from ML.utils.winsorizer import Winsorizer
-    from ML.utils.training_plots import plot_training_curves, create_learning_summary
     WINSORIZER_AVAILABLE = True
 except ImportError:
     WINSORIZER_AVAILABLE = False
@@ -174,9 +171,9 @@ class LSTMPredictor(nn.Module):
     
     def __init__(self, 
                  input_size: int = 1,
-                 hidden_size: int = 128,
+                 hidden_size: int = 16,
                  num_layers: int = 2,
-                 dropout: float = 0.3,
+                 dropout: float = 0.2,
                  forecast_horizon: int = 15):
         super().__init__()
         
@@ -324,7 +321,7 @@ def train_model(model: nn.Module,
 # ================== EVALUATION METRICS ==================
 def evaluate_model(model: nn.Module, 
                    test_loader: DataLoader,
-                   scaler: StandardScaler,
+                   scaler,  # Can be StandardScaler or Winsorizer
                    device: str = None):
     """Calculate trading-specific metrics including directional accuracy and financial metrics"""
     
@@ -452,68 +449,108 @@ def plot_training_history(train_losses: List[float], val_losses: List[float]) ->
 
 
 def plot_evaluation_metrics(metrics: Dict) -> go.Figure:
-    """Plot evaluation metrics as grouped bar chart"""
+    """Plot evaluation metrics with proper scale handling for regression and classification metrics"""
     
-    # Create subplots
+    # Create comprehensive subplots for different metric types
     fig = sp.make_subplots(
-        rows=1, cols=2,
-        subplot_titles=('Detection Performance', 'Pump Detection by Threshold'),
-        column_widths=[0.4, 0.6]
+        rows=2, cols=2,
+        subplot_titles=('Regression Metrics', 'Performance Metrics (R²)', 'Trading Performance', 'Financial Strategy'),
+        specs=[[{"secondary_y": False}, {"secondary_y": False}],
+               [{"secondary_y": False}, {"secondary_y": False}]]
     )
     
-    # Basic metrics
-    basic_metrics = ['direction_accuracy']
-    basic_values = [metrics.get(m, 0) for m in basic_metrics]
+    # 1. Regression metrics (MAE, MSE, RMSE) with log scale
+    regression_metrics = {}
+    if 'mae' in metrics:
+        regression_metrics['MAE'] = metrics['mae']
+    if 'mse' in metrics:
+        regression_metrics['MSE'] = metrics['mse']
+    if 'rmse' in metrics:
+        regression_metrics['RMSE'] = metrics['rmse']
     
-    fig.add_trace(
-        go.Bar(
-            x=['Direction\nAccuracy'],
-            y=basic_values,
-            text=[f'{v:.1%}' for v in basic_values],
-            textposition='auto',
-            marker_color='green' if basic_values[0] > 0.5 else 'orange'
-        ),
-        row=1, col=1
-    )
+    if regression_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(regression_metrics.keys()),
+                y=list(regression_metrics.values()),
+                text=[f'{v:.4f}' for v in regression_metrics.values()],
+                textposition='auto',
+                marker_color='lightblue',
+                name='Regression'
+            ),
+            row=1, col=1
+        )
+        fig.update_yaxes(type="log", row=1, col=1, title_text="Value (log scale)")
     
-    # Pump detection metrics
-    thresholds = ['50%', '2x', '5x']
-    precisions = [metrics.get(f'pump_{t}_precision', 0) for t in thresholds]
-    recalls = [metrics.get(f'pump_{t}_recall', 0) for t in thresholds]
+    # 2. Performance metrics (R²)
+    performance_metrics = {}
+    if 'r2_final_horizon' in metrics:
+        performance_metrics['R²'] = metrics['r2_final_horizon']
     
-    fig.add_trace(
-        go.Bar(
-            name='Precision',
-            x=thresholds,
-            y=precisions,
-            text=[f'{v:.1%}' for v in precisions],
-            textposition='auto',
-            marker_color='blue'
-        ),
-        row=1, col=2
-    )
+    if performance_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(performance_metrics.keys()),
+                y=list(performance_metrics.values()),
+                text=[f'{v:.3f}' for v in performance_metrics.values()],
+                textposition='auto',
+                marker_color='green' if performance_metrics.get('R²', 0) > 0 else 'orange',
+                name='Performance'
+            ),
+            row=1, col=2
+        )
+        fig.update_yaxes(row=1, col=2, title_text="R² Score")
     
-    fig.add_trace(
-        go.Bar(
-            name='Recall',
-            x=thresholds,
-            y=recalls,
-            text=[f'{v:.1%}' for v in recalls],
-            textposition='auto',
-            marker_color='red'
-        ),
-        row=1, col=2
-    )
+    # 3. Trading performance metrics
+    trading_metrics = {}
+    if 'direction_accuracy' in metrics:
+        trading_metrics['Direction Accuracy'] = metrics['direction_accuracy']
+    if 'strategy_win_rate' in metrics:
+        trading_metrics['Strategy Win Rate'] = metrics['strategy_win_rate']
+    
+    if trading_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(trading_metrics.keys()),
+                y=list(trading_metrics.values()),
+                text=[f'{v:.1%}' for v in trading_metrics.values()],
+                textposition='auto',
+                marker_color='darkgreen',
+                name='Trading'
+            ),
+            row=2, col=1
+        )
+        fig.update_yaxes(range=[0, 1], row=2, col=1, title_text="Accuracy/Rate")
+    
+    # 4. Financial strategy metrics
+    financial_metrics = {}
+    if 'strategy_avg_return' in metrics:
+        financial_metrics['Avg Strategy Return'] = metrics['strategy_avg_return']
+    if 'strategy_sharpe' in metrics:
+        financial_metrics['Strategy Sharpe'] = metrics['strategy_sharpe']
+    if 'mean_pred_return' in metrics:
+        financial_metrics['Mean Pred Return'] = metrics['mean_pred_return']
+    
+    if financial_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(financial_metrics.keys()),
+                y=list(financial_metrics.values()),
+                text=[f'{v:.3f}' for v in financial_metrics.values()],
+                textposition='auto',
+                marker_color='purple',
+                name='Financial'
+            ),
+            row=2, col=2
+        )
+        fig.update_yaxes(row=2, col=2, title_text="Return/Ratio")
     
     fig.update_layout(
-        title='Model Performance Metrics',
-        showlegend=True,
+        title='LSTM Forecasting Model Performance',
+        showlegend=False,
         template='plotly_white',
-        barmode='group'
+        height=600
     )
-    
-    fig.update_yaxes(range=[0, 1], row=1, col=1)
-    fig.update_yaxes(range=[0, 1], row=1, col=2)
     
     return fig
 
@@ -614,13 +651,13 @@ def main():
         
     # Use last fold as test, split remaining into train/val
     *train_val_folds, test_fold = global_splits
-    test_train_df, test_test_df = test_fold
+    _, test_test_df = test_fold
     all_test_data.append(test_test_df)
     
-        # Split train_val_folds into train and validation (80/20)
+    # Split train_val_folds into train and validation (80/20)
     n_train_folds = max(1, int(len(train_val_folds) * 0.8))
     
-    for i, (fold_train_df, fold_test_df) in enumerate(train_val_folds):
+    for i, (_, fold_test_df) in enumerate(train_val_folds):
         if i < n_train_folds:
             all_train_data.append(fold_test_df)  # Use 'test' part of fold for training
         else:
@@ -670,22 +707,23 @@ def main():
     # Create datasets
     print("\nCreating LSTM forecasting datasets...")
     
-    # Shared scaler for consistent normalization
-    scaler = StandardScaler()
-    
+    # First create train dataset with Winsorizer (or StandardScaler if not available)
     train_dataset = MemecoinDataset(
         train_paths, 
         lookback=60, 
         forecast_horizon=15,
-        scaler=scaler,
+        scaler=None,  # Let dataset choose Winsorizer or StandardScaler
         use_winsorizer=True
     )
+    
+    # Get the fitted scaler from train dataset for consistency across val/test
+    fitted_scaler = train_dataset.scaler
     
     val_dataset = MemecoinDataset(
         val_paths, 
         lookback=60, 
         forecast_horizon=15,
-        scaler=scaler,
+        scaler=fitted_scaler,  # Use same scaler as training
         use_winsorizer=True
     )
     
@@ -693,7 +731,7 @@ def main():
         test_paths, 
         lookback=60, 
         forecast_horizon=15,
-        scaler=scaler,
+        scaler=fitted_scaler,  # Use same scaler as training
         use_winsorizer=True
     )
     
@@ -715,8 +753,8 @@ def main():
     # Create model
     model = LSTMPredictor(
         input_size=1,
-        hidden_size=128,
-        num_layers=3,
+        hidden_size=16,
+        num_layers=1,
         dropout=0.2,
         forecast_horizon=15
     ).to(device)
@@ -732,7 +770,7 @@ def main():
     
     # Evaluation
     print("\nEvaluating on test set (walk-forward)...")
-    metrics = evaluate_model(model, test_loader, scaler, device)
+    metrics = evaluate_model(model, test_loader, fitted_scaler, device)
     
     # Print results
     print("\n" + "="*60)
@@ -760,7 +798,7 @@ def main():
     model_path = results_dir / 'lstm_model_walkforward.pth'
     torch.save({
         'model_state_dict': model.state_dict(),
-        'scaler': scaler,
+        'scaler': fitted_scaler,
         'model_config': {
             'input_size': 1,
             'hidden_size': 128,

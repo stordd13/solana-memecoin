@@ -839,7 +839,9 @@ def save_features_to_files(features_dict: Dict[str, Dict],
                     # Save ML-safe features
                     safe_features_df = pl.DataFrame(ml_safe_features)
                     output_path = category_dir / f"{token_name}_features.parquet"
-                    safe_features_df.write_parquet(output_path)
+                    safe_features_df.write_parquet(output_path,
+                                                   compression="zstd", 
+                                                   compression_level=3)
                     saved_count += 1
                 
         except Exception as e:
@@ -1212,7 +1214,9 @@ def main(fast_mode: bool = False):
                 category_dir = output_dir / category
                 category_dir.mkdir(parents=True, exist_ok=True)
                 out_path = category_dir / f"{token_name}.parquet"
-                rolling_df.write_parquet(out_path)
+                rolling_df.write_parquet(out_path,
+                                         compression="zstd", 
+                                         compression_level=3)
                 saved += 1
                 category_counts[category] = category_counts.get(category, 0) + 1
             except Exception as e:
@@ -1259,7 +1263,8 @@ def main(fast_mode: bool = False):
                 category_dir = output_dir / category
                 category_dir.mkdir(parents=True, exist_ok=True)
                 out_path = category_dir / f"{token_name}.parquet"
-                rolling_df.write_parquet(out_path)
+                rolling_df.write_parquet(out_path, compression="zstd", 
+                                         compression_level=3)
                 saved += 1
                 category_counts[category] = category_counts.get(category, 0) + 1
             except Exception as e:

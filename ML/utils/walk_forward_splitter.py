@@ -359,9 +359,11 @@ class WalkForwardSplitter:
         """
         Smart split that automatically adapts to memecoin data characteristics.
         
+        ENHANCED: Properly handles long horizons (240min+) by ensuring adequate buffer
         - Uses adaptive horizon buffer based on data length
-        - Filters horizons to only feasible ones
+        - Filters horizons to only feasible ones  
         - Uses memecoin-appropriate configurations
+        - CRITICAL: Ensures test splits have enough future data for label creation
         
         Args:
             data: Polars DataFrame
@@ -373,28 +375,76 @@ class WalkForwardSplitter:
         """
         data_length = len(data)
         
-        # Get adaptive horizon buffer
-        adaptive_buffer = self.get_adaptive_horizon_buffer(data_length, max(horizons))
+        # ENHANCED: More conservative feasibility check for long horizons
+        # Need at least 400 minutes PLUS the horizon for meaningful splits
+        min_required_length = 400 + max(horizons)
         
-        # Get feasible horizons
-        feasible_horizons = self.get_available_horizons(data_length, horizons)
+        if data_length < min_required_length:
+            print(f"⚠️  Data too short for horizons {horizons}")
+            print(f"   Required: {min_required_length} min, Available: {data_length} min")
+            # Try with shorter horizons only
+            feasible_horizons = [h for h in horizons if data_length >= 400 + h]
+            if not feasible_horizons:
+                return [], []
+        else:
+            feasible_horizons = horizons
         
-        if not feasible_horizons:
-            print(f"⚠️  No feasible horizons for {data_length}-minute token!")
-            return [], []
+        # ENHANCED: Conservative buffer calculation for long horizons
+        max_feasible_horizon = max(feasible_horizons)
         
-        print(f"📊 Token length: {data_length} minutes")
-        print(f"🎯 Feasible horizons: {feasible_horizons} (filtered from {horizons})")
-        print(f"🛡️  Adaptive buffer: {adaptive_buffer} minutes (instead of {max(horizons)})")
+        # For very long horizons (240min+), use the horizon itself + safety margin
+        if max_feasible_horizon >= 240:
+            adaptive_buffer = max_feasible_horizon + 60  # Horizon + 1 hour safety
+        else:
+            adaptive_buffer = self.get_adaptive_horizon_buffer(data_length, max_feasible_horizon)
+        
+        # Ensure we don't use more than 30% of data as buffer
+        max_buffer = int(data_length * 0.3)
+        adaptive_buffer = min(adaptive_buffer, max_buffer)
+        
+        # Final feasibility check after buffer calculation
+        effective_data_length = data_length - adaptive_buffer
+        if effective_data_length < 400:
+            print(f"⚠️  Data too short after buffer ({effective_data_length} min available)")
+            # Try again with shorter horizons
+            shorter_horizons = [h for h in horizons if h <= 120]  # Only up to 2h
+            if shorter_horizons:
+                return self.smart_split_for_memecoins(data, shorter_horizons, time_column)
+            else:
+                return [], []
+        
+        print(f"📊 Global data length: {data_length} minutes")
+        print(f"🎯 Feasible horizons: {feasible_horizons} (from {horizons})")
+        print(f"🛡️  Buffer for max horizon {max_feasible_horizon}min: {adaptive_buffer} min")
+        print(f"📏 Effective data for splitting: {effective_data_length} min")
         
         # Temporarily override horizon buffer
         original_buffer = self.horizon_buffer
         self.horizon_buffer = adaptive_buffer
         
         try:
-            # Get splits with adaptive buffer
+            # Get splits with enhanced buffer
             splits = self.get_global_splits(data, time_column)
-            return splits, feasible_horizons
+            
+            # VALIDATION: Check that splits have enough future data
+            validated_splits = []
+            for i, (train_df, test_df) in enumerate(splits):
+                # Check if test split has enough future data for max horizon
+                if len(test_df) > 0:
+                    test_end_time = test_df[time_column].max()
+                    data_end_time = data[time_column].max()
+                    remaining_minutes = (data_end_time - test_end_time).total_seconds() / 60
+                    
+                    if remaining_minutes >= max_feasible_horizon:
+                        validated_splits.append((train_df, test_df))
+                        print(f"✅ Fold {i+1}: Test has {remaining_minutes:.0f}min future data (≥{max_feasible_horizon}min required)")
+                    else:
+                        print(f"❌ Fold {i+1}: Insufficient future data ({remaining_minutes:.0f}min < {max_feasible_horizon}min)")
+            
+            print(f"📈 Validated {len(validated_splits)}/{len(splits)} folds with sufficient future data")
+            
+            return validated_splits, feasible_horizons
+            
         finally:
             # Restore original buffer
             self.horizon_buffer = original_buffer
