@@ -338,7 +338,7 @@ def main():
                 continue
 
             model = LogisticRegression(
-                max_iter=500,
+                max_iter=300,
                 n_jobs=-1,
                 random_state=CONFIG['random_state'],
                 class_weight='balanced',

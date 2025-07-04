@@ -38,7 +38,11 @@ class CategoryAwareTokenCleaner:
             'gentle': self._gentle_cleaning,
             'minimal': self._minimal_cleaning, 
             'preserve': self._preserve_extremes_cleaning,
-            'aggressive': self._aggressive_cleaning
+            'aggressive': self._aggressive_cleaning,
+            # NEW: Graduated cleaning strategies for different time horizons
+            'short_term': self._short_term_cleaning,
+            'medium_term': self._medium_term_cleaning,
+            'long_term': self._long_term_cleaning
         }
         
         # REFACTORED: More lenient thresholds for memecoin data
@@ -57,6 +61,40 @@ class CategoryAwareTokenCleaner:
             'max_realistic_dump': 0.99,         # 99% dumps can be real (was 0.95)
             'sustained_movement_minutes': 3,    # Real movements last >3 minutes (unchanged)
             'volume_confirmation_ratio': 0.1    # Volume should support price moves (unchanged)
+        }
+        
+        # NEW: Graduated cleaning thresholds for different time horizons
+        self.graduated_thresholds = {
+            'short_term': {  # For 15m-60m predictions - VERY lenient
+                'staircase_unique_ratio': 0.05,      # <5% unique prices (was 0.1)
+                'staircase_variation_ratio': 0.05,   # <5% price changes (was 0.1)
+                'staircase_relative_std': 0.0005,    # <0.05% std dev (was 0.001)
+                'staircase_tick_movements': 2,       # <2 meaningful changes (was 3)
+                'consecutive_same_threshold': 25,    # 25+ consecutive same (was 20)
+                'straight_line_unique_ratio': 0.005, # <0.5% unique prices (was 0.01)
+                'straight_line_change_ratio': 0.02,  # <2% changes (was 0.05)
+                'straight_line_consecutive': 0.9     # >90% consecutive same (was 0.8)
+            },
+            'medium_term': {  # For 120m-360m predictions - moderate
+                'staircase_unique_ratio': 0.1,       # <10% unique prices (current)
+                'staircase_variation_ratio': 0.1,    # <10% price changes (current)
+                'staircase_relative_std': 0.001,     # <0.1% std dev (current)
+                'staircase_tick_movements': 3,       # <3 meaningful changes (current)
+                'consecutive_same_threshold': 20,    # 20+ consecutive same (current)
+                'straight_line_unique_ratio': 0.01,  # <1% unique prices (current)
+                'straight_line_change_ratio': 0.05,  # <5% changes (current)
+                'straight_line_consecutive': 0.8     # >80% consecutive same (current)
+            },
+            'long_term': {  # For 720m+ predictions - strict
+                'staircase_unique_ratio': 0.15,      # <15% unique prices (more strict)
+                'staircase_variation_ratio': 0.15,   # <15% price changes (more strict)
+                'staircase_relative_std': 0.002,     # <0.2% std dev (more strict)
+                'staircase_tick_movements': 5,       # <5 meaningful changes (more strict)
+                'consecutive_same_threshold': 15,    # 15+ consecutive same (more strict)
+                'straight_line_unique_ratio': 0.02,  # <2% unique prices (more strict)
+                'straight_line_change_ratio': 0.1,   # <10% changes (more strict)
+                'straight_line_consecutive': 0.7     # >70% consecutive same (more strict)
+            }
         }
 
     def clean_token_file(self, token_path: Path, category: str) -> Dict:
@@ -101,7 +139,7 @@ class CategoryAwareTokenCleaner:
                 })
             
             # UNIVERSAL DATA QUALITY CHECKS (apply to ALL tokens regardless of category)
-            df, universal_mods = self._universal_data_quality_checks(df, token_name)
+            df, universal_mods = self._universal_data_quality_checks_graduated(df, token_name, 'medium_term')
             if universal_mods:
                 modifications.extend(universal_mods)
             
@@ -302,23 +340,18 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
-    def _universal_data_quality_checks(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+    def _universal_data_quality_checks_graduated(self, df: pl.DataFrame, token_name: str, time_horizon: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
-        Universal data quality checks that apply to ALL tokens regardless of category.
-        These catch fundamental data corruption issues that affect model training.
-        
-        Checks:
-        1. Remove constant death periods (ALL categories need this)
-        2. Detect and remove staircase artifacts (vertical + horizontal patterns)
-        3. Remove tokens with extreme price ratios (>50,000x likely data errors)
-        4. Handle NaN values and infinite prices
-        5. Remove tokens that are too short after cleaning
+        Universal data quality checks with graduated thresholds based on time horizon
         """
         modifications = []
         original_length = df.height
         
         if original_length < 60:  # Less than 1 hour of data
             return None, [{'type': 'excluded_too_short', 'original_length': original_length}]
+        
+        # Get thresholds for this time horizon
+        thresholds = self.graduated_thresholds[time_horizon]
         
         # 1. Remove NaN and infinite values FIRST
         df, nan_mods = self._handle_nan_and_infinite_values(df)
@@ -336,7 +369,7 @@ class CategoryAwareTokenCleaner:
         if df.height < 30:
             return None, modifications + [{'type': 'excluded_mostly_death_period'}]
         
-        # 3. Check for extreme price ratios (likely data corruption)
+        # 3. Check for extreme price ratios (graduated thresholds)
         prices = df['price'].to_numpy()
         if len(prices) > 0:
             finite_prices = prices[np.isfinite(prices)]
@@ -345,59 +378,38 @@ class CategoryAwareTokenCleaner:
                 max_price = np.max(finite_prices)
                 if min_price > 0:
                     price_ratio = max_price / min_price
-                    # REFACTORED: Allow extreme ratios for memecoins (up to 10,000,000x)
-                    # Only flag if it's clearly impossible (>10,000,000x is suspicious)
-                    if price_ratio > 10000000:  # 10,000,000x price ratio threshold
+                    # Use different thresholds based on time horizon
+                    if time_horizon == 'short_term':
+                        ratio_threshold = 50000000  # 50M x - very lenient
+                    elif time_horizon == 'medium_term':
+                        ratio_threshold = 10000000  # 10M x - current
+                    else:  # long_term
+                        ratio_threshold = 1000000   # 1M x - more strict
+                    
+                    if price_ratio > ratio_threshold:
                         return None, modifications + [{
                             'type': 'excluded_extreme_price_ratio',
                             'price_ratio': price_ratio,
-                            'min_price': min_price,
-                            'max_price': max_price,
-                            'reason': 'Price ratio >10,000,000x suggests data corruption'
+                            'threshold': ratio_threshold,
+                            'time_horizon': time_horizon,
+                            'reason': f'Price ratio >{ratio_threshold:,}x suggests data corruption'
                         }]
-                    elif price_ratio > 1000000:
-                        # Log but don't exclude - these can be legitimate
-                        print(f"🚀 EXTREME RATIO: {token_name} - {price_ratio:.0f}x (min: {min_price:.10f}, max: {max_price:.2f})")
-                        modifications.append({
-                            'type': 'extreme_ratio_noted',
-                            'price_ratio': price_ratio,
-                            'action': 'preserved'
-                        })
         
-        # 4. Detect and remove staircase artifacts
-        df, staircase_mods = self._detect_and_remove_staircase_artifacts(df, token_name)
+        # 4. Detect and remove staircase artifacts with graduated thresholds
+        df, staircase_mods = self._detect_and_remove_staircase_artifacts_graduated(df, token_name, time_horizon)
         if staircase_mods:
             modifications.extend(staircase_mods)
         
         if df is None or df.height < 30:
             return None, modifications + [{'type': 'excluded_staircase_artifact'}]
         
-        # 5. Additional check for extreme returns in remaining data
-        if df.height > 0:
-            returns = df['returns'].to_numpy()
-            finite_returns = returns[np.isfinite(returns)]
-            if len(finite_returns) > 0:
-                max_abs_return = np.max(np.abs(finite_returns))
-                if max_abs_return > 1000:  # >100,000% return is unrealistic
-                    return None, modifications + [{
-                        'type': 'excluded_extreme_returns',
-                        'max_return': max_abs_return
-                    }]
-
-        # 6. Check price variability to filter "straight line" tokens
-        df, variability_mods = self._check_price_variability(df, token_name)
+        # 5. Check price variability with graduated thresholds
+        df, variability_mods = self._check_price_variability_graduated(df, token_name, time_horizon)
         if variability_mods:
             modifications.extend(variability_mods)
         
         if df is None:
-            return None, modifications + [{'type': 'excluded_low_variability'}]
-
-        # 7. Final length check
-        if df.height < 60:  # After all cleaning, ensure minimum viable length
-            return None, modifications + [{'type': 'excluded_too_short_after_cleaning', 'final_length': df.height}]
-        
-        if len(modifications) > 0:
-            print(f"🧹 UNIVERSAL: {token_name} - Applied {len(modifications)} universal quality fixes")
+            return None, modifications + [{'type': 'excluded_insufficient_variability'}]
         
         return df, modifications
 
@@ -423,7 +435,7 @@ class CategoryAwareTokenCleaner:
         
         return df_clean, modifications
 
-    def _check_price_variability(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+    def _check_price_variability_graduated(self, df: pl.DataFrame, token_name: str, time_horizon: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         REFACTORED: Focus on detecting truly flat "straight line" tokens.
         Real tokens have natural price variations - preserve those!
@@ -433,6 +445,9 @@ class CategoryAwareTokenCleaner:
         
         if len(prices) < 30:
             return df, modifications
+        
+        # Get thresholds for this time horizon
+        thresholds = self.graduated_thresholds[time_horizon]
         
         # Key insight: Real tokens have price ticks/changes, dead lines don't
         
@@ -482,9 +497,9 @@ class CategoryAwareTokenCleaner:
         
         # REFACTORED CRITERIA: Only filter truly dead/straight line tokens
         is_straight_line = (
-            unique_ratio < 0.01 and                    # <1% unique prices (very strict)
-            change_ratio < 0.05 and                    # <5% of time prices change
-            max_consecutive_same > len(prices) * 0.8   # >80% consecutive same prices
+            unique_ratio < thresholds['straight_line_unique_ratio'] and
+            change_ratio < thresholds['straight_line_change_ratio'] and
+            max_consecutive_same > len(prices) * thresholds['straight_line_consecutive']
         ) or (
             unique_prices <= 3 and                     # 3 or fewer unique prices total
             activity_ratio < 0.1                       # <10% of windows show activity
@@ -546,7 +561,7 @@ class CategoryAwareTokenCleaner:
             }]
         else:
             # Token has acceptable variability
-            if unique_ratio < 0.1:  # Low but not too low
+            if unique_ratio < thresholds['straight_line_unique_ratio']:  # Low but not too low
                 print(f"⚠️  LOW VAR (kept): {token_name} - {unique_prices} unique prices, "
                       f"but {change_ratio:.1%} changes")
             
@@ -557,7 +572,7 @@ class CategoryAwareTokenCleaner:
         
         return df, modifications
 
-    def _detect_and_remove_staircase_artifacts(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+    def _detect_and_remove_staircase_artifacts_graduated(self, df: pl.DataFrame, token_name: str, time_horizon: str) -> Tuple[pl.DataFrame, List[Dict]]:
         """
         REFACTORED: Detect TRUE staircase artifacts only.
         Uses the same enhanced logic as _fix_extreme_data_corruption for consistency.
@@ -592,8 +607,8 @@ class CategoryAwareTokenCleaner:
                 post_metrics = self._analyze_staircase_pattern(post_jump_prices, "POST")
                 
                 # Check if either side shows staircase pattern
-                is_pre_staircase = self._is_staircase_pattern(pre_metrics)
-                is_post_staircase = self._is_staircase_pattern(post_metrics)
+                is_pre_staircase = self._is_staircase_pattern_graduated(pre_metrics, time_horizon)
+                is_post_staircase = self._is_staircase_pattern_graduated(post_metrics, time_horizon)
                 
                 is_definitive_staircase = is_pre_staircase or is_post_staircase
                 
@@ -649,7 +664,7 @@ class CategoryAwareTokenCleaner:
             high_confidence_count = sum(1 for d in staircase_details if d['is_high_confidence'])
             
             modifications.append({
-                'type': 'enhanced_staircase_artifacts_removed_universal',
+                'type': 'enhanced_staircase_artifacts_removed',
                 'total_artifacts': artifacts_found,
                 'high_confidence_artifacts': high_confidence_count,
                 'cut_at_minute': cut_point,
@@ -660,7 +675,7 @@ class CategoryAwareTokenCleaner:
                 'reason': 'Enhanced pre+post jump staircase pattern detected'
             })
             
-            print(f"✂️ ENHANCED UNIVERSAL CUT: {token_name} - Removed from minute {cut_point} "
+            print(f"✂️ ENHANCED CUT: Removed from minute {cut_point} "
                   f"({earliest_details['staircase_type']} pattern)")
             
             return df_clean, modifications
@@ -881,8 +896,8 @@ class CategoryAwareTokenCleaner:
                 post_staircase_metrics = self._analyze_staircase_pattern(post_jump_prices, "POST")
                 
                 # Determine if this is a staircase artifact
-                is_pre_staircase = self._is_staircase_pattern(pre_staircase_metrics)
-                is_post_staircase = self._is_staircase_pattern(post_staircase_metrics)
+                is_pre_staircase = self._is_staircase_pattern_graduated(pre_staircase_metrics, 'medium_term')
+                is_post_staircase = self._is_staircase_pattern_graduated(post_staircase_metrics, 'medium_term')
                 
                 # If EITHER side shows staircase pattern → artifact
                 is_staircase_artifact = is_pre_staircase or is_post_staircase
@@ -1061,21 +1076,19 @@ class CategoryAwareTokenCleaner:
             'length': len(prices)
         }
 
-    def _is_staircase_pattern(self, metrics: Dict) -> bool:
+    def _is_staircase_pattern_graduated(self, metrics: Dict, time_horizon: str) -> bool:
         """
-        Determine if metrics indicate a staircase pattern
+        Determine if metrics indicate a staircase pattern using graduated thresholds
+        """
+        thresholds = self.graduated_thresholds[time_horizon]
         
-        Uses the same strict criteria as before but now applied to both
-        pre-jump and post-jump periods
-        """
         return (
-            metrics['unique_price_ratio'] < 0.1 and          # <10% unique prices
-            metrics['variation_ratio'] < 0.1 and             # <10% intervals have changes
-            metrics['relative_std'] < 0.001 and              # <0.1% standard deviation  
-            metrics['max_deviation'] < 0.01 and              # <1% max deviation
-            metrics['tick_movements'] < 3                     # <3 meaningful changes in 30 min
+            metrics['unique_price_ratio'] < thresholds['staircase_unique_ratio'] and
+            metrics['variation_ratio'] < thresholds['staircase_variation_ratio'] and
+            metrics['relative_std'] < thresholds['staircase_relative_std'] and
+            metrics['tick_movements'] < thresholds['staircase_tick_movements']
         ) or (
-            metrics['consecutive_same_max'] >= 20             # 20+ consecutive identical prices
+            metrics['consecutive_same_max'] >= thresholds['consecutive_same_threshold']
         )
 
     def _fill_small_gaps_only(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
@@ -1247,6 +1260,365 @@ class CategoryAwareTokenCleaner:
             'type': 'impossible_values_fixed',
             'count': impossible_count
         })
+        
+        return df, modifications
+
+    def _short_term_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        SHORT-TERM cleaning strategy for 15m-60m predictions
+        - Very lenient on staircase detection to preserve micro-patterns
+        - Only removes the most obvious artifacts
+        - Preserves short-term volatility and noise
+        """
+        modifications = []
+        
+        # 1. Universal data quality checks with SHORT-TERM thresholds
+        df, universal_mods = self._universal_data_quality_checks_graduated(df, token_name, 'short_term')
+        if universal_mods:
+            modifications.extend(universal_mods)
+        
+        if df is None:
+            return None, modifications
+        
+        # 2. VERY minimal artifact removal - only obvious listing artifacts
+        df, artifact_mods = self._remove_listing_artifacts_minimal(df)
+        if artifact_mods:
+            modifications.extend(artifact_mods)
+        
+        # 3. Skip most pattern-based cleaning to preserve short-term patterns
+        # Only remove truly impossible data errors (>10,000,000% moves)
+        df, error_mods = self._fix_data_errors_minimal(df)
+        if error_mods:
+            modifications.extend(error_mods)
+        
+        # 4. Skip gap filling for short-term (gaps might be meaningful)
+        
+        modifications.append({
+            'type': 'short_term_cleaning_applied',
+            'strategy': 'preserve_micro_patterns',
+            'final_length': df.height if df is not None else 0
+        })
+        
+        return df, modifications
+    
+    def _medium_term_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        MEDIUM-TERM cleaning strategy for 120m-360m predictions
+        - Balanced approach (current conservative strategy)
+        - Good for trend-following models
+        """
+        modifications = []
+        
+        # Use current conservative cleaning approach
+        df, universal_mods = self._universal_data_quality_checks_graduated(df, token_name, 'medium_term')
+        if universal_mods:
+            modifications.extend(universal_mods)
+        
+        if df is None:
+            return None, modifications
+        
+        # Apply current cleaning steps
+        df, artifact_mods = self._remove_listing_artifacts(df)
+        if artifact_mods:
+            modifications.extend(artifact_mods)
+        
+        df, error_mods = self._fix_data_errors(df)
+        if error_mods:
+            modifications.extend(error_mods)
+        
+        df, corruption_mods = self._fix_extreme_data_corruption(df)
+        if corruption_mods:
+            modifications.extend(corruption_mods)
+        
+        # Small gap filling for medium-term
+        df, gap_mods = self._fill_small_gaps_only(df)
+        if gap_mods:
+            modifications.extend(gap_mods)
+        
+        modifications.append({
+            'type': 'medium_term_cleaning_applied',
+            'strategy': 'balanced_trend_focus',
+            'final_length': df.height if df is not None else 0
+        })
+        
+        return df, modifications
+    
+    def _long_term_cleaning(self, df: pl.DataFrame, token_name: str) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        LONG-TERM cleaning strategy for 720m+ predictions
+        - Most aggressive cleaning to focus on major trends
+        - Removes more noise and short-term artifacts
+        """
+        modifications = []
+        
+        # 1. Universal data quality checks with LONG-TERM thresholds
+        df, universal_mods = self._universal_data_quality_checks_graduated(df, token_name, 'long_term')
+        if universal_mods:
+            modifications.extend(universal_mods)
+        
+        if df is None:
+            return None, modifications
+        
+        # 2. Aggressive artifact removal
+        df, artifact_mods = self._remove_listing_artifacts_aggressive(df)
+        if artifact_mods:
+            modifications.extend(artifact_mods)
+        
+        # 3. More aggressive error correction
+        df, error_mods = self._fix_data_errors_aggressive(df)
+        if error_mods:
+            modifications.extend(error_mods)
+        
+        # 4. Aggressive corruption removal
+        df, corruption_mods = self._fix_extreme_data_corruption_aggressive(df)
+        if corruption_mods:
+            modifications.extend(corruption_mods)
+        
+        # 5. More comprehensive gap filling
+        df, gap_mods = self._fill_gaps_comprehensive(df)
+        if gap_mods:
+            modifications.extend(gap_mods)
+        
+        modifications.append({
+            'type': 'long_term_cleaning_applied',
+            'strategy': 'aggressive_trend_focus',
+            'final_length': df.height if df is not None else 0
+        })
+        
+        return df, modifications
+
+    def _remove_listing_artifacts_minimal(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Minimal listing artifact removal - only the most obvious ones
+        """
+        modifications = []
+        
+        if df.height < 5:
+            return df, modifications
+        
+        # Sort by datetime
+        df = df.sort('datetime')
+        
+        # Calculate returns
+        df = df.with_columns([
+            pl.col('price').pct_change().alias('returns')
+        ])
+        
+        # Only remove extreme initial spikes >200x median followed by >99.5% crash
+        median_price = df.select(pl.col('price').median()).item()
+        
+        # Look for initial spikes >200x median in first 5 minutes only
+        first_5_rows = df.head(5)
+        spike_mask = first_5_rows['price'] > (median_price * 200)  # More lenient threshold
+        
+        if spike_mask.any():
+            spike_indices = first_5_rows.with_row_count().filter(spike_mask)['row_nr'].to_list()
+            
+            for spike_idx in spike_indices:
+                if spike_idx < df.height - 2:
+                    spike_price = df.row(spike_idx, named=True)['price']
+                    next_prices = df.slice(spike_idx+1, 2)['price']
+                    
+                    # Only remove if >99.5% drop (more strict)
+                    min_after_spike = next_prices.min()
+                    if min_after_spike < spike_price * 0.005:  # 99.5% drop
+                        spike_datetime = df.row(spike_idx, named=True)['datetime']
+                        df = df.filter(pl.col('datetime') != spike_datetime)
+                        modifications.append({
+                            'type': 'minimal_listing_artifact_removed',
+                            'index': spike_idx,
+                            'price': spike_price,
+                            'reason': 'extreme_spike_followed_by_995_crash'
+                        })
+        
+        return df, modifications
+
+    def _fix_data_errors_minimal(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Minimal data error fixing - only truly impossible values
+        """
+        modifications = []
+        
+        # Only flag returns >10,000,000% (100,000x) as impossible
+        error_threshold = 100000  # 10,000,000%
+        
+        if 'returns' not in df.columns:
+            df = df.with_columns([
+                pl.col('price').pct_change().alias('returns')
+            ])
+        
+        # Find extreme returns
+        extreme_returns = df.filter(pl.col('returns').abs() > error_threshold)
+        
+        if extreme_returns.height > 0:
+            error_indices = extreme_returns.with_row_count()['row_nr'].to_list()
+            
+            modifications.append({
+                'type': 'extreme_returns_detected_minimal',
+                'count': len(error_indices),
+                'threshold_used': error_threshold,
+                'action': 'flagged_only',
+                'reason': 'Only truly impossible moves flagged'
+            })
+            
+            print(f"🚨 MINIMAL: Found {len(error_indices)} extreme moves >{error_threshold*100}% but keeping them")
+        
+        return df, modifications
+
+    def _remove_listing_artifacts_aggressive(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Aggressive listing artifact removal for long-term models
+        """
+        modifications = []
+        
+        if df.height < 10:
+            return df, modifications
+        
+        # Sort by datetime
+        df = df.sort('datetime')
+        
+        # Calculate returns
+        df = df.with_columns([
+            pl.col('price').pct_change().alias('returns')
+        ])
+        
+        # Remove spikes >10x median in first 20 minutes
+        median_price = df.select(pl.col('price').median()).item()
+        
+        first_20_rows = df.head(20)
+        spike_mask = first_20_rows['price'] > (median_price * 10)  # More aggressive
+        
+        if spike_mask.any():
+            spike_indices = first_20_rows.with_row_count().filter(spike_mask)['row_nr'].to_list()
+            
+            for spike_idx in spike_indices:
+                if spike_idx < df.height - 5:
+                    spike_price = df.row(spike_idx, named=True)['price']
+                    next_prices = df.slice(spike_idx+1, 5)['price']
+                    
+                    # Remove if >90% drop (more lenient)
+                    min_after_spike = next_prices.min()
+                    if min_after_spike < spike_price * 0.1:  # 90% drop
+                        spike_datetime = df.row(spike_idx, named=True)['datetime']
+                        df = df.filter(pl.col('datetime') != spike_datetime)
+                        modifications.append({
+                            'type': 'aggressive_listing_artifact_removed',
+                            'index': spike_idx,
+                            'price': spike_price,
+                            'reason': 'spike_followed_by_90_drop'
+                        })
+        
+        return df, modifications
+
+    def _fix_data_errors_aggressive(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Aggressive data error fixing for long-term models
+        """
+        modifications = []
+        
+        # Lower threshold for long-term models
+        error_threshold = 100  # 10,000%
+        
+        if 'returns' not in df.columns:
+            df = df.with_columns([
+                pl.col('price').pct_change().alias('returns')
+            ])
+        
+        # Find extreme returns
+        extreme_returns = df.filter(pl.col('returns').abs() > error_threshold)
+        
+        if extreme_returns.height > 0:
+            error_indices = extreme_returns.with_row_count()['row_nr'].to_list()
+            
+            # For long-term models, interpolate these values
+            for idx in error_indices:
+                if idx > 0 and idx < df.height - 1:
+                    # Linear interpolation
+                    prev_price = df.row(idx-1, named=True)['price']
+                    next_price = df.row(idx+1, named=True)['price']
+                    interpolated_price = (prev_price + next_price) / 2
+                    
+                    # Update the price
+                    df = df.with_columns([
+                        pl.when(pl.col('datetime') == df.row(idx, named=True)['datetime'])
+                        .then(interpolated_price)
+                        .otherwise(pl.col('price'))
+                        .alias('price')
+                    ])
+            
+            modifications.append({
+                'type': 'extreme_returns_interpolated_aggressive',
+                'count': len(error_indices),
+                'threshold_used': error_threshold,
+                'action': 'interpolated',
+                'reason': 'Aggressive smoothing for long-term trends'
+            })
+            
+            print(f"🔧 AGGRESSIVE: Interpolated {len(error_indices)} extreme moves >{error_threshold*100}%")
+        
+        return df, modifications
+
+    def _fix_extreme_data_corruption_aggressive(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, List[Dict]]:
+        """
+        Aggressive corruption removal for long-term models
+        """
+        modifications = []
+        
+        if df.height < 60:
+            return df, modifications
+        
+        # Calculate returns if not present
+        if 'returns' not in df.columns:
+            df = df.with_columns([
+                pl.col('price').pct_change().alias('returns')
+            ])
+        
+        # Convert to numpy for analysis
+        prices = df['price'].to_numpy()
+        returns = df['returns'].to_numpy()
+        
+        # Find jump points (>50% in one minute - more aggressive)
+        jump_threshold = 0.5  # 50%
+        jump_indices = np.where(returns > jump_threshold)[0]
+        
+        staircase_artifacts = []
+        
+        for idx in jump_indices:
+            if idx >= 30 and idx < len(returns) - 30:
+                pre_jump_prices = prices[idx-30:idx]
+                post_jump_prices = prices[idx+1:idx+31]
+                
+                pre_staircase_metrics = self._analyze_staircase_pattern(pre_jump_prices, "PRE")
+                post_staircase_metrics = self._analyze_staircase_pattern(post_jump_prices, "POST")
+                
+                # More aggressive staircase detection
+                is_pre_staircase = self._is_staircase_pattern_graduated(pre_staircase_metrics, 'long_term')
+                is_post_staircase = self._is_staircase_pattern_graduated(post_staircase_metrics, 'long_term')
+                
+                if is_pre_staircase or is_post_staircase:
+                    staircase_artifacts.append({
+                        'idx': idx,
+                        'jump_size': returns[idx],
+                        'is_pre': is_pre_staircase,
+                        'is_post': is_post_staircase
+                    })
+        
+        if staircase_artifacts:
+            # Cut at earliest staircase
+            earliest_idx = min(artifact['idx'] for artifact in staircase_artifacts)
+            df_clean = df.head(earliest_idx + 1)
+            
+            modifications.append({
+                'type': 'aggressive_staircase_artifacts_removed',
+                'total_staircases': len(staircase_artifacts),
+                'cut_at_minute': earliest_idx,
+                'original_length': len(prices),
+                'final_length': df_clean.height
+            })
+            
+            print(f"✂️ AGGRESSIVE CUT: Removed from minute {earliest_idx}")
+            
+            return df_clean, modifications
         
         return df, modifications
 
