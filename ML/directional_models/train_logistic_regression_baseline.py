@@ -343,7 +343,7 @@ def main():
                 random_state=CONFIG['random_state'],
                 class_weight='balanced',
                 solver='liblinear',
-                penalty='l1',
+                penalty='l2',
                 C=0.1,
                 tol=1e-4
             )

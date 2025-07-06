@@ -622,7 +622,7 @@ def main():
     
     if not all_paths:
         print("ERROR: No feature files found!")
-        return
+        return  
     
     print(f"\nTotal files: {len(all_paths)}")
     

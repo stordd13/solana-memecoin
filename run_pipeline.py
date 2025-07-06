@@ -30,8 +30,7 @@ import polars as pl
 
 # Data folders you want to include under data/raw/
 RAW_SUBFOLDERS = [
-    "raw/dataset",       # original dataset
-    "raw/dataset-fresh"  # newly added dataset with 10k extra tokens
+    "raw/dataset"  
 ]
 
 def run_data_quality_analysis(raw_subfolders: list[str] = None):

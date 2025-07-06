@@ -197,7 +197,7 @@ class DataQualityAnalyzer:
             avg_volatility = volatility_metrics['avg_volatility']
             # Extreme if > 100x (10,000%)
             has_extreme_volatility = avg_volatility > 100
-            has_extreme_return = abs(total_return) > 100
+            has_extreme_return = abs(total_return) > 1000
             has_extreme_range = price_range > 100
             # ---
             
