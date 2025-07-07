@@ -25,9 +25,13 @@ def main():
     st.title("🔄 Time Series Autocorrelation & Clustering Analysis")
     st.markdown("""
     This app analyzes raw price time series data using:
-    - **Autocorrelation (ACF)** and **Partial Autocorrelation (PACF)**
+    - **Autocorrelation (ACF)** and **Partial Autocorrelation (PACF)** - computed for all analysis types
     - **Time Series Clustering** to find similar patterns
     - **t-SNE Visualization** for dimensionality reduction
+    
+    **Analysis Types:**
+    - **Feature-based**: Uses 16 engineered features (ACF values + statistical measures) for clustering
+    - **Price-only**: Clusters directly on price series (returns, log returns, raw prices, log prices, DTW features) + computes ACF
     """)
     
     # Initialize analyzer
@@ -82,7 +86,8 @@ def main():
                                       help="Number of clusters for K-means")
     
     clustering_method = st.sidebar.selectbox("Clustering Method",
-                                           ["kmeans", "hierarchical", "dbscan"])
+                                           ["kmeans", "hierarchical", "dbscan"],
+                                           help="Clustering algorithm to use for both analysis types")
     
     # Analysis type selection
     st.sidebar.markdown("---")
@@ -91,14 +96,14 @@ def main():
     analysis_type = st.sidebar.radio(
         "Choose analysis approach:",
         ["Feature-based (ACF + Statistics)", "Price-only"],
-        help="Feature-based uses 16 engineered features. Price-only clusters directly on price series."
+        help="Feature-based uses 16 engineered features. Price-only clusters on price series but still computes ACF for analysis."
     )
     
     # Price-only specific options
     if analysis_type == "Price-only":
         price_method = st.sidebar.selectbox(
             "Price clustering method:",
-            ["returns", "log_returns", "normalized_prices", "dtw_features"],
+            ["returns", "log_returns", "prices", "log_prices", "dtw_features"],
             help="Method for converting price series to features"
         )
         
@@ -113,8 +118,9 @@ def main():
         st.sidebar.markdown("""
         **Price Methods:**
         - **returns**: Raw returns (more stationary)
-        - **log_returns**: Log returns (better properties)  
-        - **normalized_prices**: 0-1 scaled prices
+        - **log_returns**: Log returns (better properties)
+        - **prices**: Raw prices (as-is)
+        - **log_prices**: Log-transformed prices
         - **dtw_features**: Statistical features extracted from prices
         """)
     
@@ -181,6 +187,7 @@ def main():
                         use_log_price=use_log_price,
                         n_clusters=n_clusters,
                         find_optimal_k=find_optimal_k,
+                        clustering_method=clustering_method,
                         max_tokens=max_tokens,
                         max_length=max_sequence_length if use_max_length else None
                     )
@@ -191,6 +198,7 @@ def main():
                         use_log_price=use_log_price,
                         n_clusters=n_clusters,
                         find_optimal_k=find_optimal_k,
+                        clustering_method=clustering_method,
                         max_tokens=max_tokens
                     )
                 
@@ -304,6 +312,19 @@ def display_autocorrelation_analysis(results: Dict, analyzer: AutocorrelationClu
     """Display autocorrelation analysis"""
     st.header("📈 Autocorrelation Analysis")
     
+    # Check if ACF results are available
+    if 'acf_results' not in results:
+        st.warning("⚠️ Autocorrelation data is not available for this analysis.")
+        st.info("💡 ACF computation may have failed or been skipped.")
+        return
+    
+    # Add info about analysis type
+    analysis_method = results.get('analysis_method', 'feature_based')
+    if analysis_method.startswith('price_only'):
+        st.info(f"🎯 **Price-only Analysis** ({analysis_method.split('_')[-1]}) with ACF computation")
+    else:
+        st.info("🎯 **Feature-based Analysis** with engineered features and ACF")
+    
     # Select cluster to analyze
     cluster_id = st.selectbox("Select Cluster", 
                              sorted(np.unique(results['cluster_labels'])),
@@ -324,7 +345,7 @@ def display_autocorrelation_analysis(results: Dict, analyzer: AutocorrelationClu
         # Get ACF data for cluster
         cluster_acfs = []
         for token in cluster_tokens:
-            if token in results['acf_results']:
+            if token in results.get('acf_results', {}):
                 acf = results['acf_results'][token]['acf']
                 if len(acf) > 0:
                     cluster_acfs.append(acf)
@@ -392,7 +413,7 @@ def display_autocorrelation_analysis(results: Dict, analyzer: AutocorrelationClu
         significant_lags = []
         
         for token in cluster_tokens:
-            if token in results['acf_results']:
+            if token in results.get('acf_results', {}):
                 acf_res = results['acf_results'][token]
                 if not np.isnan(acf_res['decay_rate']):
                     decay_rates.append(acf_res['decay_rate'])
@@ -488,7 +509,7 @@ def display_autocorrelation_analysis(results: Dict, analyzer: AutocorrelationClu
             row = idx // n_cols + 1
             col = idx % n_cols + 1
             
-            if token in results['acf_results'] and token in results['token_data']:
+            if token in results.get('acf_results', {}) and token in results['token_data']:
                 acf_data = results['acf_results'][token]
                 df = results['token_data'][token]
                 n = len(df)
@@ -540,7 +561,7 @@ def display_autocorrelation_analysis(results: Dict, analyzer: AutocorrelationClu
         st.subheader("ACF Summary for Selected Tokens")
         summary_data = []
         for token in selected_tokens:
-            if token in results['acf_results']:
+            if token in results.get('acf_results', {}):
                 acf_res = results['acf_results'][token]
                 summary_data.append({
                     'Token': token[:20] + '...' if len(token) > 20 else token,
@@ -561,13 +582,40 @@ def display_clustering_results(results: Dict):
     # Feature importance (which features contribute most to clustering)
     st.subheader("Feature Contributions")
     
-    feature_names = [
-        'Mean Price', 'Std Price', 'Median Price', 'Q1 Price', 'Q3 Price',
-        'Mean Return', 'Std Return', 'Min Return', 'Max Return',
-        'ACF Lag 1', 'ACF Lag 5', 'ACF Lag 10',
-        'Significant Lags', 'Decay Rate', 'First Zero',
-        'Trend Slope'
-    ]
+    # Determine feature names based on analysis type
+    analysis_method = results.get('analysis_method', 'feature_based')
+    feature_matrix = results['feature_matrix']
+    
+    if analysis_method.startswith('price_only'):
+        # For price-only analysis, features are time series values
+        price_method = analysis_method.split('_')[-1]
+        sequence_length = results.get('sequence_length', feature_matrix.shape[1])
+        
+        if price_method == 'dtw':
+            # DTW features are statistical measures
+            feature_names = [
+                'Q10', 'Q25', 'Q50', 'Q75', 'Q90',  # Quantiles
+                'Mean Return', 'Std Return', 'Skew Return',  # Returns stats
+                'Trend Slope',  # Trend
+                'Vol Window 5', 'Vol Window 10', 'Vol Window 20'  # Rolling volatility
+            ]
+        else:
+            # Time series features (returns, log_returns, prices, log_prices)
+            if sequence_length == 'variable':
+                feature_names = [f'{price_method.title()} Feature {i+1}' for i in range(feature_matrix.shape[1])]
+            else:
+                feature_names = [f'{price_method.title()} T-{i+1}' for i in range(min(feature_matrix.shape[1], 20))]
+                if feature_matrix.shape[1] > 20:
+                    feature_names.extend([f'{price_method.title()} T-{i+1}' for i in range(20, feature_matrix.shape[1])])
+    else:
+        # Feature-based analysis - use the original 16 engineered features
+        feature_names = [
+            'Mean Price', 'Std Price', 'Median Price', 'Q1 Price', 'Q3 Price',
+            'Mean Return', 'Std Return', 'Min Return', 'Max Return',
+            'ACF Lag 1', 'ACF Lag 5', 'ACF Lag 10',
+            'Significant Lags', 'Decay Rate', 'First Zero',
+            'Trend Slope'
+        ]
     
     # Calculate feature variance across clusters
     feature_matrix = results['feature_matrix']
@@ -989,7 +1037,7 @@ def display_token_explorer(results: Dict):
             st.plotly_chart(fig, use_container_width=True)
             
             # ACF details
-            if selected_token in results['acf_results']:
+            if selected_token in results.get('acf_results', {}):
                 st.subheader("Autocorrelation Details")
                 
                 acf_data = results['acf_results'][selected_token]
@@ -1105,24 +1153,31 @@ def display_token_explorer(results: Dict):
             
             summary_data = []
             for token in display_tokens:
-                if token in results['token_data'] and token in results['acf_results']:
+                if token in results['token_data']:
                     df = results['token_data'][token]
-                    acf_res = results['acf_results'][token]
                     
                     # Calculate basic stats
                     returns = np.diff(df['price'].to_numpy()) / df['price'].to_numpy()[:-1]
                     price_change = (df['price'][-1] - df['price'][0]) / df['price'][0] * 100
                     volatility = np.std(returns) * 100  # As percentage
                     
-                    summary_data.append({
+                    summary_entry = {
                         'Token': token[:25] + '...' if len(token) > 25 else token,
                         'Data Points': len(df),
                         'Price Change (%)': f"{price_change:.2f}",
-                        'Volatility (%)': f"{volatility:.2f}",
-                        'Significant Lags': len(acf_res['significant_lags']),
-                        'Decay Rate': f"{acf_res['decay_rate']:.4f}" if not np.isnan(acf_res['decay_rate']) else "N/A",
-                        'First Zero': acf_res['first_zero_crossing']
-                    })
+                        'Volatility (%)': f"{volatility:.2f}"
+                    }
+                    
+                    # Add ACF data if available
+                    if token in results.get('acf_results', {}):
+                        acf_res = results['acf_results'][token]
+                        summary_entry.update({
+                            'Significant Lags': len(acf_res['significant_lags']),
+                            'Decay Rate': f"{acf_res['decay_rate']:.4f}" if not np.isnan(acf_res['decay_rate']) else "N/A",
+                            'First Zero': acf_res['first_zero_crossing']
+                        })
+                    
+                    summary_data.append(summary_entry)
             
             if summary_data:
                 st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
@@ -1136,9 +1191,8 @@ def display_token_explorer(results: Dict):
             all_decay_rates = []
             
             for token in display_tokens:
-                if token in results['token_data'] and token in results['acf_results']:
+                if token in results['token_data']:
                     df = results['token_data'][token]
-                    acf_res = results['acf_results'][token]
                     
                     returns = np.diff(df['price'].to_numpy()) / df['price'].to_numpy()[:-1]
                     volatility = np.std(returns)
@@ -1146,8 +1200,11 @@ def display_token_explorer(results: Dict):
                     all_returns.extend(returns.tolist())
                     all_volatilities.append(volatility)
                     
-                    if not np.isnan(acf_res['decay_rate']):
-                        all_decay_rates.append(acf_res['decay_rate'])
+                    # Add decay rate if ACF data is available
+                    if token in results.get('acf_results', {}):
+                        acf_res = results['acf_results'][token]
+                        if not np.isnan(acf_res['decay_rate']):
+                            all_decay_rates.append(acf_res['decay_rate'])
             
             if all_returns and all_volatilities:
                 col1, col2, col3 = st.columns(3)

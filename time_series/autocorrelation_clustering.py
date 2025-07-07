@@ -482,6 +482,12 @@ class AutocorrelationClusteringAnalyzer:
         if features_scaled.shape[1] > 50:
             pca = PCA(n_components=50)
             features_scaled = pca.fit_transform(features_scaled)
+        elif features_scaled.shape[1] > min(features_scaled.shape[0], features_scaled.shape[1]) // 2:
+            # Apply PCA if we have more features than half the number of samples
+            n_components = min(features_scaled.shape[0] - 1, features_scaled.shape[1] // 2)
+            if n_components > 1:
+                pca = PCA(n_components=n_components)
+                features_scaled = pca.fit_transform(features_scaled)
             
         # Compute t-SNE
         tsne = TSNE(n_components=n_components, 
@@ -740,6 +746,7 @@ class AutocorrelationClusteringAnalyzer:
                             use_log_price: bool = True,
                             n_clusters: Optional[int] = None,
                             find_optimal_k: bool = True,
+                            clustering_method: str = 'kmeans',
                             max_tokens: Optional[int] = None) -> Dict:
         """
         Run complete autocorrelation and clustering analysis
@@ -749,6 +756,7 @@ class AutocorrelationClusteringAnalyzer:
             use_log_price: Whether to use log prices
             n_clusters: Number of clusters (if None, will find optimal)
             find_optimal_k: Whether to find optimal number of clusters
+            clustering_method: Clustering method ('kmeans', 'dbscan', 'hierarchical')
             max_tokens: Maximum number of tokens to analyze (None = no limit)
             
         Returns:
@@ -776,7 +784,7 @@ class AutocorrelationClusteringAnalyzer:
         # Perform clustering with optimal K finding
         clustering_results = self.perform_clustering(
             feature_matrix, 
-            method='kmeans', 
+            method=clustering_method, 
             n_clusters=n_clusters,
             find_optimal_k=find_optimal_k
         )
@@ -836,7 +844,7 @@ class AutocorrelationClusteringAnalyzer:
         
         Args:
             token_data: Dictionary of token DataFrames
-            method: 'returns', 'log_returns', 'normalized_prices', or 'dtw_features'
+            method: 'returns', 'log_returns', 'prices', 'log_prices', or 'dtw_features'
             use_log_price: Whether to use log prices
             max_length: Maximum sequence length (None = use minimum length across all tokens)
             
@@ -894,12 +902,25 @@ class AutocorrelationClusteringAnalyzer:
                     else:
                         print(f"Skipping {valid_tokens[i]} due to invalid log returns")
                         
-            elif method == 'normalized_prices':
-                # Use normalized price levels (0-1 scaling per series)
+            elif method == 'prices':
+                # Use raw prices directly (regardless of use_log_price setting)
+                raw_prices_col = 'price'  # Always use raw prices for this method
+                if raw_prices_col in token_data[valid_tokens[i]].columns:
+                    raw_prices = token_data[valid_tokens[i]][raw_prices_col].to_numpy()
+                    segment = raw_prices[-target_length:]
+                    if len(segment) >= target_length:
+                        feature_matrix.append(segment)
+                        final_tokens.append(valid_tokens[i])
+                        
+            elif method == 'log_prices':
+                # Use log-transformed prices directly
                 segment = prices[-target_length:]
                 if len(segment) >= target_length:
-                    segment_norm = (segment - segment.min()) / (segment.max() - segment.min()) if segment.max() > segment.min() else np.zeros_like(segment)
-                    feature_matrix.append(segment_norm)
+                    # For log prices, we already have log values if use_log_price=True
+                    # Otherwise, take log of the segment
+                    if not use_log_price:
+                        segment = np.log(segment)
+                    feature_matrix.append(segment)
                     final_tokens.append(valid_tokens[i])
                     
             elif method == 'dtw_features':
@@ -909,30 +930,49 @@ class AutocorrelationClusteringAnalyzer:
                     # Extract features: quantiles, autocorrelations, etc.
                     features = []
                     # Quantiles
-                    features.extend(np.percentile(segment, [10, 25, 50, 75, 90]))
+                    quantiles = np.percentile(segment, [10, 25, 50, 75, 90])
+                    features.extend(quantiles)
                     # Returns stats
                     returns = np.diff(segment)
                     if len(returns) > 0:
-                        features.extend([np.mean(returns), np.std(returns)])
-                        features.append(skew(returns) if len(returns) > 2 else 0)
+                        mean_ret = np.mean(returns)
+                        std_ret = np.std(returns)
+                        skew_ret = skew(returns) if len(returns) > 2 else 0
+                        features.extend([mean_ret, std_ret, skew_ret])
                     else:
                         features.extend([0, 0, 0])
                     # Trend
-                    features.append(np.polyfit(np.arange(len(segment)), segment, 1)[0])
+                    trend_slope = np.polyfit(np.arange(len(segment)), segment, 1)[0]
+                    features.append(trend_slope)
                     # Volatility in different windows
                     for window in [5, 10, 20]:
                         if len(returns) >= window:
                             rolling_vol = [np.std(returns[j:j+window]) for j in range(len(returns)-window+1)]
-                            features.append(np.mean(rolling_vol))
+                            vol_mean = np.mean(rolling_vol)
+                            features.append(vol_mean)
                         else:
                             features.append(0)
                     
-                    feature_matrix.append(np.array(features))
-                    final_tokens.append(valid_tokens[i])
+                    # Convert to numpy array and clean NaN/inf values
+                    features = np.array(features, dtype=float)
+                    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+                    
+                    # Only add if no NaN/inf values remain
+                    if not np.any(np.isnan(features)) and not np.any(np.isinf(features)):
+                        feature_matrix.append(features)
+                        final_tokens.append(valid_tokens[i])
+                    else:
+                        print(f"Skipping {valid_tokens[i]} due to invalid DTW features")
             else:
                 raise ValueError(f"Unknown method: {method}")
         
         feature_matrix = np.array(feature_matrix)
+        
+        # Final check for NaN/inf values and clean if necessary
+        if len(feature_matrix) > 0:
+            if np.any(np.isnan(feature_matrix)) or np.any(np.isinf(feature_matrix)):
+                print("Warning: Found NaN/inf values in feature matrix, cleaning...")
+                feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=0.0, neginf=0.0)
         
         print(f"Price-only feature matrix shape: {feature_matrix.shape}")
         print(f"Method: {method}, Valid tokens: {len(final_tokens)}")
@@ -944,22 +984,24 @@ class AutocorrelationClusteringAnalyzer:
                                use_log_price: bool = True,
                                n_clusters: Optional[int] = None,
                                find_optimal_k: bool = True,
+                               clustering_method: str = 'kmeans',
                                max_tokens: Optional[int] = None,
                                max_length: Optional[int] = None) -> Dict:
         """
-        Run clustering analysis using only price data (no feature engineering)
+        Run clustering analysis using only price data with ACF computation
         
         Args:
             data_dir: Directory containing token data
-            method: 'returns', 'log_returns', 'normalized_prices', or 'dtw_features'
+            method: 'returns', 'log_returns', 'prices', 'log_prices', or 'dtw_features'
             use_log_price: Whether to use log prices
             n_clusters: Number of clusters (if None, will find optimal)
             find_optimal_k: Whether to find optimal number of clusters
+            clustering_method: Clustering method ('kmeans', 'dbscan', 'hierarchical')
             max_tokens: Maximum number of tokens to analyze
             max_length: Maximum sequence length for price series
             
         Returns:
-            Dictionary with all results
+            Dictionary with all results including ACF
         """
         # Load data
         token_data = self.load_raw_prices(data_dir, limit=max_tokens)
@@ -969,7 +1011,11 @@ class AutocorrelationClusteringAnalyzer:
             
         print(f"Loaded {len(token_data)} tokens for price-only analysis")
         
-        # Prepare price-only data
+        # Compute autocorrelations for all tokens (this is what ACF is for!)
+        print("Computing autocorrelations for all tokens...")
+        acf_results = self.compute_all_autocorrelations(token_data, use_log_price)
+        
+        # Prepare price-only data for clustering
         feature_matrix, token_names = self.prepare_price_only_data(
             token_data, method=method, use_log_price=use_log_price, max_length=max_length
         )
@@ -982,7 +1028,7 @@ class AutocorrelationClusteringAnalyzer:
         # Perform clustering
         clustering_results = self.perform_clustering(
             feature_matrix, 
-            method='kmeans', 
+            method=clustering_method, 
             n_clusters=n_clusters,
             find_optimal_k=find_optimal_k
         )
@@ -1000,9 +1046,27 @@ class AutocorrelationClusteringAnalyzer:
             token_names
         )
         
+        # Organize ACF by cluster (same as feature-based analysis)
+        acf_by_cluster = {}
+        for cluster_id in np.unique(clustering_results['labels']):
+            mask = clustering_results['labels'] == cluster_id
+            cluster_tokens = [token_names[i] for i in np.where(mask)[0]]
+            cluster_acfs = [acf_results[token]['acf'] for token in cluster_tokens if token in acf_results]
+            
+            if cluster_acfs:
+                # Pad to same length
+                max_len = max(len(acf) for acf in cluster_acfs)
+                padded_acfs = []
+                for acf in cluster_acfs:
+                    padded = np.pad(acf, (0, max_len - len(acf)), mode='constant', constant_values=0)
+                    padded_acfs.append(padded)
+                    
+                acf_by_cluster[cluster_id] = np.array(padded_acfs)
+        
         # Compile results
         results = {
             'token_data': filtered_token_data,
+            'acf_results': acf_results,  # Include ACF results!
             'feature_matrix': feature_matrix,
             'token_names': token_names,
             'cluster_labels': clustering_results['labels'],
@@ -1010,6 +1074,7 @@ class AutocorrelationClusteringAnalyzer:
             't_sne_2d': tsne_2d,
             't_sne_3d': tsne_3d,
             'cluster_stats': cluster_stats,
+            'acf_by_cluster': acf_by_cluster,  # Include ACF by cluster
             'use_log_price': use_log_price,
             'n_clusters': clustering_results['n_clusters'],
             'analysis_method': f'price_only_{method}',
