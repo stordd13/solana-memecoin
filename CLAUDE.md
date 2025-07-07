@@ -1,0 +1,357 @@
+# 🤖 Claude Development Guide for Memecoin Analysis Platform
+
+> **For Future Claude Instances**: This guide provides comprehensive context, architecture overview, and development workflows for the memecoin time series analysis platform.
+**Important context**
+
+Always start with testing. Test-driven development (TDD) is the only true method. Tests must use real components, in a real environment.
+Set typing and linting to maximally strict mode.
+Describe exactly what you want, down to the last detail: write a complete PRD (Product Requirements Document) and define precisely what a user can or cannot do.
+Do thorough research: study the problem, the competition, similar solutions, etc., with DeepResearch, and build a report to launch your prompt.
+Always manipulate your model and force it to criticize its own work. Every time the agent says "I'm done! Everything's ready for production!", consider that it's probably not true.
+Bottom-up method. Build the smallest elements one by one, make sure they work and are tested, then connect them together - you can develop a complete production stack if you start with the basic systems, test them, then put them together.
+There's no substitute for expertise. If you know how to code and know what to avoid, you'll save yourself a lot of trouble and expense.
+
+
+## 📊 **Project Context & Mission**
+
+### **Core Challenge**
+ML models showing unstable performance: **70%→45% precision**, **95%→25% recall** due to mixing different behavioral patterns in unified models.
+
+### **Dataset Overview**
+- **30,000 memecoins** with minute-by-minute prices (200-2000 minutes per token)
+- **3k normal tokens**: Standard behavior patterns
+- **4k extreme tokens**: 99.9% dumps, 1M%+ pumps (LEGITIMATE signals, not noise!)
+- **25k dead tokens**: Tradeable during active periods, then flatline
+
+### **Solution Strategy**
+Use **Autocorrelation Function (ACF) + Clustering + t-SNE** to identify 5-8 distinct behavioral archetypes for stable, cluster-specific ML models instead of unified approach.
+
+---
+
+## 🏗️ **Architecture Overview**
+
+### **Project Structure**
+```
+memecoin2/
+├── data_analysis/              # Interactive Streamlit dashboard & core analysis
+│   ├── app.py                 # Main entry point: streamlit run data_analysis/app.py
+│   ├── data_loader.py         # Polars-based data loading with caching
+│   ├── data_quality.py        # Dead token detection, gap analysis
+│   ├── price_analysis.py      # Optimal timing calculations
+│   └── export_utils.py        # Category export functionality
+├── data_cleaning/              # Data preprocessing pipeline
+│   └── clean_tokens.py        # Category-aware cleaning strategies
+├── feature_engineering/        # ML-safe feature creation
+│   ├── advanced_feature_engineering.py  # Rolling features (NO data leakage)
+│   └── create_directional_targets.py    # Binary targets for all horizons
+├── ML/                        # Machine learning models
+│   ├── directional_models/    # Binary classification (UP/DOWN prediction)
+│   │   ├── train_lightgbm_model.py           # Tree-based models
+│   │   ├── train_unified_lstm_model.py       # Basic LSTM
+│   │   └── train_advanced_hybrid_lstm.py     # Multi-scale + attention
+│   ├── forecasting_models/    # Regression (price value prediction)
+│   └── utils/                 # Shared ML utilities (winsorization, etc.)
+├── time_series/               # Advanced time series analysis
+│   ├── autocorrelation_app.py          # ACF analysis Streamlit app
+│   ├── autocorrelation_clustering.py   # Core ACF + clustering engine
+│   └── MEMECOIN_ANALYSIS_ROADMAP.md    # 4-phase implementation plan
+├── quant_analysis/            # Quantitative trading analysis
+└── run_pipeline.py           # Complete automated pipeline
+```
+
+### **Data Flow Architecture**
+```
+Raw Data → Data Quality Analysis → Category Export → Cleaning → Feature Engineering → ML Training
+   ↓              ↓                    ↓             ↓            ↓                ↓
+data/raw/    quality reports    data/processed/  data/cleaned/ data/features/  ML/results/
+```
+
+### **Critical Design Principles**
+1. **Temporal Splitting**: NEVER split by tokens - always split within each token's timeline
+2. **Per-Token Scaling**: Each token scaled independently (handles 200-2000min lifespans)
+3. **Feature Separation**: Rolling features (ML-safe) vs Global features (analysis-only)
+4. **Category Awareness**: Different strategies for normal/extreme/dead tokens
+5. **📊 Mathematical Validation**: All calculations validated with TDD to 1e-12 precision
+
+---
+
+## 🚀 **Build & Development Commands**
+
+### **Main Pipeline**
+```bash
+# Complete automated pipeline (data → features → ready for ML)
+python run_pipeline.py              # Full pipeline
+python run_pipeline.py --fast       # Fast mode (rolling features only)
+```
+
+### **Interactive Analysis**
+```bash
+# Main dashboard - primary entry point
+streamlit run data_analysis/app.py
+
+# ACF analysis & clustering
+streamlit run time_series/autocorrelation_app.py
+
+# Quantitative trading analysis
+streamlit run quant_analysis/quant_app.py
+
+# Time series modeling
+streamlit run time_series/time_series_app.py
+```
+
+### **ML Model Training**
+```bash
+# Directional Models (Binary Classification)
+python ML/directional_models/train_lightgbm_model.py              # Short-term (15m-1h)
+python ML/directional_models/train_lightgbm_model_medium_term.py  # Medium-term (2h-12h)
+python ML/directional_models/train_unified_lstm_model.py          # Basic LSTM
+python ML/directional_models/train_advanced_hybrid_lstm.py        # Advanced hybrid LSTM
+python ML/directional_models/train_logistic_regression_baseline.py
+
+# Forecasting Models (Regression)
+python ML/forecasting_models/train_lstm_model.py
+python ML/forecasting_models/train_advanced_hybrid_lstm_forecasting.py
+python ML/forecasting_models/train_baseline_regressors.py --horizon 60 --model both
+```
+
+### **Dependencies**
+```bash
+pip install -r requirements.txt
+# Core: polars, streamlit, plotly, numpy, scikit-learn
+# ML: torch, lightgbm, xgboost, optuna
+# Analysis: statsmodels, matplotlib, seaborn
+# Testing: pytest (for TDD mathematical validation)
+```
+
+### **Testing & Validation**
+```bash
+# Run mathematical validation tests
+python -m pytest data_analysis/tests/test_mathematical_validation.py -v
+python -m pytest data_cleaning/tests/test_core_mathematical_validation.py -v
+python -m pytest data_cleaning/tests/test_analyze_exclusions_validation.py -v
+python -m pytest data_cleaning/tests/test_generate_graduated_datasets_validation.py -v
+
+# Complete test suite summary
+python -m pytest data_analysis/tests/ data_cleaning/tests/ --tb=no -q
+```
+
+---
+
+## 💡 **Key Technical Concepts**
+
+### **1. Data Leakage Prevention**
+**❌ WRONG**: Random token splits
+```python
+train_tokens, test_tokens = train_test_split(all_tokens, test_size=0.2)
+```
+
+**✅ CORRECT**: Temporal splits within each token
+```python
+for token in all_tokens:
+    token_data = load_token(token)
+    train_split = token_data[:int(0.6 * len(token_data))]    # First 60%
+    val_split = token_data[int(0.6 * len(token_data)):int(0.8 * len(token_data))]  # Next 20%
+    test_split = token_data[int(0.8 * len(token_data)):]     # Last 20%
+```
+
+### **2. Per-Token Scaling Strategy**
+Handles variable lifespans (200-2000 minutes) and extreme volatility:
+```python
+# Each token gets individual scaler fitted on training data only
+for token in tokens:
+    scaler = RobustScaler()  # or Winsorizer for extreme crypto volatility
+    scaler.fit(token.train_data)
+    token.scaled_features = scaler.transform(token.all_data)
+```
+
+### **3. Feature Engineering Architecture**
+**Rolling Features** (ML-safe, no future leakage):
+- RSI, MACD, Bollinger Bands
+- Rolling means, std devs
+- Log returns, momentum
+- Saved to `data/features/`
+
+**Global Features** (analysis-only, uses full token history):
+- Total return, max drawdown
+- FFT analysis, spectral features
+- Computed on-demand in Streamlit
+
+### **4. Extreme Returns Handling**
+**CRITICAL**: 99.9% dumps and 1M%+ pumps are **LEGITIMATE trading signals**, not noise!
+- Use Winsorization instead of outlier removal
+- Design features that capture extreme volatility patterns
+- Cluster-specific models handle different volatility regimes
+
+---
+
+## 🎯 **Memecoin-Specific Analysis Framework**
+
+### **Behavioral Archetypes** (Target: 5-8 clusters)
+- **"Moon Mission"**: Sustained pumps with momentum ACF
+- **"Rug Pull"**: Quick pump → sustained dump  
+- **"Slow Bleed"**: Gradual decline patterns
+- **"Volatile Chop"**: High volatility, no clear direction
+- **"Dead on Arrival"**: Minimal activity from launch
+
+### **Multi-Resolution ACF Analysis**
+- **Sprint** (200-400 min): Fast-moving patterns
+- **Standard** (400-1200 min): Typical lifecycle
+- **Marathon** (1200+ min): Extended development
+
+### **Lifecycle Phase Analysis**
+- **Launch phase** (0-60 min): Initial behavior
+- **Development phase** (2-8 hours): Growth/decline patterns
+- **Resolution phase** (final hours): End-of-life signatures
+
+---
+
+## 📋 **Current Roadmap Status**
+
+### **✅ Completed**
+- Comprehensive data analysis pipeline
+- Category-aware cleaning strategies  
+- ML-safe feature engineering with temporal splitting
+- Multiple ML models (LightGBM, LSTM, hybrid approaches)
+- Autocorrelation analysis framework
+- **🧪 COMPREHENSIVE TDD IMPLEMENTATION**:
+  - **data_analysis/**: 16/16 mathematical validation tests passing
+  - **data_cleaning/**: 44/44 mathematical validation tests passing
+  - All statistical calculations validated against numpy/scipy with 1e-12 precision
+  - Streamlit display accuracy mathematically guaranteed
+  - Complete test coverage for edge cases and numerical stability
+
+### **🔄 In Progress** 
+- **Phase 1**: Pattern Discovery & Behavioral Archetype Identification
+  - Multi-resolution ACF analysis (sprint/standard/marathon)
+  - Extreme-return-aware clustering
+  - t-SNE behavioral mapping
+
+### **📋 Next Steps** (From MEMECOIN_ANALYSIS_ROADMAP.md)
+- **Phase 2**: Temporal Pattern Recognition
+- **Phase 3**: Feature Engineering & ML Pipeline Stabilization  
+- **Phase 4**: Volume Data Integration Preparation
+
+---
+
+## ⚠️ **Critical Guidelines & Best Practices**
+
+### **❌ Never Do This**
+- Mix behavioral patterns in unified models
+- Use global scaling across tokens
+- Split data randomly by tokens
+- Treat extreme returns as noise/outliers
+- Create unified features for all token types
+
+### **✅ Always Do This**  
+- Use temporal splitting within each token
+- Scale each token individually using RobustScaler or Winsorizer
+- Separate rolling features (ML) from global features (analysis)
+- Embrace extreme volatility as legitimate signal
+- Design cluster-specific models for each archetype
+- **Validate all mathematical operations with comprehensive tests**
+
+### **🔍 Data Quality Checks**
+```python
+# Essential validations before ML training
+def validate_features_safety(features_df, token_name):
+    # Check for constant features (data leakage risk)
+    # Validate temporal ordering
+    # Ensure no future information in features
+```
+
+### **📊 Performance Expectations**
+- **Directional Models**: 85-90% accuracy, 85-95% ROC AUC
+- **Forecasting Models**: R² 0.3-0.7, MAE 5-15% of avg price
+- **Current Challenge**: Achieving stable performance across behavioral types
+
+---
+
+## 🔧 **Development Workflows**
+
+### **Adding New Features**
+1. Check if feature needs future information (if yes → global feature only)
+2. Implement in `feature_engineering/advanced_feature_engineering.py`
+3. Test with temporal splitting validation
+4. Update feature documentation
+
+### **New ML Model Development**
+1. Follow existing patterns in `ML/directional_models/` or `ML/forecasting_models/`
+2. Implement per-token scaling
+3. Use temporal splitting for validation
+4. Add comprehensive metrics reporting
+
+### **Debugging Data Issues**
+1. Use `data_analysis/app.py` for visual inspection
+2. Check quality reports from `data_quality.py`
+3. Validate feature engineering with sample tokens
+4. Use category-specific analysis
+
+### **Performance Optimization**
+- Polars for fast DataFrame operations
+- Lazy evaluation where possible
+- Caching for repeated analysis
+- Parallel processing for batch operations
+
+---
+
+## 📚 **Key Files to Understand**
+
+### **Must Read First**
+- `README.md`: Project overview and usage guide
+- `MEMECOIN_ANALYSIS_ROADMAP.md`: Comprehensive 4-phase plan
+- `ML/README.md`: Detailed ML pipeline documentation
+
+### **Core Analysis**
+- `data_analysis/app.py`: Main dashboard entry point
+- `time_series/autocorrelation_app.py`: ACF analysis interface
+- `run_pipeline.py`: Complete automated pipeline
+
+### **Architecture Examples**
+- `ML/directional_models/train_unified_lstm_model.py`: Standard LSTM with per-token scaling
+- `feature_engineering/advanced_feature_engineering.py`: ML-safe feature creation
+- `data_cleaning/clean_tokens.py`: Category-aware cleaning strategies
+
+---
+
+## 🚨 **Common Pitfalls & Solutions**
+
+### **Data Leakage**
+- **Problem**: Using future information in features
+- **Solution**: Strict temporal splitting, rolling feature validation
+
+### **Scale Mismatch**
+- **Problem**: Tokens with vastly different price ranges  
+- **Solution**: Per-token RobustScaler or Winsorization
+
+### **Mixed Behavioral Patterns**
+- **Problem**: Single model trying to handle all archetypes
+- **Solution**: Cluster-specific models after behavioral identification
+
+### **Extreme Volatility**
+- **Problem**: Treating 1M%+ moves as outliers
+- **Solution**: Embrace as signal, use appropriate scaling methods
+
+---
+
+## 🎉 **Success Metrics & Goals**
+
+### **Pattern Discovery Success**
+- [ ] 5-8 distinct behavioral archetypes with clear ACF signatures
+- [ ] >80% intra-cluster ACF similarity within each archetype  
+- [ ] <50% inter-cluster ACF similarity between archetypes
+
+### **ML Pipeline Success**
+- [ ] Stable cluster-specific models with <10% performance variance
+- [ ] Improved overall performance vs unified approach
+- [ ] Early classification accuracy >70% from first 60 minutes
+
+### **Practical Utility Success**
+- [ ] Actionable trading strategies for each archetype
+- [ ] Clear risk/reward profiles per behavioral type
+- [ ] Scalable framework ready for volume data integration
+
+---
+
+**🚀 Ready to contribute to stable, interpretable memecoin analysis!**
+
+*Last updated: Based on analysis through autocorrelation improvements and roadmap creation*

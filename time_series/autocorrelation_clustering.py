@@ -97,13 +97,17 @@ class AutocorrelationClusteringAnalyzer:
         # Remove NaN values
         series_clean = series[~np.isnan(series)]
         
-        if len(series_clean) < max_lag + 1:
+        if len(series_clean) < 3:  # Need minimum 3 points for meaningful ACF
             return {
                 'acf': np.array([]),
                 'pacf': np.array([]),
                 'significant_lags': [],
                 'decay_rate': np.nan
             }
+        
+        # Adjust max_lag if series is too short
+        max_lag = min(max_lag, len(series_clean) // 2 - 1, len(series_clean) - 2)
+        max_lag = max(max_lag, 1)  # Ensure at least lag 1
         
         # Compute ACF and PACF
         acf_values = acf(series_clean, nlags=max_lag, fft=True)
@@ -276,17 +280,25 @@ class AutocorrelationClusteringAnalyzer:
         return feature_matrix, token_names
     
     def find_optimal_clusters(self, feature_matrix: np.ndarray, 
-                            max_clusters: int = 15) -> Dict:
+                            max_clusters: int = None,
+                            max_k: int = None) -> Dict:
         """
         Find optimal number of clusters using elbow method and silhouette analysis
         
         Args:
             feature_matrix: Feature matrix for clustering
-            max_clusters: Maximum number of clusters to test
+            max_clusters: Maximum number of clusters to test (default: 15)
+            max_k: Alternative parameter name for max_clusters
             
         Returns:
             Dictionary with elbow analysis results and optimal K suggestions
         """
+        # Handle both parameter names for backwards compatibility
+        if max_k is not None:
+            max_clusters = max_k
+        elif max_clusters is None:
+            max_clusters = 15
+            
         from sklearn.metrics import silhouette_score
         
         # Add feature validation
@@ -430,6 +442,17 @@ class AutocorrelationClusteringAnalyzer:
         
         if n_clusters is None:
             n_clusters = self.n_clusters
+        
+        # Validate n_clusters against data size
+        n_samples = feature_matrix.shape[0]
+        if method in ['kmeans', 'hierarchical'] and n_clusters > n_samples:
+            print(f"Warning: n_clusters ({n_clusters}) > n_samples ({n_samples}), adjusting to {n_samples}")
+            n_clusters = n_samples
+        
+        # For very small datasets, ensure minimum viable clustering
+        if method in ['kmeans', 'hierarchical'] and n_clusters > n_samples // 2 and n_samples > 2:
+            n_clusters = max(2, n_samples // 2)
+            print(f"Adjusting n_clusters to {n_clusters} for small dataset")
             
         # Standardize features
         scaler = StandardScaler()
@@ -478,22 +501,33 @@ class AutocorrelationClusteringAnalyzer:
         scaler = StandardScaler()
         features_scaled = scaler.fit_transform(feature_matrix)
         
-        # Apply PCA first if high dimensional
-        if features_scaled.shape[1] > 50:
+        # Apply PCA first if high dimensional or if we have more features than samples
+        n_samples, n_features = features_scaled.shape
+        
+        if n_features > 50 and n_samples > 50:
+            # For large datasets, reduce to 50 components
             pca = PCA(n_components=50)
             features_scaled = pca.fit_transform(features_scaled)
-        elif features_scaled.shape[1] > min(features_scaled.shape[0], features_scaled.shape[1]) // 2:
-            # Apply PCA if we have more features than half the number of samples
-            n_components = min(features_scaled.shape[0] - 1, features_scaled.shape[1] // 2)
-            if n_components > 1:
+        elif n_features > n_samples:
+            # If more features than samples, reduce dimensions
+            n_components = min(n_samples - 1, n_features // 2)
+            if n_components > 1 and n_components < n_features:
                 pca = PCA(n_components=n_components)
                 features_scaled = pca.fit_transform(features_scaled)
             
+        # Adjust perplexity for small datasets
+        adjusted_perplexity = min(perplexity, (features_scaled.shape[0] - 1) / 3.0)
+        adjusted_perplexity = max(adjusted_perplexity, 1.0)
+        
+        # Use exact method for small datasets or high dimensions
+        method = 'exact' if features_scaled.shape[0] < 1000 or n_components >= 4 else 'barnes_hut'
+        
         # Compute t-SNE
         tsne = TSNE(n_components=n_components, 
-                   perplexity=min(perplexity, features_scaled.shape[0] - 1),
+                   perplexity=adjusted_perplexity,
                    random_state=42,
-                   max_iter=1000)
+                   max_iter=1000,
+                   method=method)
         
         embedding = tsne.fit_transform(features_scaled)
         
@@ -869,14 +903,24 @@ class AutocorrelationClusteringAnalyzer:
         if not price_series:
             raise ValueError("No valid price series found")
         
-        # Determine sequence length
+        # Determine sequence length based on method
         lengths = [len(series) for series in price_series]
-        if max_length is None:
-            target_length = min(lengths)  # Use shortest series length
-        else:
-            target_length = min(max_length, min(lengths))
         
-        print(f"Using sequence length: {target_length} (range: {min(lengths)}-{max(lengths)})")
+        if method in ['returns', 'log_returns']:
+            # For returns, we need N+1 prices to get N returns
+            max_returns_length = min(lengths) - 1
+            if max_length is None:
+                target_length = max_returns_length
+            else:
+                target_length = min(max_length, max_returns_length)
+        else:
+            # For prices and other methods, use the series length directly
+            if max_length is None:
+                target_length = min(lengths)
+            else:
+                target_length = min(max_length, min(lengths))
+        
+        print(f"Using sequence length: {target_length} (method: {method}, range: {min(lengths)}-{max(lengths)})")
         
         # Second pass: prepare data based on method
         feature_matrix = []
@@ -885,22 +929,32 @@ class AutocorrelationClusteringAnalyzer:
         for i, prices in enumerate(price_series):
             if method == 'returns':
                 # Use returns (more stationary)
-                returns = np.diff(prices[-target_length-1:])  # Get target_length returns
-                if len(returns) >= target_length:
-                    feature_matrix.append(returns[:target_length])
-                    final_tokens.append(valid_tokens[i])
+                # We already calculated target_length to account for this
+                if len(prices) >= target_length + 1:
+                    returns = np.diff(prices[-(target_length+1):])  # Get target_length returns
+                    if len(returns) == target_length:
+                        feature_matrix.append(returns)
+                        final_tokens.append(valid_tokens[i])
+                    else:
+                        print(f"Unexpected returns length for {valid_tokens[i]}: {len(returns)} vs {target_length}")
+                else:
+                    print(f"Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} returns")
                     
             elif method == 'log_returns':
                 # Use log returns
-                log_returns = np.diff(np.log(prices[-target_length-1:]))
-                if len(log_returns) >= target_length:
-                    # Remove any inf/nan values
-                    log_returns = log_returns[:target_length]
-                    if not np.any(np.isnan(log_returns)) and not np.any(np.isinf(log_returns)):
-                        feature_matrix.append(log_returns)
-                        final_tokens.append(valid_tokens[i])
+                if len(prices) >= target_length + 1:
+                    log_returns = np.diff(np.log(prices[-(target_length+1):]))
+                    if len(log_returns) == target_length:
+                        # Remove any inf/nan values
+                        if not np.any(np.isnan(log_returns)) and not np.any(np.isinf(log_returns)):
+                            feature_matrix.append(log_returns)
+                            final_tokens.append(valid_tokens[i])
+                        else:
+                            print(f"Skipping {valid_tokens[i]} due to invalid log returns")
                     else:
-                        print(f"Skipping {valid_tokens[i]} due to invalid log returns")
+                        print(f"Unexpected log returns length for {valid_tokens[i]}: {len(log_returns)} vs {target_length}")
+                else:
+                    print(f"Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} log returns")
                         
             elif method == 'prices':
                 # Use raw prices directly (regardless of use_log_price setting)
@@ -1081,4 +1135,424 @@ class AutocorrelationClusteringAnalyzer:
             'sequence_length': feature_matrix.shape[1] if method != 'dtw_features' else 'variable'
         }
         
-        return results 
+        return results
+
+    # ================================
+    # PHASE 1A: MULTI-RESOLUTION ACF ANALYSIS METHODS
+    # ================================
+    
+    def analyze_by_lifespan_category(self, data_dir: Path, 
+                                   method: str = 'returns',
+                                   use_log_price: bool = True,
+                                   max_tokens_per_category: Optional[int] = None) -> Dict:
+        """
+        Analyze tokens by lifespan categories: Sprint, Standard, Marathon
+        
+        Args:
+            data_dir: Directory containing token data
+            method: Price transformation method
+            use_log_price: Whether to use log prices
+            max_tokens_per_category: Maximum tokens per category
+            
+        Returns:
+            Dictionary with results for each lifespan category
+        """
+        # Load all token data
+        all_token_data = self.load_raw_prices(data_dir)
+        
+        # Categorize tokens by lifespan
+        categories = {
+            'Sprint': {},      # 200-400 minutes
+            'Standard': {},    # 400-1200 minutes  
+            'Marathon': {}     # 1200+ minutes
+        }
+        
+        for token_name, df in all_token_data.items():
+            lifespan = len(df)
+            
+            if 200 <= lifespan <= 400:
+                categories['Sprint'][token_name] = df
+            elif 400 < lifespan <= 1200:
+                categories['Standard'][token_name] = df
+            elif lifespan > 1200:
+                categories['Marathon'][token_name] = df
+        
+        print(f"Token distribution by lifespan:")
+        for category, tokens in categories.items():
+            print(f"  {category}: {len(tokens)} tokens")
+            
+        # Analyze each category separately
+        results_by_category = {}
+        
+        for category_name, token_data in categories.items():
+            if len(token_data) == 0:
+                print(f"Skipping {category_name} - no tokens in this category")
+                continue
+                
+            print(f"\nAnalyzing {category_name} category ({len(token_data)} tokens)...")
+            
+            # Limit tokens per category if specified
+            if max_tokens_per_category and len(token_data) > max_tokens_per_category:
+                # Sample randomly to get diverse representation
+                import random
+                token_names = list(token_data.keys())
+                sampled_names = random.sample(token_names, max_tokens_per_category)
+                token_data = {name: token_data[name] for name in sampled_names}
+                print(f"  Sampled {len(token_data)} tokens for analysis")
+            
+            try:
+                # For category-specific analysis, we need to work with the subset
+                # Create a temporary directory-like structure
+                temp_results = {}
+                
+                # Compute ACF for category tokens
+                acf_results = self.compute_all_autocorrelations(token_data, use_log_price)
+                
+                # Prepare price data for clustering
+                feature_matrix, token_names = self.prepare_price_only_data(
+                    token_data, method=method, use_log_price=use_log_price
+                )
+                
+                if len(feature_matrix) == 0:
+                    print(f"No valid feature matrix for {category_name}")
+                    continue
+                
+                # Perform clustering
+                clustering_results = self.perform_clustering(
+                    feature_matrix, 
+                    method='kmeans',
+                    find_optimal_k=True
+                )
+                
+                # Compute t-SNE
+                tsne_2d = self.compute_tsne(feature_matrix, n_components=2)
+                tsne_3d = self.compute_tsne(feature_matrix, n_components=3)
+                
+                # Analyze clusters
+                cluster_stats = self.analyze_cluster_characteristics(
+                    token_data, 
+                    clustering_results['labels'], 
+                    token_names
+                )
+                
+                # Organize ACF by cluster
+                acf_by_cluster = {}
+                for cluster_id in np.unique(clustering_results['labels']):
+                    mask = clustering_results['labels'] == cluster_id
+                    cluster_tokens = [token_names[i] for i in np.where(mask)[0]]
+                    cluster_acfs = [acf_results[token]['acf'] for token in cluster_tokens if token in acf_results]
+                    
+                    if cluster_acfs:
+                        max_len = max(len(acf) for acf in cluster_acfs)
+                        padded_acfs = []
+                        for acf in cluster_acfs:
+                            padded = np.pad(acf, (0, max_len - len(acf)), mode='constant', constant_values=0)
+                            padded_acfs.append(padded)
+                            
+                        acf_by_cluster[cluster_id] = np.array(padded_acfs)
+                
+                # Compile category results
+                category_results = {
+                    'token_data': token_data,
+                    'acf_results': acf_results,
+                    'feature_matrix': feature_matrix,
+                    'token_names': token_names,
+                    'cluster_labels': clustering_results['labels'],
+                    'clustering_results': clustering_results,
+                    't_sne_2d': tsne_2d,
+                    't_sne_3d': tsne_3d,
+                    'cluster_stats': cluster_stats,
+                    'acf_by_cluster': acf_by_cluster,
+                    'use_log_price': use_log_price,
+                    'n_clusters': clustering_results['n_clusters'],
+                    'category': category_name,
+                    'lifespan_range': self._get_lifespan_range(category_name),
+                    'analysis_method': f'multi_resolution_{method}'
+                }
+                
+                results_by_category[category_name] = category_results
+                
+            except Exception as e:
+                print(f"Error analyzing {category_name}: {e}")
+                continue
+        
+        # Compile multi-resolution results
+        multi_resolution_results = {
+            'categories': results_by_category,
+            'category_summary': {
+                category: {
+                    'n_tokens': len(results['token_data']),
+                    'n_clusters': results['n_clusters'],
+                    'lifespan_range': results['lifespan_range']
+                }
+                for category, results in results_by_category.items()
+            },
+            'analysis_method': f'multi_resolution_{method}',
+            'total_tokens_analyzed': sum(len(results['token_data']) for results in results_by_category.values())
+        }
+        
+        return multi_resolution_results
+    
+    def _get_lifespan_range(self, category_name: str) -> str:
+        """Get lifespan range description for category"""
+        ranges = {
+            'Sprint': '200-400 minutes',
+            'Standard': '400-1200 minutes', 
+            'Marathon': '1200+ minutes'
+        }
+        return ranges.get(category_name, 'Unknown')
+    
+    def compute_multi_resolution_acf(self, token_data: Dict[str, pl.DataFrame],
+                                   time_horizons: List[int] = None) -> Dict:
+        """
+        Compute ACF at multiple time horizons for cross-resolution analysis
+        
+        Args:
+            token_data: Dictionary of token DataFrames
+            time_horizons: List of maximum lags to compute (default: [20, 50, 100])
+            
+        Returns:
+            Dictionary with ACF results at different time horizons
+        """
+        if time_horizons is None:
+            time_horizons = [20, 50, 100]  # Short, medium, long horizons
+            
+        multi_resolution_acf = {}
+        
+        for horizon in time_horizons:
+            print(f"Computing ACF with max lag {horizon}...")
+            
+            # Temporarily set max_lag for this horizon
+            original_max_lag = self.max_lag
+            self.max_lag = horizon
+            
+            try:
+                # Compute ACF for all tokens at this horizon
+                acf_results = self.compute_all_autocorrelations(token_data, use_log_price=True)
+                multi_resolution_acf[f'horizon_{horizon}'] = acf_results
+                
+            except Exception as e:
+                print(f"Error computing ACF for horizon {horizon}: {e}")
+                multi_resolution_acf[f'horizon_{horizon}'] = {}
+            finally:
+                # Restore original max_lag
+                self.max_lag = original_max_lag
+        
+        return multi_resolution_acf
+    
+    def dtw_clustering_variable_length(self, token_data: Dict[str, pl.DataFrame],
+                                     use_log_price: bool = True,
+                                     n_clusters: int = 5,
+                                     max_tokens: Optional[int] = None) -> Dict:
+        """
+        Perform DTW-based clustering for variable-length sequences
+        
+        Args:
+            token_data: Dictionary of token DataFrames
+            use_log_price: Whether to use log prices
+            n_clusters: Number of clusters
+            max_tokens: Maximum number of tokens to analyze
+            
+        Returns:
+            Dictionary with DTW clustering results
+        """
+        from dtaidistance import dtw
+        from sklearn.cluster import AgglomerativeClustering
+        
+        # Prepare data
+        price_col = 'log_price' if use_log_price else 'price'
+        
+        valid_tokens = []
+        price_series = []
+        
+        # Collect price series (keeping original lengths)
+        for token_name, df in token_data.items():
+            if price_col in df.columns:
+                prices = df[price_col].to_numpy()
+                if len(prices) >= 50:  # Minimum length for meaningful DTW
+                    valid_tokens.append(token_name)
+                    price_series.append(prices)
+                    
+        if len(price_series) == 0:
+            raise ValueError("No valid price series for DTW clustering")
+            
+        # Limit tokens if specified
+        if max_tokens and len(price_series) > max_tokens:
+            import random
+            indices = random.sample(range(len(price_series)), max_tokens)
+            price_series = [price_series[i] for i in indices]
+            valid_tokens = [valid_tokens[i] for i in indices]
+        
+        print(f"Computing DTW distances for {len(price_series)} variable-length sequences...")
+        
+        # Compute DTW distance matrix
+        n_series = len(price_series)
+        distance_matrix = np.zeros((n_series, n_series))
+        
+        for i in tqdm(range(n_series), desc="Computing DTW distances"):
+            for j in range(i+1, n_series):
+                try:
+                    # Use DTW distance with window constraint for efficiency
+                    window_size = max(10, int(0.1 * max(len(price_series[i]), len(price_series[j]))))
+                    dist = dtw.distance(price_series[i], price_series[j], window=window_size)
+                    
+                    # Handle invalid distance values
+                    if np.isnan(dist) or np.isinf(dist) or dist < 0:
+                        # Use Euclidean distance of summary statistics as fallback
+                        mean_diff = abs(np.mean(price_series[i]) - np.mean(price_series[j]))
+                        std_diff = abs(np.std(price_series[i]) - np.std(price_series[j]))
+                        dist = mean_diff + std_diff
+                    
+                    distance_matrix[i, j] = dist
+                    distance_matrix[j, i] = dist
+                    
+                except Exception as e:
+                    print(f"Error computing DTW between series {i} and {j}: {e}")
+                    # Use Euclidean distance of summary statistics as fallback
+                    try:
+                        mean_diff = abs(np.mean(price_series[i]) - np.mean(price_series[j]))
+                        std_diff = abs(np.std(price_series[i]) - np.std(price_series[j]))
+                        fallback_dist = mean_diff + std_diff
+                        distance_matrix[i, j] = fallback_dist
+                        distance_matrix[j, i] = fallback_dist
+                    except:
+                        # Last resort: use a large but finite distance
+                        distance_matrix[i, j] = 1000.0
+                        distance_matrix[j, i] = 1000.0
+        
+        # Validate distance matrix before clustering
+        if np.any(np.isnan(distance_matrix)) or np.any(np.isinf(distance_matrix)):
+            print("Warning: Distance matrix contains NaN or inf values, cleaning...")
+            distance_matrix = np.nan_to_num(distance_matrix, nan=1000.0, posinf=1000.0, neginf=0.0)
+        
+        # Ensure matrix is symmetric
+        distance_matrix = (distance_matrix + distance_matrix.T) / 2
+        
+        # Perform hierarchical clustering on DTW distances
+        try:
+            # Use precomputed distance matrix
+            clusterer = AgglomerativeClustering(
+                n_clusters=min(n_clusters, len(valid_tokens)), 
+                metric='precomputed',
+                linkage='average'
+            )
+            labels = clusterer.fit_predict(distance_matrix)
+            
+        except Exception as e:
+            print(f"DTW clustering failed: {e}")
+            # Fallback to random assignment
+            labels = np.random.randint(0, min(n_clusters, len(valid_tokens)), size=len(valid_tokens))
+        
+        # Analyze cluster characteristics
+        cluster_stats = {}
+        for cluster_id in np.unique(labels):
+            mask = labels == cluster_id
+            cluster_tokens = [valid_tokens[i] for i in np.where(mask)[0]]
+            cluster_lengths = [len(price_series[i]) for i in np.where(mask)[0]]
+            
+            cluster_stats[cluster_id] = {
+                'n_tokens': int(np.sum(mask)),
+                'token_names': cluster_tokens,
+                'avg_length': float(np.mean(cluster_lengths)),
+                'std_length': float(np.std(cluster_lengths)),
+                'min_length': int(np.min(cluster_lengths)),
+                'max_length': int(np.max(cluster_lengths))
+            }
+        
+        return {
+            'labels': labels,
+            'token_names': valid_tokens,
+            'distance_matrix': distance_matrix,
+            'cluster_stats': cluster_stats,
+            'n_clusters': len(np.unique(labels)),
+            'method': 'dtw_variable_length'
+        }
+    
+    def compare_acf_across_lifespans(self, multi_resolution_results: Dict) -> Dict:
+        """
+        Compare ACF patterns across different lifespan categories
+        
+        Args:
+            multi_resolution_results: Results from analyze_by_lifespan_category()
+            
+        Returns:
+            Dictionary with cross-lifespan ACF comparison
+        """
+        if 'categories' not in multi_resolution_results:
+            raise ValueError("Invalid multi-resolution results format")
+            
+        acf_comparison = {
+            'category_acf_means': {},
+            'category_acf_stds': {},
+            'cross_category_correlations': {},
+            'distinctive_patterns': {}
+        }
+        
+        categories = multi_resolution_results['categories']
+        
+        # Compute mean ACF patterns for each category
+        for category_name, results in categories.items():
+            if 'acf_by_cluster' in results:
+                all_acfs = []
+                
+                # Collect all ACF patterns in this category
+                for cluster_id, cluster_acfs in results['acf_by_cluster'].items():
+                    for acf in cluster_acfs:
+                        all_acfs.append(acf)
+                
+                if all_acfs:
+                    # Pad to same length
+                    max_len = max(len(acf) for acf in all_acfs)
+                    padded_acfs = []
+                    for acf in all_acfs:
+                        padded = np.pad(acf, (0, max_len - len(acf)), mode='constant', constant_values=0)
+                        padded_acfs.append(padded)
+                    
+                    acf_matrix = np.array(padded_acfs)
+                    
+                    # Compute statistics
+                    acf_comparison['category_acf_means'][category_name] = np.mean(acf_matrix, axis=0)
+                    acf_comparison['category_acf_stds'][category_name] = np.std(acf_matrix, axis=0)
+        
+        # Compute cross-category correlations
+        category_names = list(acf_comparison['category_acf_means'].keys())
+        for i, cat1 in enumerate(category_names):
+            for j, cat2 in enumerate(category_names):
+                if i <= j:  # Upper triangular matrix
+                    mean1 = acf_comparison['category_acf_means'][cat1]
+                    mean2 = acf_comparison['category_acf_means'][cat2]
+                    
+                    # Trim to same length
+                    min_len = min(len(mean1), len(mean2))
+                    corr = np.corrcoef(mean1[:min_len], mean2[:min_len])[0, 1]
+                    
+                    acf_comparison['cross_category_correlations'][f'{cat1}_vs_{cat2}'] = corr
+        
+        # Identify distinctive patterns (largest differences)
+        if len(category_names) >= 2:
+            for cat in category_names:
+                mean_acf = acf_comparison['category_acf_means'][cat]
+                
+                # Compare with other categories
+                other_cats = [c for c in category_names if c != cat]
+                if other_cats:
+                    other_means = [acf_comparison['category_acf_means'][c] for c in other_cats]
+                    
+                    # Find lags where this category differs most
+                    max_differences = []
+                    for lag in range(min(len(mean_acf), min(len(m) for m in other_means))):
+                        cat_value = mean_acf[lag]
+                        other_values = [m[lag] for m in other_means]
+                        avg_other = np.mean(other_values)
+                        difference = abs(cat_value - avg_other)
+                        max_differences.append(difference)
+                    
+                    # Find top distinctive lags
+                    distinctive_lags = np.argsort(max_differences)[-5:][::-1]  # Top 5
+                    
+                    acf_comparison['distinctive_patterns'][cat] = {
+                        'distinctive_lags': distinctive_lags.tolist(),
+                        'differences': [max_differences[lag] for lag in distinctive_lags]
+                    }
+        
+        return acf_comparison 

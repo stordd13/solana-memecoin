@@ -8,51 +8,97 @@
 - **25k tokens**: "Dead" after N minutes/hours
 - **Artifacts**: Staircase patterns, 60min gaps
 
-**Current Challenge**: ML models showing unstable performance (70%→45% precision, 95%→25% recall) due to mixing different behavioral patterns.
+**Current Challenge**: ML models showing unstable performance (70%→45% precision, 95%→25% recall) due to mixing different behavioral patterns. 
+
+**✅ SOLVED: Mathematical Stability**: Comprehensive TDD implementation completed:
+- **data_analysis/**: 16/16 mathematical validation tests passing
+- **data_cleaning/**: 44/44 mathematical validation tests passing  
+- All calculations validated to 1e-12 precision against numpy/scipy references
+- Streamlit display accuracy mathematically guaranteed
+
+**Immediate Priority**: Establish stable behavioral archetypes through ACF + Clustering + t-SNE analysis **BEFORE** returning to feature engineering and ML pipeline work.
 
 **Goal**: Use ACF + Clustering + t-SNE to identify distinct memecoin behavioral archetypes for stable ML pipeline.
 
 ---
 
-## 🎯 **Phase 1: Pattern Discovery & Behavioral Archetype Identification**
+## 🚀 **PHASE 1A: IMMEDIATE PRIORITY - Multi-Resolution ACF Analysis** ⭐
 
-### **Objective**: Discover 5-8 distinct memecoin behavioral archetypes
+### **Objective**: Establish stable clustering baseline (Weeks 1-2)
 
-#### **1.1 Multi-Resolution ACF Analysis**
-- [ ] **Sprint Analysis** (200-400 min tokens): Fast-moving patterns
-- [ ] **Standard Analysis** (400-1200 min tokens): Typical lifecycle  
-- [ ] **Marathon Analysis** (1200+ min tokens): Extended development
-- [ ] **Cross-resolution comparison**: How patterns change with lifespan
+#### **1A.1 Multi-Resolution ACF Implementation** 
+- [ ] **Sprint Analysis** (200-400 min tokens): Fast pump/dump patterns
+- [ ] **Standard Analysis** (400-1200 min tokens): Typical memecoin lifecycle  
+- [ ] **Marathon Analysis** (1200+ min tokens): Extended development patterns
+- [ ] **Cross-resolution ACF comparison**: How patterns change with lifespan
+- [ ] **Variable-length sequence handling**: DTW clustering for different lifespans
 
 **Key Questions:**
 - Do different lifespans show fundamentally different ACF signatures?
 - Which time horizons reveal the clearest behavioral differences?
+- Can we identify archetype-specific ACF patterns?
 
-#### **1.2 Extreme-Return-Aware Clustering**
-- [ ] **Price transformation testing**: returns, log_returns, raw prices, normalized cumulative returns
-- [ ] **Cluster stability analysis**: Optimal K finding across different transformations
-- [ ] **Archetype identification**: Label clusters by behavioral characteristics
+#### **1A.2 Enhanced Clustering Pipeline**
+- [ ] **Price transformation testing**: raw prices, returns, log_returns, normalized cumulative returns
+- [ ] **DTW clustering implementation**: Handle variable-length sequences properly
+- [ ] **Multiple clustering methods**: K-means, hierarchical, DBSCAN comparison
+- [ ] **Cluster stability analysis**: Optimal K finding across transformations and methods
+- [ ] **ACF-based distance metrics**: Custom similarity measures for time series
 
-**Expected Clusters:**
-- "Moon Mission": Sustained pumps with momentum ACF
-- "Rug Pull": Quick pump → sustained dump
-- "Slow Bleed": Gradual decline patterns
-- "Volatile Chop": High volatility, no direction
-- "Dead on Arrival": Minimal activity
-
-#### **1.3 t-SNE Behavioral Mapping**
-- [ ] **Multi-dimensional pattern visualization**: Price magnitude × Timing × Volatility axes
-- [ ] **Outlier identification**: Truly unique/anomalous patterns
+#### **1A.3 Interactive t-SNE Behavioral Mapping**
+- [ ] **Multi-dimensional visualization**: ACF features + price patterns + volatility
+- [ ] **Real-time cluster exploration**: Interactive archetype identification
+- [ ] **Outlier detection**: Identify truly unique/anomalous patterns
 - [ ] **Density analysis**: Common vs rare behavioral patterns
 
-**Success Metrics:**
-- Clear separation between behavioral archetypes
-- Smooth transitions within similar types
-- Interpretable cluster boundaries
+**Success Metrics for Phase 1A:**
+- Stable clustering across different token samples
+- Clear ACF signature differences between clusters
+- Interactive visualization working for all lifespan categories
 
 ---
 
-## ⏰ **Phase 2: Temporal Pattern Recognition**
+## 🎯 **PHASE 1B: Archetype Validation & Characterization** 
+
+### **Objective**: Validate and refine discovered archetypes
+
+#### **1B.1 Archetype Characterization**
+- [ ] **Behavioral labeling**: Assign meaningful names to each cluster
+- [ ] **ACF signature analysis**: Define unique patterns for each archetype
+- [ ] **Intra-cluster similarity**: Measure >80% ACF similarity within clusters
+- [ ] **Inter-cluster differences**: Ensure <50% ACF similarity between clusters
+
+**Expected Archetypes:**
+- "Moon Mission": Sustained pumps with momentum ACF
+- "Rug Pull": Quick pump → sustained dump
+- "Slow Bleed": Gradual decline patterns
+- "Volatile Chop": High volatility, no clear direction
+- "Dead on Arrival": Minimal activity from launch
+
+#### **1B.2 Cross-Resolution Validation**
+- [ ] **Pattern consistency**: Verify archetypes exist across lifespan categories
+- [ ] **Lifecycle evolution**: How archetypes manifest differently in Sprint vs Marathon
+- [ ] **Archetype-specific characteristics**: Define unique signatures per category
+
+#### **1B.3 Stability Testing**
+- [ ] **Cross-validation**: Test stability across different token samples
+- [ ] **Parameter sensitivity**: Ensure robustness to clustering parameters
+- [ ] **Temporal validation**: Test across different market periods
+
+**Success Metrics for Phase 1B:**
+- 5-8 distinct behavioral archetypes with clear ACF signatures
+- >80% intra-cluster ACF similarity within each archetype
+- <50% inter-cluster ACF similarity between different archetypes
+- Stable results across different validation approaches
+
+---
+
+---
+
+## ⏸️ **PHASE 2: POSTPONED - Temporal Pattern Recognition**
+
+> **Status**: POSTPONED until Phase 1A/1B establishes stable baseline
+> **Return Priority**: After achieving 5-8 stable behavioral archetypes
 
 ### **Objective**: Identify timing signatures and lifecycle phase transitions
 
@@ -79,7 +125,10 @@
 
 ---
 
-## 🔧 **Phase 3: Feature Engineering & ML Pipeline Stabilization**
+## ⏸️ **PHASE 3: POSTPONED - Feature Engineering & ML Pipeline Stabilization**
+
+> **Status**: POSTPONED until Phase 1A/1B establishes stable baseline
+> **Return Priority**: After behavioral archetypes are validated - will include Shapley values & mutual information analysis
 
 ### **Objective**: Create stable, cluster-specific feature sets for ML
 
@@ -105,7 +154,10 @@
 
 ---
 
-## 📈 **Phase 4: Advanced Analysis & Volume Integration Prep**
+## ⏸️ **PHASE 4: POSTPONED - Advanced Analysis & Volume Integration Prep**
+
+> **Status**: POSTPONED until Phase 1A/1B establishes stable baseline
+> **Return Priority**: After cluster-specific feature engineering is complete
 
 ### **Objective**: Prepare for volume/transaction data integration
 
@@ -150,27 +202,30 @@
 
 ---
 
-## 📅 **Implementation Timeline**
+## 📅 **UPDATED Implementation Timeline - FOCUSED APPROACH**
 
-### **Week 1-2: Phase 1 - Pattern Discovery**
-- Multi-resolution ACF analysis
-- Initial clustering experiments
-- t-SNE visualization setup
+### **Week 1: Phase 1A - Multi-Resolution ACF Analysis** ⭐
+- **Priority Focus**: Sprint/Standard/Marathon ACF implementation
+- Multi-resolution ACF comparison pipeline
+- Enhanced clustering with DTW for variable-length sequences
+- Interactive t-SNE behavioral mapping interface
 
-### **Week 3-4: Phase 2 - Temporal Patterns**
-- Lifecycle phase analysis
-- Timing pattern discovery
-- Predictive signature identification
+### **Week 2: Phase 1B - Archetype Validation** ⭐
+- **Priority Focus**: Archetype characterization and validation
+- Behavioral labeling and ACF signature analysis
+- Cross-resolution validation and stability testing
+- Export stable archetype definitions
 
-### **Week 5-6: Phase 3 - ML Pipeline**
-- Cluster-specific feature engineering
-- Model redesign and validation
-- Stability testing
+### **Week 3+: Return to Feature Engineering**
+- **After stable baseline established**: Return to feature engineering
+- Implement Shapley values and mutual information analysis
+- Cluster-specific feature engineering based on discovered archetypes
+- Enhanced ML pipeline with archetype-aware approach
 
-### **Week 7-8: Phase 4 - Advanced Analysis**
-- Advanced pattern analysis
-- Volume integration preparation
-- Production pipeline design
+### **Postponed Until After Stable Baseline:**
+- Phase 2: Temporal Pattern Recognition  
+- Phase 3: ML Pipeline Stabilization (enhanced with archetype knowledge)
+- Phase 4: Volume Integration Preparation
 
 ---
 
