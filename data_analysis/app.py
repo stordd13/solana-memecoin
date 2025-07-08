@@ -10,6 +10,8 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import streamlit as st
+from streamlit_utils.formatting import format_large_number, format_file_count, format_data_points, format_percentage, format_currency
+from streamlit_utils.components import DataSourceManager, TokenSelector, NavigationManager
 import polars as pl
 import numpy as np
 import plotly.graph_objects as go
@@ -18,7 +20,6 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union
 from collections import Counter
-import random
 import shutil
 import plotly.express as px
 import os
@@ -33,150 +34,69 @@ from data_cleaning.clean_tokens import CategoryAwareTokenCleaner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize session state
-if 'data_loaded' not in st.session_state:
-    st.session_state.data_loaded = False
-if 'data_loader' not in st.session_state:
-    st.session_state.data_loader = None
-if 'quality_analyzer' not in st.session_state:
-    st.session_state.quality_analyzer = None
-if 'price_analyzer' not in st.session_state:
-    st.session_state.price_analyzer = None
-if 'selected_datasets' not in st.session_state:
-    st.session_state.selected_datasets = None
-
 def main():
     st.title("Memecoin Data Analysis Dashboard")
     
+    # Initialize session state
+    if 'data_loaded' not in st.session_state:
+        st.session_state.data_loaded = False
+    if 'data_loader' not in st.session_state:
+        st.session_state.data_loader = None
+    if 'quality_analyzer' not in st.session_state:
+        st.session_state.quality_analyzer = None
+    if 'price_analyzer' not in st.session_state:
+        st.session_state.price_analyzer = None
+    if 'selected_datasets' not in st.session_state:
+        st.session_state.selected_datasets = None
+    
     # Sidebar navigation
     st.sidebar.title("Navigation")
-    # Data folder selection (before loading)
+    
+    # Initialize shared components
+    data_source_manager = DataSourceManager()
+    navigation_manager = NavigationManager()
+    
+    # Data source selection (before loading)
     if not st.session_state.data_loaded:
-        st.sidebar.subheader("Select Data Source")
-        
-        # Common data subfolders
-        common_subfolders = [
-            "raw/dataset",
-            "processed",
-            "cleaned",
-            "features"
-        ]
-        
-        # Find available subfolders with parquet files
-        project_root = Path(__file__).resolve().parent.parent
-        data_root = project_root / "data"
-        available_subfolders = []
-        
-        for subfolder in common_subfolders:
-            subfolder_path = data_root / subfolder
-            if subfolder_path.exists():
-                parquet_files = list(subfolder_path.rglob('*.parquet'))
-                if parquet_files:
-                    available_subfolders.append((subfolder, len(parquet_files)))
-        
-        # Add custom option for other subfolders
-        for root, dirs, files in os.walk(data_root):
-            if any(f.endswith('.parquet') for f in files):
-                rel = os.path.relpath(root, data_root)
-                if rel not in common_subfolders and (rel, len([f for f in files if f.endswith('.parquet')])) not in available_subfolders:
-                    available_subfolders.append((rel, len([f for f in files if f.endswith('.parquet')])))
-        
-        if not available_subfolders:
-            st.sidebar.error("No parquet files found in data directory!")
+        result = data_source_manager.render_data_source_selection()
+        if result:
+            selected_subfolder, file_count = result
+            if data_source_manager.render_load_button(selected_subfolder, data_loader_class=DataLoader):
+                return
+        else:
             return
-        
-        # Create selectbox with subfolder info
-        subfolder_options = [f"{sf} ({count:,} files)" for sf, count in available_subfolders]
-        if 'selected_subfolder_idx' not in st.session_state:
-            st.session_state.selected_subfolder_idx = 0
-        
-        selected_idx = st.sidebar.selectbox(
-            "Choose data subfolder:",
-            range(len(subfolder_options)),
-            format_func=lambda x: subfolder_options[x],
-            index=st.session_state.selected_subfolder_idx,
-            key="subfolder_select"
-        )
-        
-        selected_subfolder = available_subfolders[selected_idx][0]
-        file_count = available_subfolders[selected_idx][1]
-        
-        st.sidebar.info(f"Selected: `data/{selected_subfolder}`\n{file_count:,} parquet files")
-        
-        if st.sidebar.button("Load Data", type="primary"):
-            try:
-                st.session_state.data_loader = DataLoader(subfolder=selected_subfolder)
-                # Pre-cache the tokens
-                st.session_state.data_loader.get_available_tokens()
-                st.session_state.data_loaded = True
-                st.session_state.selected_subfolder_idx = selected_idx
-                st.success(f"Data loaded from data/{selected_subfolder} successfully!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error loading data from data/{selected_subfolder}: {e}")
-                logger.error(f"Error loading data from data/{selected_subfolder}: {e}")
-        return
+    
     # Sidebar navigation after loading
     page = st.sidebar.radio("Go to", ["Data Quality", "Price Analysis", "Pattern Detection", "Price Distribution", "Variability Analysis"])
-    if st.sidebar.button("Change Data Source"):
-        st.session_state.data_loaded = False
-        st.session_state.data_loader = None
-        st.session_state.pop('selected_subfolder_idx', None)
-        st.session_state.pop('dq_selected_datasets', None)
-        st.rerun()
     
-    # Add a button to refresh analyzers
-    if st.sidebar.button("Refresh Analyzers"):
-        st.session_state.quality_analyzer = None
-        st.session_state.price_analyzer = None
-        st.success("Analyzers refreshed!")
-        st.rerun()
+    # Common navigation controls
+    navigation_manager.render_common_sidebar_controls([
+        'quality_analyzer', 
+        'price_analyzer'
+    ])
         
-    # Token selection mode in sidebar
-    selection_mode = st.sidebar.radio(
-        "Token Selection Mode",
-        ["Single Token", "Multiple Tokens", "Random Tokens", "All Tokens"],
-        help="Choose how to select tokens for analysis"
-    )
-    # Get available tokens from loaded folder
-    available_tokens = st.session_state.data_loader.get_available_tokens()
-    token_symbols = sorted([t['symbol'] for t in available_tokens])
-    # Token selection widgets in sidebar
-    selected_tokens = []
-    if selection_mode == "Single Token":
-        if 'dq_single_token' not in st.session_state or st.session_state.dq_single_token not in token_symbols:
-            st.session_state.dq_single_token = token_symbols[0] if token_symbols else None
-        st.sidebar.selectbox("Select Token", token_symbols, key="dq_single_token")
-        selected_tokens = [st.session_state.dq_single_token] if st.session_state.dq_single_token else []
-    elif selection_mode == "Multiple Tokens":
-        if 'dq_multi_tokens' not in st.session_state:
-            st.session_state.dq_multi_tokens = []
-        st.sidebar.multiselect("Select Tokens", token_symbols, key="dq_multi_tokens")
-        selected_tokens = st.session_state.dq_multi_tokens
-    elif selection_mode == "Random Tokens":
-        if 'dq_random_tokens' not in st.session_state:
-            st.session_state.dq_random_tokens = []
-        num_tokens = st.sidebar.number_input(
-            "Number of Random Tokens", min_value=1, max_value=len(token_symbols), value=5, key="dq_random_num"
-        )
-        if st.sidebar.button("Select Random Tokens", key="dq_random_btn"):
-            st.session_state.dq_random_tokens = random.sample(token_symbols, min(num_tokens, len(token_symbols)))
-        selected_tokens = st.session_state.dq_random_tokens
-    else:  # All Tokens
-        selected_tokens = token_symbols.copy()
+    # Token selection using shared component (only after data is loaded)
+    if st.session_state.data_loader is not None:
+        token_selector = TokenSelector(st.session_state.data_loader, key_prefix="dq_")
+        selected_token_dicts = token_selector.render_token_selection()
+        token_selector.display_selection_summary(selected_token_dicts)
+        selected_tokens = [t['symbol'] for t in selected_token_dicts]
+    else:
+        st.sidebar.error("Data loader not initialized. Please reload the page.")
+        selected_tokens = []
     # Main content based on selected page
     if page == "Data Quality":
-        show_data_quality(selected_tokens, selection_mode)
+        show_data_quality(selected_tokens)
     elif page == "Price Analysis":
-        show_price_analysis(selected_tokens, selection_mode)
+        show_price_analysis(selected_tokens)
     elif page == "Pattern Detection":
-        show_pattern_detection(selected_tokens, selection_mode)
+        show_pattern_detection(selected_tokens)
     elif page == "Price Distribution":
-        show_price_distribution(selected_tokens, selection_mode)
+        show_price_distribution(selected_tokens)
     elif page == "Variability Analysis":
-        show_variability_analysis(selected_tokens, selection_mode)
+        show_variability_analysis(selected_tokens)
 
-def show_data_quality(selected_tokens, selection_mode):
+def show_data_quality(selected_tokens):
     """Display data quality analysis"""
     st.header("Data Quality Analysis")
     
@@ -201,8 +121,8 @@ def show_data_quality(selected_tokens, selection_mode):
         dead_tokens_count = sum(1 for report in quality_reports.values() if report['is_dead'])
         st.subheader(f"Number of Dead Tokens: {dead_tokens_count}")
         
-        # Calculate and display dead tokens per hour only for multiple, random, or all tokens
-        if selection_mode in ["Multiple Tokens", "Random Tokens", "All Tokens"]:
+        # Calculate and display dead tokens per hour for multiple tokens
+        if len(selected_tokens) > 1:
             # Group tokens by the duration of their "death"
             death_durations = [report.get('death_duration_hours', 0) for report in quality_reports.values()]
             duration_counts = Counter(death_durations)
@@ -365,13 +285,13 @@ def show_data_quality(selected_tokens, selection_mode):
                 
                 # Display results
                 total_exported = sum(len(tokens) for tokens in exported_results.values())
-                st.success(f'✅ Successfully exported {total_exported:,} tokens across all categories!')
+                st.success(f'✅ Successfully exported {format_large_number(total_exported)} tokens across all categories!')
                 
                 # Show breakdown
                 st.subheader("Export Summary")
                 for category, tokens in exported_results.items():
                     if tokens:
-                        st.write(f"✅ **{category}**: {len(tokens):,} tokens exported")
+                        st.write(f"✅ **{category}**: {format_large_number(len(tokens))} tokens exported")
                     else:
                         st.write(f"⚠️ **{category}**: No tokens found")
                         
@@ -497,7 +417,7 @@ def show_data_quality(selected_tokens, selection_mode):
     else:
         st.warning("No data available for the selected tokens")
         
-def show_price_analysis(selected_tokens, selection_mode):
+def show_price_analysis(selected_tokens):
     st.title("Price Analysis")
     if not selected_tokens:
         st.warning("Please select at least one token")
@@ -508,7 +428,7 @@ def show_price_analysis(selected_tokens, selection_mode):
         st.session_state.price_analyzer = PriceAnalyzer()
 
     # Single or multiple token analysis
-    if selection_mode == "Single Token":
+    if len(selected_tokens) == 1:
         token = selected_tokens[0]
         df = st.session_state.data_loader.get_token_data(token)
         if df is not None and not df.is_empty():
@@ -538,7 +458,7 @@ def show_price_analysis(selected_tokens, selection_mode):
         else:
             st.warning("No tokens were successfully analyzed")
 
-def show_pattern_detection(selected_tokens, selection_mode):
+def show_pattern_detection(selected_tokens):
     st.header("Pattern Detection")
     if not selected_tokens:
         st.warning("Please select at least one token")
@@ -557,7 +477,7 @@ def show_pattern_detection(selected_tokens, selection_mode):
             except Exception as e:
                 st.error(f"Error analyzing patterns for {token}: {str(e)}")
 
-def show_price_distribution(selected_tokens, selection_mode):
+def show_price_distribution(selected_tokens):
     st.header("Price Distribution with Gap Analysis")
     if not selected_tokens:
         st.info("No tokens selected.")
@@ -700,7 +620,7 @@ def show_price_distribution(selected_tokens, selection_mode):
         
         st.divider()
 
-def show_variability_analysis(selected_tokens, selection_mode):
+def show_variability_analysis(selected_tokens):
     """Display token variability analysis to distinguish real variations from straight-line patterns"""
     st.header("Token Variability Analysis")
     st.info("🔍 Analyze price patterns to distinguish real market variations from 'straight line' tokens")
@@ -745,7 +665,7 @@ def show_individual_variability_analysis(selected_tokens):
         
         # Get variability analysis
         try:
-            result_df, modifications = st.session_state.token_cleaner._check_price_variability(df, token)
+            result_df, modifications = st.session_state.token_cleaner._check_price_variability_graduated(df, token, "medium_term")
             
             # Extract metrics from modifications
             metrics = None
@@ -765,46 +685,68 @@ def show_individual_variability_analysis(selected_tokens):
                     st.warning(f"Missing metric '{metric_name}' for {token}, using default value 0.0")
                     metrics[metric_name] = 0.0
             
+            # Ensure new metric keys exist
+            if 'max_flat_minutes' not in metrics:
+                metrics['max_flat_minutes'] = 0
+            if 'tick_frequency' not in metrics:
+                metrics['tick_frequency'] = metrics.get('change_ratio', 0)
+            
             # Add is_low_variability key if missing (use is_straight_line as fallback)
             if 'is_low_variability' not in metrics:
                 metrics['is_low_variability'] = metrics.get('is_straight_line', False)
                 
-            # Display metrics in columns
+            # Display enhanced metrics in columns with new thresholds
             col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
-                price_cv = metrics.get('price_cv', 0.0)
-                cv_status = "🔴" if price_cv < 0.05 else "🟢"
-                st.metric("Price CV", f"{price_cv:.4f}", help="Coefficient of Variation")
-                st.write(f"{cv_status} Threshold: < 0.05")
+                recent_cv = metrics.get('price_cv', 0.0)  # Now shows recent CV
+                recent_cv_pass = metrics.get('recent_cv_pass', False)
+                cv_status = "🟢" if recent_cv_pass else "🔴"
+                st.metric("Recent Activity CV", f"{recent_cv:.4f}", help="Recent price variability (last 50% of data)")
+                st.write(f"{cv_status} Threshold: > 0.02")
             
             with col2:
                 log_price_cv = metrics.get('log_price_cv', 0.0)
-                log_cv_status = "🔴" if log_price_cv < 0.1 else "🟢"
-                st.metric("Log Price CV", f"{log_price_cv:.4f}")
-                st.write(f"{log_cv_status} Threshold: < 0.1")
+                log_cv_status = "🟢" if log_price_cv > 0.05 else "🔴"
+                st.metric("Log Price CV", f"{log_price_cv:.4f}", help="Stable variability measure")
+                st.write(f"{log_cv_status} Threshold: > 0.05")
             
             with col3:
-                flat_periods = metrics.get('flat_periods_fraction', 0.0)
-                flat_status = "🔴" if flat_periods > 0.8 else "🟢"
-                st.metric("Flat Periods", f"{flat_periods:.3f}")
-                st.write(f"{flat_status} Threshold: > 0.8")
+                activity_dist = 1 - metrics.get('flat_periods_fraction', 0.0)  # Invert back
+                activity_dist_pass = metrics.get('activity_dist_pass', False)
+                activity_status = "🟢" if activity_dist_pass else "🔴"
+                st.metric("Activity Distribution", f"{activity_dist:.3f}", help="How evenly spread price changes are over time")
+                st.write(f"{activity_status} Threshold: > 0.3")
             
             with col4:
-                range_eff = metrics.get('range_efficiency', 0.0)
-                range_status = "🔴" if range_eff < 0.1 else "🟢"
-                st.metric("Range Efficiency", f"{range_eff:.3f}")
-                st.write(f"{range_status} Threshold: < 0.1")
+                movement_eff = metrics.get('range_efficiency', 0.0)  # Now shows movement efficiency
+                movement_eff_pass = metrics.get('movement_eff_pass', False)
+                movement_status = "🟢" if movement_eff_pass else "🔴"
+                st.metric("Movement Efficiency", f"{movement_eff:.3f}", help="Price movement vs activity level")
+                st.write(f"{movement_status} Threshold: > 0.1")
             
             with col5:
-                norm_entropy = metrics.get('normalized_entropy', 0.0)
-                entropy_status = "🔴" if norm_entropy < 0.3 else "🟢"
-                st.metric("Entropy", f"{norm_entropy:.3f}")
-                st.write(f"{entropy_status} Threshold: < 0.3")
+                pattern_complex = metrics.get('normalized_entropy', 0.0)  # Now shows pattern complexity
+                pattern_complex_pass = metrics.get('pattern_complex_pass', False)
+                complexity_status = "🟢" if pattern_complex_pass else "🔴"
+                st.metric("Pattern Complexity", f"{pattern_complex:.3f}", help="Unpredictability of price patterns")
+                st.write(f"{complexity_status} Threshold: > 0.2")
             
-            # Overall decision
-            decision = "🔴 FILTERED (Low Variability)" if metrics['is_low_variability'] else "🟢 PASSED"
+            # Overall decision with explanation
+            is_filtered = metrics.get('is_low_variability', False)
+            passes_count = metrics.get('passes_count', 0)
+            recent_cv_pass = metrics.get('recent_cv_pass', False)
+            
+            if is_filtered:
+                decision = "🔴 FILTERED (Low Variability)"
+                explanation = f"Passes {passes_count}/5 criteria. Recent Activity CV: {'✓ Pass' if recent_cv_pass else '✗ Fail'}"
+            else:
+                decision = "🟢 PASSED"
+                explanation = f"Passes {passes_count}/5 criteria with required Recent Activity CV ✓"
+            
             st.markdown(f"**Final Decision:** {decision}")
+            st.markdown(f"**Criteria:** {explanation}")
+            st.info("**Filtering Rule:** Must pass Recent Activity CV + at least 3 out of 5 total criteria")
             
             # Price plot
             prices = df['price'].to_numpy()
@@ -813,7 +755,7 @@ def show_individual_variability_analysis(selected_tokens):
             # Create price plots
             fig = make_subplots(
                 rows=2, cols=2,
-                subplot_titles=('Raw Price', 'Log Price', 'Returns Distribution', 'Rolling CV'),
+                subplot_titles=('Raw Price', 'Log Price', 'Returns Over Time', 'Rolling CV'),
                 specs=[[{"secondary_y": False}, {"secondary_y": False}],
                        [{"secondary_y": False}, {"secondary_y": False}]]
             )
@@ -837,10 +779,16 @@ def show_individual_variability_analysis(selected_tokens):
                     row=1, col=2
                 )
             
-            # Returns distribution
-            finite_returns = returns[np.isfinite(returns)]
+            # Returns over time (time series)
+            datetime_col = df['datetime'].to_numpy()
+            finite_mask = np.isfinite(returns)
+            finite_returns = returns[finite_mask]
+            finite_datetime = datetime_col[1:][finite_mask[1:]]  # Skip first return (NaN)
+            
             fig.add_trace(
-                go.Histogram(x=finite_returns, name='Returns', nbinsx=50, opacity=0.7),
+                go.Scatter(x=finite_datetime, y=finite_returns, mode='markers+lines', 
+                          name='Returns Over Time', line=dict(color='orange'), 
+                          marker=dict(size=3)),
                 row=2, col=1
             )
             
@@ -914,7 +862,7 @@ def show_batch_variability_comparison(selected_tokens):
                 df = st.session_state.token_cleaner._calculate_returns(df)
             
             try:
-                result_df, modifications = st.session_state.token_cleaner._check_price_variability(df, token)
+                result_df, modifications = st.session_state.token_cleaner._check_price_variability_graduated(df, token, "medium_term")
                 
                 # Extract metrics
                 metrics = None
@@ -929,6 +877,12 @@ def show_batch_variability_comparison(selected_tokens):
                     for metric_name in required_metrics:
                         if metric_name not in metrics:
                             metrics[metric_name] = 0.0
+                    
+                    # Ensure new metric keys exist
+                    if 'max_flat_minutes' not in metrics:
+                        metrics['max_flat_minutes'] = 0
+                    if 'tick_frequency' not in metrics:
+                        metrics['tick_frequency'] = metrics.get('change_ratio', 0)
                     
                     # Add is_low_variability key if missing (use is_straight_line as fallback)
                     if 'is_low_variability' not in metrics:
@@ -1018,7 +972,7 @@ def show_variability_distribution_analysis(selected_tokens):
                 df = st.session_state.token_cleaner._calculate_returns(df)
             
             try:
-                result_df, modifications = st.session_state.token_cleaner._check_price_variability(df, token)
+                result_df, modifications = st.session_state.token_cleaner._check_price_variability_graduated(df, token, "medium_term")
                 
                 # Extract metrics
                 metrics = None
@@ -1033,6 +987,12 @@ def show_variability_distribution_analysis(selected_tokens):
                     for metric_name in required_metrics:
                         if metric_name not in metrics:
                             metrics[metric_name] = 0.0
+                    
+                    # Ensure new metric keys exist
+                    if 'max_flat_minutes' not in metrics:
+                        metrics['max_flat_minutes'] = 0
+                    if 'tick_frequency' not in metrics:
+                        metrics['tick_frequency'] = metrics.get('change_ratio', 0)
                     
                     # Add is_low_variability key if missing (use is_straight_line as fallback)
                     if 'is_low_variability' not in metrics:
@@ -1121,10 +1081,10 @@ def show_variability_distribution_analysis(selected_tokens):
         st.metric("Total Tokens", total_count)
     
     with col2:
-        st.metric("Filtered", filtered_count, delta=f"{filtered_count/total_count*100:.1f}%")
+        st.metric("Filtered", filtered_count, delta=format_percentage(filtered_count/total_count))
     
     with col3:
-        st.metric("Passed", total_count - filtered_count, delta=f"{(total_count-filtered_count)/total_count*100:.1f}%")
+        st.metric("Passed", total_count - filtered_count, delta=format_percentage((total_count-filtered_count)/total_count))
     
     with col4:
         avg_metrics_passed = plot_df[~plot_df['is_low_variability']]['price_cv'].mean() if (total_count - filtered_count) > 0 else 0

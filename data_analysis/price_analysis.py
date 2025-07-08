@@ -10,6 +10,13 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+import sys
+from pathlib import Path
+
+# Add project root to path for streamlit_utils
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+from streamlit_utils.formatting import format_percentage, format_large_number
 
 
 logger = logging.getLogger(__name__)
@@ -612,13 +619,13 @@ class PriceAnalyzer:
         col1, col2, col3 = st.columns(3)
         
         total_return_pct = price_stats.get('total_return', 0) * 100
-        col1.metric("Total Return", f"{total_return_pct:.2f}%")
+        col1.metric("Total Return", format_percentage(total_return_pct))
         
         avg_volatility_pct = volatility_metrics.get('avg_volatility', 0) * 100
-        col2.metric("Avg. Volatility", f"{avg_volatility_pct:.2f}%")
+        col2.metric("Avg. Volatility", format_percentage(avg_volatility_pct))
 
         max_drawdown_pct = movement_patterns.get('max_drawdown', 0) * 100
-        col3.metric("Max Drawdown", f"{max_drawdown_pct:.2f}%")
+        col3.metric("Max Drawdown", format_percentage(max_drawdown_pct))
 
         st.divider()
 
@@ -627,7 +634,7 @@ class PriceAnalyzer:
         col1_opt, col2_opt, col3_opt = st.columns(3)
 
         optimal_return = optimal_metrics.get('optimal_return_pct', 0)
-        col1_opt.metric("Optimal Return", f"{optimal_return:.2f}%")
+        col1_opt.metric("Optimal Return", format_percentage(optimal_return))
         
         entry_minutes = optimal_metrics.get('optimal_entry_minutes', 0)
         exit_minutes = optimal_metrics.get('optimal_exit_minutes', 0)
@@ -638,75 +645,76 @@ class PriceAnalyzer:
     def display_patterns(self, metrics: Dict) -> None:
         """Display detected patterns for a single token."""
         try:
-            st.subheader("Price Patterns and Trends")
+            st.subheader("Price Patterns and Classification")
             
-            # Get pattern data with safe defaults
-            token_patterns = metrics.get('patterns', {})
-            pumps = token_patterns.get('pumps', {'datetime': [], 'magnitude': []})
-            dumps = token_patterns.get('dumps', {'datetime': [], 'magnitude': []})
-            trend_changes = token_patterns.get('trend_changes', {'datetime': [], 'magnitude': []})
-            momentum_shifts = token_patterns.get('momentum_shifts', {'datetime': [], 'magnitude': []})
+            # Get pattern data - updated to match actual structure
+            pattern_data = metrics.get('patterns', {})
+            momentum_data = metrics.get('momentum_metrics', {})
             
-            # Display pattern summary
-            col1, col2 = st.columns(2)
+            # Display pattern classification
+            col1, col2, col3 = st.columns(3)
+            
             with col1:
-                st.metric("Pump Events", len(pumps.get('datetime', [])))
-                st.metric("Dump Events", len(dumps.get('datetime', [])))
-            with col2:
-                st.metric("Trend Changes", len(trend_changes.get('datetime', [])))
-                st.metric("Momentum Shifts", len(momentum_shifts.get('datetime', [])))
-            
-            # Display pattern timeline
-            if any([pumps.get('datetime'), dumps.get('datetime'), 
-                   trend_changes.get('datetime'), momentum_shifts.get('datetime')]):
-                st.subheader("Pattern Timeline")
+                pattern_type = pattern_data.get('pattern', 'unknown')
+                st.metric("Pattern Type", pattern_type.replace('_', ' ').title())
                 
-                # Create timeline data
+            with col2:
+                max_gain_pct = pattern_data.get('max_gain', 0) * 100
+                st.metric("Max Gain", format_percentage(max_gain_pct))
+                
+            with col3:
+                final_return_pct = pattern_data.get('final_return', 0) * 100  
+                st.metric("Final Return", format_percentage(final_return_pct))
+            
+            # Display momentum analysis
+            st.subheader("Momentum Analysis")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                trend_changes = momentum_data.get('trend_changes', [])
+                st.metric("Trend Changes", format_large_number(len(trend_changes)))
+                
+            with col2:
+                momentum_shifts = momentum_data.get('momentum_shifts', [])
+                st.metric("Momentum Shifts", format_large_number(len(momentum_shifts)))
+            
+            # Display event timeline if available
+            if trend_changes or momentum_shifts:
+                st.subheader("Event Timeline")
+                
+                # Create timeline data from momentum events
                 timeline_data = []
                 
-                # Add pump events
-                for dt, mag in zip(pumps.get('datetime', []), pumps.get('magnitude', [])):
-                    timeline_data.append({
-                        'datetime': dt,
-                        'event': 'Pump',
-                        'magnitude': mag
-                    })
-                
-                # Add dump events
-                for dt, mag in zip(dumps.get('datetime', []), dumps.get('magnitude', [])):
-                    timeline_data.append({
-                        'datetime': dt,
-                        'event': 'Dump',
-                        'magnitude': mag
-                    })
-                
                 # Add trend changes
-                for dt, mag in zip(trend_changes.get('datetime', []), trend_changes.get('magnitude', [])):
-                    timeline_data.append({
-                        'datetime': dt,
-                        'event': 'Trend Change',
-                        'magnitude': mag
-                    })
+                for event in trend_changes:
+                    if isinstance(event, dict) and 'timestamp' in event:
+                        timeline_data.append({
+                            'datetime': event['timestamp'],
+                            'event': 'Trend Change',
+                            'magnitude': event.get('magnitude', 0),
+                            'type': event.get('type', 'unknown')
+                        })
                 
                 # Add momentum shifts
-                for dt, mag in zip(momentum_shifts.get('datetime', []), momentum_shifts.get('magnitude', [])):
-                    timeline_data.append({
-                        'datetime': dt,
-                        'event': 'Momentum Shift',
-                        'magnitude': mag
-                    })
+                for event in momentum_shifts:
+                    if isinstance(event, dict) and 'timestamp' in event:
+                        timeline_data.append({
+                            'datetime': event['timestamp'],
+                            'event': 'Momentum Shift',
+                            'magnitude': event.get('magnitude', 0),
+                            'type': event.get('type', 'unknown')
+                        })
                 
-                # Sort by datetime
-                timeline_data.sort(key=lambda x: x['datetime'])
-                
-                # Display timeline
+                # Display timeline if we have events
                 if timeline_data:
+                    # Sort by datetime
+                    timeline_data.sort(key=lambda x: x['datetime'])
                     df = pl.DataFrame(timeline_data)
-                    st.dataframe(df)
+                    st.dataframe(df, use_container_width=True)
                 else:
-                    st.info("No significant patterns detected")
+                    st.info("No momentum events detected")
             else:
-                st.info("No significant patterns detected")
+                st.info("No significant events detected")
                 
         except KeyError as e:
             st.error(f"Missing key in pattern data: {str(e)}")
@@ -751,28 +759,41 @@ class PriceAnalyzer:
         # Returns
         avg_total_return = df.select(pl.mean('total_return_%')).item()
         median_total_return = df.select(pl.median('total_return_%')).item()
-        col1.metric("Avg. Total Return", f"{avg_total_return:.2f}%")
-        col1.metric("Median Total Return", f"{median_total_return:.2f}%")
+        col1.metric("Avg. Total Return", format_percentage(avg_total_return))
+        col1.metric("Median Total Return", format_percentage(median_total_return))
         
         # Volatility
         avg_volatility = df.select(pl.mean('volatility_%')).item()
         median_volatility = df.select(pl.median('volatility_%')).item()
-        col2.metric("Avg. Volatility", f"{avg_volatility:.2f}%")
-        col2.metric("Median Volatility", f"{median_volatility:.2f}%")
+        col2.metric("Avg. Volatility", format_percentage(avg_volatility))
+        col2.metric("Median Volatility", format_percentage(median_volatility))
         
         # Optimal Return
         avg_optimal_return = df.select(pl.mean('optimal_return_%')).item()
-        col3.metric("Avg. Optimal Return", f"{avg_optimal_return:.2f}%")
+        col3.metric("Avg. Optimal Return", format_percentage(avg_optimal_return))
 
         # Calculate best universal entry/exit timing
         best_entry_exit = self._calculate_best_universal_timing(all_metrics)
-        col4.metric("Best Universal Entry", f"{best_entry_exit['best_entry_min']} min")
-        col4.metric("Best Universal Exit", f"{best_entry_exit['best_exit_min']} min")
-        col4.metric("Universal Return", f"{best_entry_exit['universal_return']:.2f}%")
+        col4.metric("Best Universal Entry", format_large_number(best_entry_exit['best_entry_min']) + " min")
+        col4.metric("Best Universal Exit", format_large_number(best_entry_exit['best_exit_min']) + " min")
+        col4.metric("Universal Return", format_percentage(best_entry_exit['universal_return']))
 
         st.divider()
         st.subheader("Detailed Metrics per Token")
-        st.dataframe(df, use_container_width=True, height=400)
+        
+        # Format DataFrame for display with scientific notation
+        display_df = df.with_columns([
+            pl.col('total_return_%').map_elements(lambda x: format_percentage(x), return_dtype=pl.String).alias('Total Return'),
+            pl.col('volatility_%').map_elements(lambda x: format_percentage(x), return_dtype=pl.String).alias('Volatility'),
+            pl.col('optimal_return_%').map_elements(lambda x: format_percentage(x), return_dtype=pl.String).alias('Optimal Return'),
+            pl.col('min_price').map_elements(lambda x: format_large_number(x), return_dtype=pl.String).alias('Min Price'),
+            pl.col('max_price').map_elements(lambda x: format_large_number(x), return_dtype=pl.String).alias('Max Price'),
+            pl.col('optimal_entry_min').map_elements(lambda x: format_large_number(x) + " min", return_dtype=pl.String).alias('Entry Time'),
+            pl.col('optimal_exit_min').map_elements(lambda x: format_large_number(x) + " min", return_dtype=pl.String).alias('Exit Time'),
+            pl.col('token').alias('Token')
+        ]).select(['Token', 'Total Return', 'Volatility', 'Optimal Return', 'Min Price', 'Max Price', 'Entry Time', 'Exit Time'])
+        
+        st.dataframe(display_df, use_container_width=True, height=400)
 
     def _calculate_best_universal_timing(self, all_metrics: Dict[str, Dict]) -> Dict:
         """Calculate the best entry/exit timing that would work across all tokens."""

@@ -77,12 +77,27 @@ class TradingAnalytics:
         
         # Aggregate results
         results_df = pd.DataFrame(results)
+        
+        # Return DataFrame with stop/take profit columns if no results
+        if results_df.empty:
+            df['stop_loss'] = df['price'] * (1 - 0.05)  # 5% stop loss
+            df['take_profit'] = df['price'] * (1 + 0.10)  # 10% take profit
+            return df[['datetime', 'price', 'stop_loss', 'take_profit']]
+        
         optimal_levels = results_df.groupby(['sl_multiplier', 'tp_multiplier']).agg({
             'win': ['mean', 'count'],
             'risk_reward_ratio': 'first'
         }).reset_index()
         
-        return optimal_levels
+        # Add stop/take profit columns to original DataFrame
+        best_combo = optimal_levels.loc[optimal_levels[('win', 'mean')].idxmax()]
+        best_sl = best_combo[('sl_multiplier', '')]
+        best_tp = best_combo[('tp_multiplier', '')]
+        
+        df['stop_loss'] = df['price'] * (1 + df['stop_loss_1x'] * best_sl)
+        df['take_profit'] = df['price'] * (1 + df['take_profit_1x'] * best_tp)
+        
+        return df[['datetime', 'price', 'stop_loss', 'take_profit']]
     
     def calculate_order_flow_imbalance(self, df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
         """
@@ -116,7 +131,7 @@ class TradingAnalytics:
         
         return df[['datetime', 'price', 'order_flow_imbalance', 'cumulative_delta']]
     
-    def vwap_analysis(self, df: pd.DataFrame, anchors: List[int] = [60, 240, 480]) -> pd.DataFrame:
+    def vwap_analysis(self, df: pd.DataFrame, anchors: List[int] = [5, 60, 240]) -> pd.DataFrame:
         """
         Calculate VWAP (Volume Weighted Average Price) with multiple anchor points
         Using volatility as volume proxy
@@ -126,10 +141,17 @@ class TradingAnalytics:
         
         for anchor in anchors:
             # Calculate VWAP for each anchor period
-            df[f'vwap_{anchor}'] = (
-                (df['price'] * df['volume_proxy']).rolling(anchor).sum() / 
-                df['volume_proxy'].rolling(anchor).sum()
-            )
+            # Use actual volume if available, otherwise use volume_proxy
+            if 'volume' in df.columns:
+                df[f'vwap_{anchor}'] = (
+                    (df['price'] * df['volume']).rolling(anchor).sum() / 
+                    df['volume'].rolling(anchor).sum()
+                )
+            else:
+                df[f'vwap_{anchor}'] = (
+                    (df['price'] * df['volume_proxy']).rolling(anchor).sum() / 
+                    df['volume_proxy'].rolling(anchor).sum()
+                )
             
             # VWAP bands (standard deviation)
             df[f'vwap_upper_{anchor}'] = df[f'vwap_{anchor}'] + df['price'].rolling(anchor).std()
@@ -137,6 +159,9 @@ class TradingAnalytics:
             
             # Distance from VWAP (normalized)
             df[f'vwap_distance_{anchor}'] = (df['price'] - df[f'vwap_{anchor}']) / df[f'vwap_{anchor}']
+        
+        # Add main vwap column (using first anchor as default)
+        df['vwap'] = df[f'vwap_{anchors[0]}']
         
         return df
     

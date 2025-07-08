@@ -97,7 +97,7 @@ def test_token_datasets():
     # Token with staircase pattern (constant prices)
     staircase_prices = []
     for i in range(20):
-        staircase_prices.extend([100 + i] * 5)  # 5 minutes at each price level
+        staircase_prices.extend([100.0 + i] * 5)  # 5 minutes at each price level
     datasets['staircase_pattern'] = pl.DataFrame({
         'datetime': pl.datetime_range(
             start=datetime(2024, 1, 1),
@@ -114,11 +114,11 @@ def test_token_datasets():
     base_time = datetime(2024, 1, 1)
     for i in range(50):
         gap_timestamps.append(base_time + timedelta(minutes=i))
-        gap_prices.append(100 + i * 0.1)
+        gap_prices.append(100.0 + i * 0.1)
     # 30-minute gap
     for i in range(80, 130):  # Skip 50-79 (30 minute gap)
         gap_timestamps.append(base_time + timedelta(minutes=i))
-        gap_prices.append(100 + i * 0.1)
+        gap_prices.append(100.0 + i * 0.1)
     
     datasets['with_gaps'] = pl.DataFrame({
         'datetime': gap_timestamps,
@@ -145,7 +145,7 @@ def test_token_datasets():
     })
     
     # Token with zero prices
-    zero_prices = [100] * 30 + [0] * 20 + [100] * 50
+    zero_prices = [100.0] * 30 + [0.0] * 20 + [100.0] * 50
     datasets['with_zeros'] = pl.DataFrame({
         'datetime': pl.datetime_range(
             start=datetime(2024, 1, 1),
@@ -157,7 +157,7 @@ def test_token_datasets():
     })
     
     # Token with negative prices
-    negative_prices = [100] * 30 + [-10] * 20 + [100] * 50
+    negative_prices = [100.0] * 30 + [-10.0] * 20 + [100.0] * 50
     datasets['with_negatives'] = pl.DataFrame({
         'datetime': pl.datetime_range(
             start=datetime(2024, 1, 1),
@@ -169,7 +169,7 @@ def test_token_datasets():
     })
     
     # High volatility token (frequent large changes)
-    high_vol_prices = [100]
+    high_vol_prices = [100.0]
     for i in range(99):
         # Alternate between +50% and -33% changes
         if i % 2 == 0:

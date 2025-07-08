@@ -36,6 +36,7 @@ except ImportError:
 
 # Import price analysis for on-demand global features
 from data_analysis.price_analysis import PriceAnalyzer
+from streamlit_utils.formatting import format_large_number, format_percentage, format_data_points
 
 def compute_global_features_on_demand(df: pl.DataFrame, token_name: str) -> Dict:
     """Compute global features on-demand using the price analysis module"""
@@ -840,7 +841,7 @@ def display_correlation_results(results, correlation_analyzer):
     with col1:
         st.metric("Tokens Analyzed", len(results.get('tokens_analyzed', [])))
     with col2:
-        st.metric("Data Points", f"{results.get('data_points', 0):,}")
+        st.metric("Data Points", format_data_points(results.get('data_points', 0)))
     with col3:
         st.metric("Time Period", f"{results.get('lifecycle_minutes', 0)} min")
     with col4:
@@ -1058,13 +1059,13 @@ def display_global_features(global_features: Dict, token_name: str):
             
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Total Return %", f"{stats.get('total_return_pct', 0):.2f}%")
+                st.metric("Total Return %", format_percentage(stats.get('total_return_pct', 0)))
             with col2:
-                st.metric("Max Gain %", f"{stats.get('max_gain_pct', 0):.2f}%")
+                st.metric("Max Gain %", format_percentage(stats.get('max_gain_pct', 0)))
             with col3:
-                st.metric("Max Drawdown %", f"{stats.get('max_drawdown_pct', 0):.2f}%")
+                st.metric("Max Drawdown %", format_percentage(stats.get('max_drawdown_pct', 0)))
             with col4:
-                st.metric("Price Range %", f"{stats.get('price_range_pct', 0):.2f}%")
+                st.metric("Price Range %", format_percentage(stats.get('price_range_pct', 0)))
     
     # Display pattern analysis
     with st.expander("🔍 Pattern Analysis"):
@@ -1231,7 +1232,7 @@ def run_fft_analysis(data_loader, correlation_analyzer, available_tokens):
                         # Display summary statistics
                         col1, col2, col3, col4 = st.columns(4)
                         with col1:
-                            st.metric("Data Points", f"{fft_results['data_points']:,}")
+                            st.metric("Data Points", format_data_points(fft_results['data_points']))
                         with col2:
                             dominant_period = fft_results.get('dominant_period')
                             if dominant_period:

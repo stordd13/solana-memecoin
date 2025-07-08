@@ -19,6 +19,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from data_analysis.export_utils import export_parquet_files
 from data_analysis.price_analysis import PriceAnalyzer
+from streamlit_utils.formatting import format_large_number, format_percentage, format_data_points
 
 logger = logging.getLogger(__name__)
 
@@ -838,7 +839,7 @@ class DataQualityAnalyzer:
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
-                st.metric("Total Tokens", len(quality_reports))
+                st.metric("Total Tokens", format_large_number(len(quality_reports)))
                 st.metric("Average Quality Score", f"{quality_df['quality_score'].mean():.1f}")
             
             with col2:

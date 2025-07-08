@@ -286,8 +286,12 @@ def edge_case_time_series():
 @pytest.fixture
 def technical_indicator_references():
     """Calculate reference technical indicators using standard formulas."""
-    # Test data
-    prices = np.array([100, 102, 101, 103, 105, 104, 106, 108, 107, 109, 111, 110])
+    # Test data - need at least 26 points for MACD calculation
+    np.random.seed(42)  # For reproducible test data
+    base_prices = np.array([100, 102, 101, 103, 105, 104, 106, 108, 107, 109, 111, 110])
+    # Extend with additional points for MACD
+    additional_prices = 110 + np.cumsum(np.random.normal(0, 1, 20))
+    prices = np.concatenate([base_prices, additional_prices])
     
     references = {}
     
@@ -411,6 +415,9 @@ def _calculate_ema(prices, period):
     """Calculate exponential moving average."""
     alpha = 2 / (period + 1)
     ema = np.full(len(prices), np.nan)
+    
+    if len(prices) < period:
+        return ema  # Return all NaN if insufficient data
     
     # Start with simple average
     ema[period - 1] = np.mean(prices[:period])

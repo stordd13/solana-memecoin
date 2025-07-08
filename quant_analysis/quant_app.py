@@ -15,13 +15,15 @@ import numpy as np
 import random
 from collections import Counter
 
-# Add parent directory to Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 # Import modules
 from data_analysis.data_loader import DataLoader
-from quant_analysis import QuantAnalysis
-from quant_viz import QuantVisualizations
+from quant_analysis.quant_analysis import QuantAnalysis
+from quant_analysis.quant_viz import QuantVisualizations
+from streamlit_utils.formatting import format_large_number, format_percentage, format_data_points
 
 # Page config
 st.set_page_config(
@@ -2023,7 +2025,7 @@ def show_price_distribution_evolution(selected_tokens, selection_mode):
                         col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             avg_normal_pct = aggregated_df['normality_percentage'].mean()
-                            st.metric("Avg Normal %", f"{avg_normal_pct:.1f}%")
+                            st.metric("Avg Normal %", format_percentage(avg_normal_pct))
                         with col2:
                             best_period = aggregated_df.sort('avg_mean_return', descending=True).limit(1)
                             if len(best_period) > 0:
@@ -2038,7 +2040,7 @@ def show_price_distribution_evolution(selected_tokens, selection_mode):
                                 st.metric("Most Stable", f"Period {period_num}", f"±{std_val:.2f}%")
                         with col4:
                             total_observations = aggregated_df['total_tokens'].sum()
-                            st.metric("Total Observations", f"{total_observations}")
+                            st.metric("Total Observations", format_data_points(total_observations))
                         
                         # Interpretation for aggregated analysis
                         st.markdown("#### 📖 **Aggregated Analysis Interpretation:**")
@@ -2472,7 +2474,7 @@ def show_optimal_holding_period(selected_tokens, selection_mode):
                     
                     with col4:
                         total_observations = aggregated_stats['Token Count'].sum()
-                        st.metric("Total Observations", f"{total_observations}")
+                        st.metric("Total Observations", format_data_points(total_observations))
                     
                     # Multi-token visualization with explanation
                     st.subheader("📈 Multi-Token Performance Visualization")

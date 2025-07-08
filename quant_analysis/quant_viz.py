@@ -37,33 +37,34 @@ class QuantVisualizations:
         Plot optimal entry/exit timing matrix
         Shows average returns for different entry/exit window combinations
         """
-        matrix = pl.DataFrame(index=entry_windows, columns=exit_windows)
+        # Create matrix using numpy then convert to polars
+        matrix_np = np.zeros((len(entry_windows), len(exit_windows)))
         
-        for entry_window in entry_windows:
-            for exit_window in exit_windows:
+        for i, entry_window in enumerate(entry_windows):
+            for j, exit_window in enumerate(exit_windows):
                 returns = []
                 
                 # Calculate returns for each combination
-                for i in range(entry_window, len(df) - exit_window, entry_window):
+                for k in range(entry_window, len(df) - exit_window, entry_window):
                     # Entry signal: positive momentum
-                    entry_momentum = (df['price'].to_numpy()[i] / df['price'].to_numpy()[i-entry_window] - 1)
+                    entry_momentum = (df['price'].to_numpy()[k] / df['price'].to_numpy()[k-entry_window] - 1)
                     
                     if entry_momentum > 0:  # Enter on positive momentum
-                        entry_price = df['price'].to_numpy()[i]
-                        exit_price = df['price'].to_numpy()[i + exit_window]
+                        entry_price = df['price'].to_numpy()[k]
+                        exit_price = df['price'].to_numpy()[k + exit_window]
                         trade_return = (exit_price / entry_price - 1) * 100
                         returns.append(trade_return)
                 
-                matrix.loc[entry_window, exit_window] = pl.Series(returns).mean() if returns else 0
+                matrix_np[i, j] = pl.Series(returns).mean() if returns else 0
         
         # Create heatmap
         fig = go.Figure(data=go.Heatmap(
-            z=matrix.to_numpy().astype(float),
+            z=matrix_np.astype(float),
             x=[f"{w}min" for w in exit_windows],
             y=[f"{w}min" for w in entry_windows],
             colorscale='RdBu',
             zmid=0,
-            text=np.round(matrix.to_numpy().astype(float), 2),
+            text=np.round(matrix_np.astype(float), 2),
             texttemplate='%{text}%',
             textfont={"size": 10},
             colorbar=dict(title="Avg Return %")

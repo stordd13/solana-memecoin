@@ -19,9 +19,17 @@ ML models showing unstable performance: **70%→45% precision**, **95%→25% rec
 
 ### **Dataset Overview**
 - **30,000 memecoins** with minute-by-minute prices (200-2000 minutes per token)
+- **24-hour timeframe context**: ~1440 minutes of trading data per token
 - **3k normal tokens**: Standard behavior patterns
 - **4k extreme tokens**: 99.9% dumps, 1M%+ pumps (LEGITIMATE signals, not noise!)
 - **25k dead tokens**: Tradeable during active periods, then flatline
+
+### **🪙 Critical Memecoin Context**
+**IMPORTANT**: This is **24-hour minute-by-minute memecoin data** - NOT traditional markets!
+- **No "historical" vs "recent"**: Every minute in 24h cycle is equally relevant
+- **Extreme volatility is normal**: 1M%+ pumps and 99.9% dumps are legitimate patterns
+- **Purpose is data filtering**: Identify dead/inactive tokens for ML pipeline quality
+- **Not trading strategies**: Focus on token filtering, not trading signal generation
 
 ### **Solution Strategy**
 Use **Autocorrelation Function (ACF) + Clustering + t-SNE** to identify 5-8 distinct behavioral archetypes for stable, cluster-specific ML models instead of unified approach.
@@ -222,6 +230,13 @@ for token in tokens:
   - Streamlit display accuracy mathematically guaranteed
   - Complete test coverage for edge cases and numerical stability
   - Test-driven approach ensures mathematical correctness before implementation
+- **🪙 MEMECOIN-AWARE TOKEN FILTERING**:
+  - **Removed invalid "recent vs historical" bias** from 24-hour data analysis
+  - **Updated variability thresholds** for memecoin context (0.1% CV vs 2% before)
+  - **Implemented scalping-focused dead token detection** (flat periods, tick frequency)
+  - **Enhanced UI with memecoin-appropriate metrics** (24h CV, max flat period, signal strength)
+  - **Preserves extreme volatility** (99.9% dumps, 1M%+ pumps) as legitimate patterns
+  - **Focuses on data quality filtering** for ML pipeline (not trading strategies)
 
 ### **🔄 In Progress** 
 - **Phase 1**: Pattern Discovery & Behavioral Archetype Identification
@@ -355,6 +370,36 @@ def validate_features_safety(features_df, token_name):
 
 ---
 
+## 📝 **Recent Session Context (Latest Updates)**
+
+### **🪙 Memecoin Token Filtering Revolution (Current Session)**
+
+**Key Insight**: User provided critical context about **24-hour minute-by-minute memecoin data** to correct fundamental assumptions in variability analysis.
+
+**❌ What Was Wrong**:
+- **"Recent vs Historical" bias**: Artificially split 24-hour data into "recent" (last 50%) and "historical" (first 50%)
+- **Invalid timeframe assumptions**: Applied traditional market concepts to 24-hour crypto cycles
+- **Over-strict thresholds**: 2% CV minimum filtered out legitimate memecoin patterns
+- **Misunderstood purpose**: Focused on trading strategy context rather than data quality filtering
+
+**✅ What Was Fixed**:
+- **Full 24-hour analysis**: Every minute equally important for token filtering
+- **Memecoin-appropriate thresholds**: 0.1% CV minimum preserves extreme volatility patterns  
+- **Dead token detection**: Focus on flat periods (>2 hours identical prices) and tick frequency
+- **Data quality focus**: Filter for ML pipeline input, not trading strategies
+- **Preserve extreme moves**: 99.9% dumps and 1M%+ pumps are legitimate signals
+
+**🔧 Technical Changes**:
+- `data_cleaning/clean_tokens.py`: Completely rewrote `_check_price_variability_graduated()`
+- `data_analysis/app.py`: Updated UI labels from "Recent Activity CV" to "24h Price CV"
+- New metrics: Max Flat Period, Tick Frequency, Signal Strength
+- Decision logic: 3/5 criteria (no mandatory recent CV requirement)
+
+**🎯 Current State**: 
+Token filtering now properly identifies **truly dead/inactive tokens** while preserving **all legitimate memecoin volatility patterns** for downstream ML analysis.
+
+---
+
 **🚀 Ready to contribute to stable, interpretable memecoin analysis!**
 
-*Last updated: Based on analysis through autocorrelation improvements and roadmap creation*
+*Last updated: Memecoin-aware token filtering implementation completed*

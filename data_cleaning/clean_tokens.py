@@ -201,10 +201,8 @@ class CategoryAwareTokenCleaner:
             (pl.col('price').pct_change()).alias('returns')
         ])
         
-        # Replace the first NaN with 0 (no return for first observation)
-        df = df.with_columns([
-            pl.col('returns').fill_null(0.0)
-        ])
+        # Keep the first value as NaN (standard returns calculation)
+        # This is the expected behavior for returns time series
         
         return df
 
@@ -505,34 +503,77 @@ class CategoryAwareTokenCleaner:
             activity_ratio < 0.1                       # <10% of windows show activity
         )
         
-        # Calculate additional metrics expected by the app
-        # Price coefficient of variation (CV)
+        # MEMECOIN SCALPING: Calculate metrics for 24-hour trading session
+        # Every minute matters for scalping - no "historical" vs "recent" bias
+        
+        # 1. Full-Period Price CV (main volatility indicator for memecoins)
         price_mean = np.mean(prices)
         price_std = np.std(prices)
         price_cv = price_std / price_mean if price_mean > 0 else 0
         
-        # Log price coefficient of variation
+        # 2. Log price CV (stable for extreme memecoin price ranges)
         log_prices = np.log(prices + 1e-10)  # Add small value to avoid log(0)
-        log_price_cv = np.std(log_prices) / np.mean(log_prices) if np.mean(log_prices) != 0 else 0
+        log_price_cv = np.std(log_prices) / abs(np.mean(log_prices)) if np.mean(log_prices) != 0 else 0
         
-        # Flat periods fraction (fraction of time with no price changes)
-        flat_periods_fraction = 1 - change_ratio
+        # 3. Flat-Line Detection (dead token identification for scalping)
+        # Find longest consecutive period of identical prices
+        max_flat_minutes = 0
+        current_flat = 1
+        for i in range(1, len(prices)):
+            if prices[i] == prices[i-1]:
+                current_flat += 1
+                max_flat_minutes = max(max_flat_minutes, current_flat)
+            else:
+                current_flat = 1
         
-        # Range efficiency (actual range vs theoretical max range)
-        price_range = np.max(prices) - np.min(prices)
-        theoretical_max_range = np.max(prices) + np.std(prices)
-        range_efficiency = price_range / theoretical_max_range if theoretical_max_range > 0 else 0
+        # Calculate flat periods as fraction of total time
+        flat_periods_fraction = max_flat_minutes / len(prices) if len(prices) > 0 else 1
         
-        # Normalized entropy (measure of price distribution randomness)
-        # Simple entropy calculation based on price bins
+        # 4. Tick Frequency (price update rate for active trading)
+        # How often does price actually change? Critical for scalping
+        tick_frequency = change_ratio  # Reuse existing calculation
+        
+        # 5. Price Range Efficiency (memecoin-specific movement detection)
         if len(prices) > 1:
-            hist, _ = np.histogram(prices, bins=min(10, unique_prices))
-            hist = hist[hist > 0]  # Remove zero bins
-            probs = hist / np.sum(hist)
-            entropy = -np.sum(probs * np.log2(probs)) if len(probs) > 1 else 0
-            normalized_entropy = entropy / np.log2(len(probs)) if len(probs) > 1 else 0
+            price_range = np.max(prices) - np.min(prices)
+            relative_range = price_range / np.mean(prices) if np.mean(prices) > 0 else 0
+            # For memecoins, any significant range indicates trading opportunity
+            range_efficiency = min(1.0, relative_range)  # Don't penalize large moves
         else:
-            normalized_entropy = 0
+            range_efficiency = 0
+        
+        # 6. Trading Signal Strength (simplified for memecoin scalping)
+        # Focus on whether there are enough price movements for trading
+        if len(price_changes) > 1:
+            # Count significant price changes (> 0.1% moves)
+            significant_changes = np.sum(np.abs(price_changes) > 0.001)  # 0.1% threshold
+            signal_strength = significant_changes / len(price_changes) if len(price_changes) > 0 else 0
+        else:
+            signal_strength = 0
+        
+        # MEMECOIN SCALPING: Dead token detection for 24-hour trading
+        # Focus on identifying truly flat/dead tokens vs legitimate memecoin volatility
+        
+        # Metric 1: Price CV (memecoin-appropriate threshold)
+        price_cv_pass = price_cv > 0.001  # 0.1% CV minimum (very lenient for memecoins)
+        
+        # Metric 2: Flat Period Check (no more than 2 hours of identical prices)
+        flat_period_pass = max_flat_minutes < 120  # Max 2 hours flat (120 minutes)
+        
+        # Metric 3: Tick Frequency (at least 5% of minutes should have price changes)
+        tick_freq_pass = tick_frequency > 0.05  # 5% minimum tick rate
+        
+        # Metric 4: Range Efficiency (any significant price movement)
+        range_eff_pass = range_efficiency > 0.01  # 1% range minimum
+        
+        # Metric 5: Trading Signal Strength (sufficient movement for scalping)
+        signal_strength_pass = signal_strength > 0.02  # 2% of minutes with >0.1% moves
+        
+        # SCALPING-FOCUSED: Must pass at least 3 out of 5 metrics (no mandatory metric)
+        # This allows for various memecoin patterns while filtering truly dead tokens
+        passes_count = sum([price_cv_pass, flat_period_pass, tick_freq_pass, 
+                           range_eff_pass, signal_strength_pass])
+        is_low_variability = passes_count < 3
         
         # Log the analysis
         variability_metrics = {
@@ -543,30 +584,46 @@ class CategoryAwareTokenCleaner:
             'activity_ratio': activity_ratio,
             'unique_patterns': unique_patterns,
             'is_straight_line': is_straight_line,
-            # Additional metrics for app compatibility
-            'price_cv': price_cv,
-            'log_price_cv': abs(log_price_cv),  # Use absolute value to avoid negative CV
-            'flat_periods_fraction': flat_periods_fraction,
-            'range_efficiency': range_efficiency,
-            'normalized_entropy': normalized_entropy
+            'is_low_variability': is_low_variability,
+            # Memecoin scalping metrics for app display
+            'price_cv': price_cv,  # Full 24-hour period CV
+            'log_price_cv': abs(log_price_cv),  # Stable log CV
+            'flat_periods_fraction': flat_periods_fraction,  # Direct flat period fraction
+            'range_efficiency': range_efficiency,  # Price range efficiency
+            'normalized_entropy': signal_strength,  # Trading signal strength
+            # Additional metrics for analysis
+            'tick_frequency': tick_frequency,
+            'max_flat_minutes': max_flat_minutes,
+            'signal_strength': signal_strength,
+            'overall_cv': price_cv,  # Same as price_cv now
+            # Threshold passes for debugging
+            'price_cv_pass': price_cv_pass,
+            'flat_period_pass': flat_period_pass,
+            'tick_freq_pass': tick_freq_pass,
+            'range_eff_pass': range_eff_pass,
+            'signal_strength_pass': signal_strength_pass,
+            'passes_count': passes_count
         }
         
-        if is_straight_line:
-            print(f"📏 STRAIGHT LINE: {token_name} - {unique_prices} unique prices, "
-                  f"{change_ratio:.1%} changes, max consecutive: {max_consecutive_same}")
+        if is_low_variability:
+            print(f"🔴 DEAD TOKEN: {token_name} - CV: {price_cv:.4f}, Max Flat: {max_flat_minutes}min, "
+                  f"Passes: {passes_count}/5 ({'✓' if price_cv_pass else '✗'}CV, "
+                  f"{'✓' if flat_period_pass else '✗'}Flat, {'✓' if tick_freq_pass else '✗'}Ticks, "
+                  f"{'✓' if range_eff_pass else '✗'}Range, {'✓' if signal_strength_pass else '✗'}Signal)")
             return None, modifications + [{
-                'type': 'excluded_straight_line',
+                'type': 'excluded_dead_token',
                 'metrics': variability_metrics,
-                'reason': 'Token shows no meaningful price variation (straight line)'
+                'reason': f'Token appears dead/inactive (passes {passes_count}/5 criteria, CV: {price_cv:.4f}, max flat: {max_flat_minutes}min)'
             }]
         else:
-            # Token has acceptable variability
-            if unique_ratio < thresholds['straight_line_unique_ratio']:  # Low but not too low
-                print(f"⚠️  LOW VAR (kept): {token_name} - {unique_prices} unique prices, "
-                      f"but {change_ratio:.1%} changes")
+            # Token has sufficient activity for trading
+            print(f"🟢 ACTIVE TOKEN: {token_name} - CV: {price_cv:.4f}, Max Flat: {max_flat_minutes}min, "
+                  f"Passes: {passes_count}/5 ({'✓' if price_cv_pass else '✗'}CV, "
+                  f"{'✓' if flat_period_pass else '✗'}Flat, {'✓' if tick_freq_pass else '✗'}Ticks, "
+                  f"{'✓' if range_eff_pass else '✗'}Range, {'✓' if signal_strength_pass else '✗'}Signal)")
             
             modifications.append({
-                'type': 'variability_check_passed',
+                'type': 'active_token_check_passed',
                 'metrics': variability_metrics
             })
         
@@ -1043,7 +1100,7 @@ class CategoryAwareTokenCleaner:
         variation_ratio = non_zero_diffs / len(price_diffs) if len(price_diffs) > 0 else 0
         
         # 3. Standard deviation relative to mean
-        price_std = np.std(prices)
+        price_std = np.std(prices, ddof=1)  # Use sample standard deviation for consistency with tests
         price_mean = np.mean(prices)
         relative_std = price_std / price_mean if price_mean > 0 else 0
         

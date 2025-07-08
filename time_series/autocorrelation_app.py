@@ -2,21 +2,28 @@
 Streamlit App for Autocorrelation and Time Series Clustering Analysis
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 import streamlit as st
 import polars as pl
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from pathlib import Path
 import pandas as pd
 from typing import Dict, List, Optional
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from streamlit_utils.formatting import format_large_number, format_percentage, format_data_points
 
 # Import our analyzer
-from autocorrelation_clustering import AutocorrelationClusteringAnalyzer
+from time_series.autocorrelation_clustering import AutocorrelationClusteringAnalyzer
 
 
 def main():
@@ -1404,7 +1411,7 @@ def display_multi_resolution_overview(results: Dict):
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Tokens Analyzed", results.get('total_tokens_analyzed', 0))
+        st.metric("Total Tokens Analyzed", format_large_number(results.get('total_tokens_analyzed', 0)))
         
     with col2:
         st.metric("Lifespan Categories", len(results.get('categories', {})))
@@ -1809,7 +1816,7 @@ def display_combined_tsne(results: Dict):
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.metric("Total Data Points", len(combined_tsne_data))
+            st.metric("Total Data Points", format_data_points(len(combined_tsne_data)))
             
         with col2:
             st.metric("Categories Visualized", len(set(combined_colors)))
