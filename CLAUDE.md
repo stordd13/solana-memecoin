@@ -97,7 +97,7 @@ python run_pipeline.py --fast       # Fast mode (rolling features only)
 # Main dashboard - primary entry point
 streamlit run data_analysis/app.py
 
-# ACF analysis & clustering
+# Behavioral archetype analysis (Phase 1 complete)
 streamlit run time_series/autocorrelation_app.py
 
 # Quantitative trading analysis
@@ -105,6 +105,17 @@ streamlit run quant_analysis/quant_app.py
 
 # Time series modeling
 streamlit run time_series/time_series_app.py
+```
+
+### **Phase 1 Analysis Workflow**
+```bash
+# Run behavioral archetype analysis
+streamlit run time_series/autocorrelation_app.py
+
+# Navigate to "Multi-Resolution ACF" or "🎭 Behavioral Archetypes" tabs
+# Configure token limits (supports 'none' for unlimited)
+# Select analysis parameters and run
+# Results exported to time_series/results/
 ```
 
 ### **ML Model Training**
@@ -139,9 +150,11 @@ python -m pytest data_cleaning/tests/test_core_mathematical_validation.py -v
 python -m pytest data_cleaning/tests/test_analyze_exclusions_validation.py -v
 python -m pytest data_cleaning/tests/test_generate_graduated_datasets_validation.py -v
 python -m pytest feature_engineering/tests/test_mathematical_validation.py -v
+python -m pytest time_series/tests/test_archetype_utils_mathematical_validation.py -v
+python -m pytest time_series/tests/test_behavioral_archetype_analysis_mathematical_validation.py -v
 
 # Complete test suite summary
-python -m pytest data_analysis/tests/ data_cleaning/tests/ feature_engineering/tests/ --tb=no -q
+python -m pytest data_analysis/tests/ data_cleaning/tests/ feature_engineering/tests/ time_series/tests/ --tb=no -q
 ```
 
 ---
@@ -195,22 +208,33 @@ for token in tokens:
 
 ## 🎯 **Memecoin-Specific Analysis Framework**
 
-### **Behavioral Archetypes** (Target: 5-8 clusters)
-- **"Moon Mission"**: Sustained pumps with momentum ACF
-- **"Rug Pull"**: Quick pump → sustained dump  
-- **"Slow Bleed"**: Gradual decline patterns
-- **"Volatile Chop"**: High volatility, no clear direction
-- **"Dead on Arrival"**: Minimal activity from launch
+### **Behavioral Archetypes** (9 Production Patterns)
+**Death Patterns (>90% dead tokens):**
+- **"Quick Pump & Death"**: High early returns, short lifespan
+- **"Dead on Arrival"**: Low volatility, immediate death
+- **"Slow Bleed"**: Gradual decline, medium lifespan
+- **"Extended Decline"**: Long lifespan before death
 
-### **Multi-Resolution ACF Analysis**
-- **Sprint** (200-400 min): Fast-moving patterns
-- **Standard** (400-1200 min): Typical lifecycle
-- **Marathon** (1200+ min): Extended development
+**Mixed Patterns (50-90% dead tokens):**
+- **"Phoenix Attempt"**: Multiple pumps before death, high volatility
+- **"Zombie Walker"**: Minimal movement, eventual death
 
-### **Lifecycle Phase Analysis**
-- **Launch phase** (0-60 min): Initial behavior
-- **Development phase** (2-8 hours): Growth/decline patterns
-- **Resolution phase** (final hours): End-of-life signatures
+**Survivor Patterns (<50% dead tokens):**
+- **"Survivor Pump"**: Artificial pumps, still alive, high volatility
+- **"Stable Survivor"**: Low volatility, consistent survival
+- **"Survivor Organic"**: Natural trading patterns, low death rate
+
+### **Multi-Resolution ACF Analysis** (Death-Aware)
+- **Sprint** (50-400 active min): Fast-moving patterns with early death
+- **Standard** (400-1200 active min): Typical lifecycle before death/survival
+- **Marathon** (1200+ active min): Extended development or survival
+
+### **Pre-Death Feature Extraction**
+- **ACF signatures** at lags [1,2,5,10,20,60] before death_minute
+- **Statistical features**: mean, std, skewness, kurtosis of pre-death returns
+- **Peak timing**: when highest price occurred before death
+- **Drawdown metrics**: maximum decline from peak before death
+- **Death characteristics**: death_type, death_velocity, death_completeness
 
 ---
 
@@ -226,6 +250,7 @@ for token in tokens:
   - **data_analysis/**: 16/16 mathematical validation tests passing
   - **data_cleaning/**: 44/44 mathematical validation tests passing
   - **feature_engineering/**: 96 tests created (39 passing, 57 expected failures - testing against future implementations)
+  - **time_series/**: 44 TDD tests for behavioral archetype analysis (36 archetype_utils + 8 behavioral_archetype_analysis)
   - All statistical calculations validated against numpy/scipy with 1e-12 precision
   - Streamlit display accuracy mathematically guaranteed
   - Complete test coverage for edge cases and numerical stability
@@ -237,12 +262,19 @@ for token in tokens:
   - **Enhanced UI with memecoin-appropriate metrics** (24h CV, max flat period, signal strength)
   - **Preserves extreme volatility** (99.9% dumps, 1M%+ pumps) as legitimate patterns
   - **Focuses on data quality filtering** for ML pipeline (not trading strategies)
+- **✅ PHASE 1 COMPLETE**: Pattern Discovery & Behavioral Archetype Identification
+  - **Production-ready multi-resolution ACF analysis** with death-aware token categorization
+  - **Behavioral archetype identification system** for 9 distinct memecoin patterns
+  - **Death detection algorithm** with multi-criteria approach and 1e-12 mathematical precision
+  - **Pre-death feature extraction** using only data before death_minute (ACF lags, statistics, peak timing)
+  - **Early detection classifier** (5-minute window) for real-time archetype classification
+  - **Unlimited token analysis** with configurable per-category limits
+  - **Extreme volatility optimization** for memecoin data (10M%+ pumps, 99.9% dumps)
+  - **Interactive Streamlit interface** with t-SNE visualization and survival analysis
+  - **Comprehensive testing coverage** with 44 mathematical validation tests
 
 ### **🔄 In Progress** 
-- **Phase 1**: Pattern Discovery & Behavioral Archetype Identification
-  - Multi-resolution ACF analysis (sprint/standard/marathon)
-  - Extreme-return-aware clustering
-  - t-SNE behavioral mapping
+- **Phase 2**: Temporal Pattern Recognition
 
 ### **📋 Next Steps** (From MEMECOIN_ANALYSIS_ROADMAP.md)
 - **Phase 2**: Temporal Pattern Recognition

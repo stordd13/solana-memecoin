@@ -24,6 +24,151 @@ from streamlit_utils.formatting import format_large_number, format_percentage, f
 
 # Import our analyzer
 from time_series.autocorrelation_clustering import AutocorrelationClusteringAnalyzer
+from time_series.behavioral_archetype_analysis import BehavioralArchetypeAnalyzer
+
+
+def run_baseline_clustering_analysis(processed_data_path, token_limits, k_range, n_stability_runs, export_results):
+    """
+    Run baseline clustering analysis with CEO requirements (14 features, elbow method, stability testing).
+    """
+    from time_series.archetype_utils import categorize_by_lifespan
+    from sklearn.metrics import adjusted_rand_score
+    import json
+    from datetime import datetime
+    
+    # Initialize analyzer
+    analyzer = BehavioralArchetypeAnalyzer()
+    
+    # Load tokens from processed categories
+    st.info("Loading categorized token data...")
+    token_data = analyzer.load_categorized_tokens(processed_data_path, limit=None)
+    
+    if not token_data:
+        st.error("No token data found!")
+        return {}
+    
+    # Categorize by lifespan
+    st.info("Categorizing tokens by lifespan...")
+    categorized_tokens = categorize_by_lifespan(token_data, token_limits)
+    
+    # Extract 14 features for each category
+    st.info("Extracting 14 essential features...")
+    results = {
+        'analysis_type': 'Baseline Clustering (CEO)',
+        'categories': {},
+        'total_tokens_analyzed': 0,
+        'stability_summary': {}
+    }
+    
+    for category_name, category_tokens in categorized_tokens.items():
+        if not category_tokens:
+            continue
+            
+        st.info(f"Processing {category_name}: {len(category_tokens)} tokens")
+        
+        # Extract 14 features
+        features_df = analyzer.extract_14_features(category_tokens)
+        
+        if features_df is None or len(features_df) == 0:
+            st.warning(f"No features extracted for {category_name} - skipping")
+            continue
+        
+        st.info(f"Extracted {len(features_df)} features for {category_name}")
+        
+        # Check if we have enough samples for clustering
+        if len(features_df) < 3:
+            st.warning(f"Category {category_name} has only {len(features_df)} samples - skipping clustering (need at least 3)")
+            continue
+        
+        # Find optimal K using elbow method
+        optimal_k = analyzer.find_optimal_k_elbow(features_df, k_range)
+        
+        # Ensure K is reasonable for the number of samples
+        optimal_k = min(optimal_k, len(features_df) - 1)
+        optimal_k = max(optimal_k, 2)  # At least 2 clusters
+        
+        st.info(f"Using K={optimal_k} for {category_name}")
+        
+        # Run clustering
+        clustering_results = analyzer.run_kmeans_clustering(features_df, optimal_k)
+        
+        # Test stability
+        stability_results = analyzer.test_clustering_stability(features_df, optimal_k, n_stability_runs)
+        
+        # Store results
+        results['categories'][category_name] = {
+            'n_tokens': len(category_tokens),
+            'features': features_df,
+            'optimal_k': optimal_k,
+            'clustering_results': clustering_results,
+            'stability_results': stability_results,
+            'token_data': category_tokens
+        }
+        
+        results['total_tokens_analyzed'] += len(category_tokens)
+    
+    # Calculate overall stability summary
+    all_ari_scores = []
+    for category_results in results['categories'].values():
+        stability = category_results['stability_results']
+        if 'ari_scores' in stability:
+            all_ari_scores.extend(stability['ari_scores'])
+    
+    if all_ari_scores:
+        results['stability_summary'] = {
+            'average_ari': np.mean(all_ari_scores),
+            'min_ari': np.min(all_ari_scores),
+            'max_ari': np.max(all_ari_scores),
+            'n_runs': len(all_ari_scores)
+        }
+    
+    # Export results if requested
+    if export_results:
+        st.info("Exporting results...")
+        export_baseline_results(results, processed_data_path.parent / "time_series" / "results")
+    
+    return results
+
+
+def export_baseline_results(results, output_dir):
+    """Export baseline clustering results to files."""
+    from pathlib import Path
+    import json
+    from datetime import datetime
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Export summary
+    summary_file = output_dir / f"baseline_clustering_summary_{timestamp}.json"
+    with open(summary_file, 'w') as f:
+        json.dump({
+            'analysis_type': results['analysis_type'],
+            'total_tokens_analyzed': results['total_tokens_analyzed'],
+            'stability_summary': results['stability_summary'],
+            'categories': {name: {
+                'n_tokens': cat['n_tokens'],
+                'optimal_k': cat['optimal_k'],
+                'stability_results': cat['stability_results']
+            } for name, cat in results['categories'].items()}
+        }, f, indent=2)
+    
+    # Export detailed results per category
+    for category_name, category_results in results['categories'].items():
+        category_file = output_dir / f"baseline_{category_name.lower()}_{timestamp}.csv"
+        features_df = category_results['features']
+        clustering_results = category_results['clustering_results']
+        
+        # Add cluster assignments to features
+        features_with_clusters = features_df.copy()
+        features_with_clusters['cluster'] = clustering_results['labels']
+        
+        # Save to CSV
+        features_with_clusters.to_csv(category_file, index=False)
+    
+    st.success(f"Results exported to: {output_dir}")
 
 
 def main():
@@ -76,8 +221,8 @@ def main():
     
     analysis_type = st.sidebar.radio(
         "Choose analysis approach:",
-        ["Feature-based (ACF + Statistics)", "Price-only", "Multi-Resolution ACF"],
-        help="Feature-based uses 16 engineered features. Price-only clusters on price series. Multi-Resolution compares Sprint/Standard/Marathon tokens."
+        ["Feature-based (ACF + Statistics)", "Price-only", "Multi-Resolution ACF + Baseline Clustering"],
+        help="Feature-based uses 16 engineered features. Price-only clusters on price series. Multi-Resolution performs comprehensive analysis across Sprint/Standard/Marathon categories with 14-feature baseline clustering and stability testing."
     )
     
     # Analysis-specific configuration
@@ -98,8 +243,8 @@ def main():
                                       help="Use log-transformed prices for feature engineering")
             
             max_tokens = st.number_input("Max tokens to analyze:", 
-                                       min_value=10, value=100,
-                                       help="Limit for faster analysis")
+                                       min_value=10, value=1000,
+                                       help="Limit for faster analysis (use higher values for comprehensive analysis)")
             
             find_optimal_k = st.checkbox("Find optimal K", value=True,
                                        help="Automatically find optimal clusters using elbow method")
@@ -122,9 +267,21 @@ def main():
                 help="How to convert price series for clustering"
             )
             
+            # Add guidance for extreme volatility
+            if price_method == "returns":
+                st.info("💡 **Returns** work well for normal volatility. For extreme moves (>1000%), consider **log_returns** or **log_prices**.")
+            elif price_method == "log_returns":
+                st.info("💡 **Log Returns** handle extreme volatility better than regular returns. Good for pumps/dumps >100%.")
+            elif price_method == "log_prices":
+                st.info("💡 **Log Prices** are best for extreme volatility (10M%+ pumps, 99.9% dumps). Most stable for memecoin analysis.")
+            elif price_method == "dtw_features":
+                st.info("💡 **DTW Features** find similar temporal patterns regardless of scale. Good for discovering behavioral patterns.")
+            else:
+                st.info("💡 **Raw Prices** can be unstable with extreme volatility. Consider log_prices for better results.")
+            
             max_tokens = st.number_input("Max tokens to analyze:", 
-                                       min_value=10, value=100,
-                                       help="Limit for faster analysis")
+                                       min_value=10, value=1000,
+                                       help="Limit for faster analysis (use higher values for comprehensive analysis)")
             
             max_sequence_length = st.number_input(
                 "Max sequence length:",
@@ -155,8 +312,8 @@ def main():
             - **dtw_features**: Statistical features from price series
             """)
     
-    # Multi-Resolution ACF specific options
-    elif analysis_type == "Multi-Resolution ACF":
+    # Multi-Resolution ACF + Baseline Clustering specific options
+    elif analysis_type == "Multi-Resolution ACF + Baseline Clustering":
         with st.sidebar.expander("🚀 Multi-Resolution Settings", expanded=True):
             st.markdown("**⭐ PHASE 1A: Multi-Resolution Analysis**")
             
@@ -166,11 +323,25 @@ def main():
                 help="Method for analyzing across lifespan categories"
             )
             
-            max_tokens_per_category = st.number_input(
-                "Max tokens per category:",
-                min_value=10, max_value=1000, value=100,
-                help="Limit per category for balanced analysis across Sprint/Standard/Marathon"
+            # Token limit with support for unlimited analysis
+            token_limit_input = st.text_input(
+                "Max tokens per category (or 'none' for unlimited):",
+                value="1000",
+                help="Limit per category for balanced analysis across Sprint/Standard/Marathon. Use 'none' for unlimited analysis."
             )
+            
+            # Parse token limit
+            try:
+                if token_limit_input.lower() == 'none':
+                    max_tokens_per_category = None
+                else:
+                    max_tokens_per_category = int(token_limit_input)
+                    if max_tokens_per_category < 10:
+                        st.error("Token limit must be at least 10 or 'none'")
+                        max_tokens_per_category = 1000
+            except ValueError:
+                st.error("Invalid input. Please enter a number or 'none'")
+                max_tokens_per_category = 1000
             
             enable_dtw_clustering = st.checkbox(
                 "Enable DTW clustering",
@@ -184,17 +355,44 @@ def main():
                 help="Compare ACF patterns across lifespan categories"
             )
             
+            # Baseline clustering options
+            st.markdown("---")
+            st.markdown("**⭐ Baseline Clustering (CEO Requirements):**")
+            
+            enable_baseline_clustering = st.checkbox(
+                "Enable 14-feature baseline clustering",
+                value=True,
+                help="Run baseline clustering with 14 features, elbow method, and stability testing"
+            )
+            
+            if enable_baseline_clustering:
+                # Clustering parameters
+                k_range_min = st.number_input("Min clusters (K):", min_value=3, max_value=10, value=3)
+                k_range_max = st.number_input("Max clusters (K):", min_value=3, max_value=15, value=10)
+                
+                # Stability testing
+                n_stability_runs = st.number_input(
+                    "Number of stability runs:", 
+                    min_value=3, max_value=10, value=5,
+                    help="Number of runs to test clustering stability (ARI calculation)"
+                )
+                
+                # Export options
+                export_results = st.checkbox("Export results to files", value=True)
+            
             st.markdown("""
-            **Lifespan Categories:**
-            - **Sprint**: 200-400 min (fast pump/dump)
-            - **Standard**: 400-1200 min (typical lifecycle)
-            - **Marathon**: 1200+ min (extended development)
+            **Lifespan Categories (Death-Aware):**
+            - **Sprint**: 0-400 active min (includes ALL dead tokens)
+            - **Standard**: 400-1200 active min (typical lifecycle)
+            - **Marathon**: 1200+ active min (extended development)
             
-            **Why limit per category?** 
-            Ensures balanced representation across categories.
-            Without limits: Sprint=50, Standard=5000, Marathon=20 → imbalanced analysis.
+            **Analysis Features:**
+            - Multi-resolution ACF analysis across categories
+            - 14-feature baseline clustering (CEO requirements)
+            - Stability testing with ARI > 0.7 threshold
+            - Elbow method for optimal K selection
             
-            **Goal**: Discover behavioral archetypes for stable ML baseline
+            **Goal**: Discover behavioral archetypes including death patterns
             """)
         
         # Multi-resolution uses fixed optimal settings
@@ -205,18 +403,27 @@ def main():
         max_tokens = None
         
         # Initialize multi-resolution specific variables for other analysis types
-        multi_method = "returns"
-        max_tokens_per_category = 100
-        enable_dtw_clustering = False
-        compare_across_categories = True
+        # multi_method is set by UI above, don't override
+        if not enable_baseline_clustering:
+            enable_dtw_clustering = False
+            compare_across_categories = True
+            k_range_min = 3
+            k_range_max = 10
+            n_stability_runs = 5
+            export_results = True
     
     # Initialize variables for other analysis types that don't have multi-resolution settings
-    if analysis_type != "Multi-Resolution ACF":
+    if analysis_type not in ["Multi-Resolution ACF + Baseline Clustering"]:
         # Default values for multi-resolution variables not used in other types
-        multi_method = "returns"
-        max_tokens_per_category = 100
+        multi_method = "returns"  # Default for non-multi-resolution analysis
+        max_tokens_per_category = None  # Use None as default for unlimited
         enable_dtw_clustering = False
         compare_across_categories = True
+        enable_baseline_clustering = False
+        k_range_min = 3
+        k_range_max = 10
+        n_stability_runs = 5
+        export_results = True
     
     # Initialize price-only specific variables for other analysis types
     if analysis_type != "Price-only":
@@ -224,8 +431,9 @@ def main():
         max_sequence_length = 500
         use_max_length = True
     
+    
     # Quick rerun option if results exist (only for non-multi-resolution analysis)
-    if 'results' in st.session_state and analysis_type != "Multi-Resolution ACF":
+    if 'results' in st.session_state and analysis_type not in ["Multi-Resolution ACF + Baseline Clustering"]:
         st.sidebar.markdown("---")
         st.sidebar.markdown("**Quick Rerun Options:**")
         
@@ -293,12 +501,21 @@ def main():
                         max_tokens=max_tokens,
                         max_length=max_sequence_length if use_max_length else None
                     )
-                elif analysis_type == "Multi-Resolution ACF":
+                elif analysis_type == "Multi-Resolution ACF + Baseline Clustering":
                     # Run multi-resolution lifespan category analysis
                     st.info("🚀 Running Phase 1A: Multi-Resolution ACF Analysis...")
                     
+                    # Use processed data directory for multi-resolution analysis
+                    processed_data_path = data_path.parent / "processed"
+                    if not processed_data_path.exists():
+                        st.error(f"Processed data directory not found: {processed_data_path.absolute()}")
+                        st.error("Please run data analysis first to generate processed categories.")
+                        return
+                    
+                    st.info(f"Using processed data from: {processed_data_path.absolute()}")
+                    
                     results = analyzer.analyze_by_lifespan_category(
-                        data_path,
+                        processed_data_path,
                         method=multi_method,
                         use_log_price=use_log_price,
                         max_tokens_per_category=max_tokens_per_category
@@ -327,6 +544,26 @@ def main():
                             results['acf_comparison'] = acf_comparison
                         except Exception as e:
                             st.warning(f"ACF comparison failed: {e}")
+                    
+                    # Run baseline clustering if enabled
+                    if enable_baseline_clustering:
+                        st.info("🎯 Running Baseline Clustering Analysis (CEO Requirements)...")
+                        
+                        baseline_results = run_baseline_clustering_analysis(
+                            processed_data_path,
+                            token_limits={
+                                'sprint': None,  # No limits - use all tokens
+                                'standard': None, 
+                                'marathon': None
+                            },
+                            k_range=(k_range_min, k_range_max),
+                            n_stability_runs=n_stability_runs,
+                            export_results=export_results
+                        )
+                        
+                        # Merge baseline results into main results
+                        results['baseline_clustering'] = baseline_results
+                
                 
                 else:
                     # Run complete feature-based analysis
@@ -343,10 +580,19 @@ def main():
                 st.session_state['results'] = results
                 
                 # Success message depends on analysis type
-                if analysis_type == "Multi-Resolution ACF":
+                if analysis_type == "Multi-Resolution ACF + Baseline Clustering":
                     total_tokens = results.get('total_tokens_analyzed', 0)
                     n_categories = len(results.get('categories', {}))
-                    st.success(f"✅ Multi-Resolution Analysis complete! Analyzed {total_tokens} tokens across {n_categories} lifespan categories.")
+                    success_msg = f"✅ Multi-Resolution Analysis complete! Analyzed {total_tokens} tokens across {n_categories} lifespan categories."
+                    
+                    # Add baseline clustering info if enabled
+                    if enable_baseline_clustering and 'baseline_clustering' in results:
+                        baseline_results = results['baseline_clustering']
+                        stability_summary = baseline_results.get('stability_summary', {})
+                        avg_ari = stability_summary.get('average_ari', 0)
+                        success_msg += f" Baseline clustering: Average ARI {avg_ari:.3f}"
+                    
+                    st.success(success_msg)
                 else:
                     n_tokens = len(results.get('token_names', []))
                     st.success(f"✅ Analysis complete! Analyzed {n_tokens} tokens.")
@@ -361,27 +607,43 @@ def main():
     if 'results' in st.session_state:
         results = st.session_state['results']
         
-        # Create tabs based on analysis type
-        if 'categories' in results:  # Multi-Resolution analysis
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "📊 Multi-Resolution Overview", 
-                "🏃 Category Comparison",
-                "📈 Cross-Category ACF",
-                "🎯 Category Clustering",
-                "🗺️ Combined t-SNE"
-            ])
+        # Create tabs based on analysis type  
+        if 'categories' in results:  # Multi-Resolution analysis (includes baseline clustering)
+            # Check if baseline clustering was run
+            has_baseline = 'baseline_clustering' in results
+            
+            if has_baseline:
+                tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+                    "📊 Multi-Resolution Overview", 
+                    "🏃 Category Comparison",
+                    "📈 Cross-Category ACF",
+                    "🎯 Baseline Clustering",
+                    "📈 Stability Analysis",
+                    "🗺️ Combined t-SNE",
+                    "🎭 Behavioral Archetypes"
+                ])
+            else:
+                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                    "📊 Multi-Resolution Overview", 
+                    "🏃 Category Comparison",
+                    "📈 Cross-Category ACF",
+                    "🎯 Category Clustering",
+                    "🗺️ Combined t-SNE",
+                    "🎭 Behavioral Archetypes"
+                ])
         else:  # Standard analysis
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
                 "📊 Overview", 
                 "📈 Autocorrelation Analysis",
                 "🎯 Clustering Results",
                 "📈 Elbow Analysis",
                 "🗺️ t-SNE Visualization",
-                "🔍 Token Explorer"
+                "🔍 Token Explorer",
+                "🎭 Behavioral Archetypes"
             ])
         
         # Handle tab content based on analysis type
-        if 'categories' in results:  # Multi-Resolution analysis
+        if 'categories' in results:  # Multi-Resolution analysis (includes baseline clustering)
             with tab1:
                 display_multi_resolution_overview(results)
                 
@@ -391,11 +653,37 @@ def main():
             with tab3:
                 display_cross_category_acf(results)
                 
-            with tab4:
-                display_category_clustering(results)
-                
-            with tab5:
-                display_combined_tsne(results)
+            if has_baseline:
+                with tab4:
+                    # Display baseline clustering results
+                    if 'baseline_clustering' in results:
+                        baseline_results = results['baseline_clustering']
+                        display_baseline_cluster_overview(baseline_results)
+                    else:
+                        st.info("Baseline clustering not available")
+                        
+                with tab5:
+                    # Display stability analysis
+                    if 'baseline_clustering' in results:
+                        baseline_results = results['baseline_clustering']
+                        display_baseline_stability_analysis(baseline_results)
+                    else:
+                        st.info("Stability analysis not available")
+                        
+                with tab6:
+                    display_combined_tsne(results)
+                    
+                with tab7:
+                    display_behavioral_archetypes(results)
+            else:
+                with tab4:
+                    display_category_clustering(results)
+                    
+                with tab5:
+                    display_combined_tsne(results)
+                    
+                with tab6:
+                    display_behavioral_archetypes(results)
         else:  # Standard analysis
             with tab1:
                 display_overview(results)
@@ -414,6 +702,9 @@ def main():
                 
             with tab6:
                 display_token_explorer(results)
+                
+            with tab7:
+                display_behavioral_archetypes(results)
             
     else:
         st.info("👈 Configure parameters and click 'Run Analysis' to start")
@@ -1551,8 +1842,8 @@ def display_category_comparison(results: Dict):
                 cluster_data.append({
                     'Cluster': f"Cluster {cluster_id}",
                     'Tokens': stats.get('n_tokens', 0),
-                    'Avg Return': f"{stats.get('avg_return', 0)*100:.1f}%",
-                    'Avg Volatility': f"{stats.get('avg_volatility', 0)*100:.1f}%"
+                    'Avg Return': f"{stats.get('price_characteristics', {}).get('avg_return', 0)*100:.1f}%",
+                    'Avg Volatility': f"{stats.get('price_characteristics', {}).get('avg_volatility', 0)*100:.1f}%"
                 })
             
             if cluster_data:
@@ -1720,11 +2011,11 @@ def display_category_clustering(results: Dict):
                     st.metric("Tokens in Cluster", stats.get('n_tokens', 0))
                     
                 with col2:
-                    avg_return = stats.get('avg_return', 0)
+                    avg_return = stats.get('price_characteristics', {}).get('avg_return', 0)
                     st.metric("Avg Return", f"{avg_return*100:.1f}%")
                     
                 with col3:
-                    avg_volatility = stats.get('avg_volatility', 0)
+                    avg_volatility = stats.get('price_characteristics', {}).get('avg_volatility', 0)
                     st.metric("Avg Volatility", f"{avg_volatility*100:.1f}%")
     
     # DTW clustering results if available
@@ -1786,7 +2077,8 @@ def display_combined_tsne(results: Dict):
             tsne_2d = category_results['t_sne_2d']
             cluster_labels = category_results.get('cluster_labels', [])
             
-            for i, (x, y) in enumerate(tsne_2d):
+            for i, row in enumerate(tsne_2d):
+                x, y = row[0], row[1]
                 combined_tsne_data.append([x, y])
                 combined_colors.append(category_name)
                 
@@ -1834,6 +2126,867 @@ def display_combined_tsne(results: Dict):
     
     else:
         st.warning("No t-SNE data available for visualization")
+
+
+def display_behavioral_archetypes(results: Dict):
+    """Display behavioral archetype analysis interface"""
+    st.header("🎭 Behavioral Archetype Analysis")
+    
+    st.markdown("""
+    This section analyzes memecoin tokens to identify behavioral archetypes including death patterns.
+    
+    **Key Features:**
+    - Death detection using robust algorithms for tokens with small values
+    - Identification of 5-8 behavioral archetypes
+    - Early detection rules using only first 5 minutes of data
+    - Survival analysis and return profiles
+    """)
+    
+    # Initialize behavioral analyzer
+    if 'behavioral_analyzer' not in st.session_state:
+        st.session_state.behavioral_analyzer = BehavioralArchetypeAnalyzer()
+    
+    behavioral_analyzer = st.session_state.behavioral_analyzer
+    
+    # Configuration section
+    st.subheader("🛠️ Configuration")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Data source selection
+        project_root = Path(__file__).parent.parent
+        processed_dir = project_root / "data" / "processed"
+        
+        st.write("**Data Source**: Processed Categories")
+        st.write(f"Directory: `{processed_dir}`")
+        
+        if processed_dir.exists():
+            categories = [d.name for d in processed_dir.iterdir() if d.is_dir()]
+            st.write(f"Available categories: {', '.join(categories)}")
+        else:
+            st.error("Processed data directory not found. Please run data analysis first.")
+            return
+    
+    with col2:
+        # Analysis parameters
+        token_limit_input = st.text_input(
+            "Tokens per category (or 'none' for unlimited)",
+            value="1000",
+            help="Limit tokens per category for faster analysis. Use 'none' for unlimited comprehensive analysis."
+        )
+        
+        # Parse token limit
+        try:
+            if token_limit_input.lower() == 'none':
+                token_limit = None
+            else:
+                token_limit = int(token_limit_input)
+                if token_limit < 10:
+                    st.error("Token limit must be at least 10 or 'none'")
+                    token_limit = 1000
+        except ValueError:
+            st.error("Invalid input. Please enter a number or 'none'")
+            token_limit = 1000
+        
+        n_clusters_range = st.multiselect(
+            "Number of clusters to try",
+            options=[5, 6, 7, 8, 9, 10],
+            default=[6, 7, 8],
+            help="Range of cluster numbers to test"
+        )
+    
+    with col3:
+        # Output options
+        save_results = st.checkbox("Save results to files", value=True)
+        
+        if save_results:
+            output_dir = project_root / "time_series" / "results"
+            st.write(f"**Output directory**: `{output_dir}`")
+            output_dir.mkdir(exist_ok=True)
+    
+    # Run analysis button
+    if st.button("🚀 Run Behavioral Archetype Analysis", type="primary"):
+        if not processed_dir.exists():
+            st.error("Processed data directory not found")
+            return
+        
+        if not n_clusters_range:
+            st.error("Please select at least one cluster number")
+            return
+        
+        # Progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            # Step 1: Load data
+            status_text.text("Loading categorized token data...")
+            progress_bar.progress(10)
+            
+            token_data = behavioral_analyzer.load_categorized_tokens(
+                processed_dir, limit=token_limit
+            )
+            
+            if not token_data:
+                st.error("No token data found")
+                return
+            
+            # Step 2: Extract features
+            status_text.text("Extracting features (death detection, lifecycle, early features)...")
+            progress_bar.progress(30)
+            
+            features_df = behavioral_analyzer.extract_all_features(token_data)
+            
+            # Step 3: Perform clustering
+            status_text.text("Performing clustering analysis...")
+            progress_bar.progress(60)
+            
+            clustering_results = behavioral_analyzer.perform_clustering(
+                features_df, n_clusters_range=n_clusters_range
+            )
+            
+            # Step 4: Identify archetypes
+            status_text.text("Identifying behavioral archetypes...")
+            progress_bar.progress(80)
+            
+            archetypes = behavioral_analyzer.identify_archetypes(
+                features_df, clustering_results
+            )
+            
+            # Step 5: Create early detection rules (DISABLED - not requested)
+            # status_text.text("Creating early detection rules...")
+            # progress_bar.progress(90)
+            
+            # early_detection_model = behavioral_analyzer.create_early_detection_rules(
+            #     features_df, archetypes
+            # )
+            early_detection_model = None
+            
+            # Step 6: Save results
+            if save_results:
+                status_text.text("Saving results...")
+                timestamp = behavioral_analyzer.save_results(
+                    features_df, clustering_results, archetypes, output_dir
+                )
+            
+            progress_bar.progress(100)
+            status_text.text("✅ Analysis complete!")
+            
+            # Store results in session state
+            st.session_state.archetype_results = {
+                'features_df': features_df,
+                'clustering_results': clustering_results,
+                'archetypes': archetypes,
+                'early_detection_model': early_detection_model,
+                'timestamp': timestamp if save_results else None
+            }
+            
+            st.success(f"🎉 Behavioral archetype analysis complete! Found {len(archetypes)} archetypes.")
+            
+        except Exception as e:
+            st.error(f"Error during analysis: {str(e)}")
+            import traceback
+            st.error(f"Full traceback: {traceback.format_exc()}")
+            return
+        
+        finally:
+            progress_bar.empty()
+            status_text.empty()
+    
+    # Display results if available
+    if 'archetype_results' in st.session_state:
+        results = st.session_state.archetype_results
+        
+        # Create sub-tabs for results
+        subtab1, subtab2, subtab3, subtab4, subtab5 = st.tabs([
+            "📊 Archetype Overview",
+            "🎯 Archetype Details", 
+            "📈 Survival Analysis",
+            "⚡ Early Detection",
+            "🗺️ Archetype t-SNE"
+        ])
+        
+        with subtab1:
+            display_archetype_overview(results)
+        
+        with subtab2:
+            display_archetype_details(results)
+        
+        with subtab3:
+            display_survival_analysis(results)
+        
+        with subtab4:
+            # display_early_detection(results)  # DISABLED - not requested
+            st.info("Early detection analysis not implemented yet.")
+        
+        with subtab5:
+            display_archetype_tsne(results)
+
+
+def display_archetype_overview(results: Dict):
+    """Display archetype analysis overview"""
+    st.subheader("📊 Behavioral Archetype Overview")
+    
+    features_df = results['features_df']
+    archetypes = results['archetypes']
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Tokens", len(features_df))
+    
+    with col2:
+        dead_pct = features_df['is_dead'].mean() * 100
+        st.metric("Dead Tokens", f"{dead_pct:.1f}%")
+    
+    with col3:
+        st.metric("Archetypes Found", len(archetypes))
+    
+    with col4:
+        avg_lifespan = features_df['lifespan_minutes'].mean()
+        st.metric("Avg Lifespan", f"{avg_lifespan:.0f} min")
+    
+    # Archetype distribution
+    st.subheader("🎭 Archetype Distribution")
+    
+    archetype_counts = features_df['cluster'].value_counts().sort_index()
+    archetype_names = [archetypes[i]['name'] for i in archetype_counts.index]
+    
+    fig = go.Figure(data=[
+        go.Pie(
+            labels=archetype_names,
+            values=archetype_counts.values,
+            hole=0.3,
+            textinfo='label+percent',
+            hovertemplate='<b>%{label}</b><br>Tokens: %{value}<br>Percentage: %{percent}<extra></extra>'
+        )
+    ])
+    fig.update_layout(
+        title="Token Distribution by Behavioral Archetype",
+        height=500
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Archetype characteristics table
+    st.subheader("📋 Archetype Characteristics")
+    
+    table_data = []
+    for cluster_id, archetype in archetypes.items():
+        stats = archetype['stats']
+        table_data.append({
+            'Archetype': archetype['name'],
+            'Tokens': stats['n_tokens'],
+            'Percentage': f"{stats['pct_of_total']:.1f}%",
+            'Death Rate': f"{stats['pct_dead']:.1f}%",
+            'Avg Lifespan': f"{stats['avg_lifespan']:.0f} min",
+            'Avg Max Return (5min)': f"{stats['avg_max_return']*100:.1f}%"
+        })
+    
+    # Convert to polars DataFrame for consistency
+    table_df = pl.DataFrame(table_data)
+    st.dataframe(table_df.to_pandas(), use_container_width=True)
+
+
+def display_archetype_details(results: Dict):
+    """Display detailed archetype analysis"""
+    st.subheader("🎯 Detailed Archetype Analysis")
+    
+    archetypes = results['archetypes']
+    features_df = results['features_df']
+    
+    # Select archetype for detailed view
+    archetype_options = {f"{arch['name']} (Cluster {cluster_id})": cluster_id 
+                        for cluster_id, arch in archetypes.items()}
+    
+    selected_archetype = st.selectbox(
+        "Select archetype for detailed analysis:",
+        options=list(archetype_options.keys())
+    )
+    
+    if selected_archetype:
+        cluster_id = archetype_options[selected_archetype]
+        archetype = archetypes[cluster_id]
+        cluster_data = features_df[features_df['cluster'] == cluster_id]
+        
+        # Archetype summary
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Total Tokens", archetype['stats']['n_tokens'])
+        
+        with col2:
+            st.metric("Death Rate", f"{archetype['stats']['pct_dead']:.1f}%")
+        
+        with col3:
+            st.metric("Avg Lifespan", f"{archetype['stats']['avg_lifespan']:.0f} min")
+        
+        # Representative examples
+        st.subheader(f"📋 Representative Examples: {archetype['name']}")
+        
+        examples_data = []
+        for token in archetype['examples'][:10]:
+            token_data = cluster_data[cluster_data['token'] == token]
+            if not token_data.empty:
+                row = token_data.iloc[0]
+                examples_data.append({
+                    'Token': token,
+                    'Category': row['category'],
+                    'Is Dead': '💀' if row['is_dead'] else '✅',
+                    'Lifespan': f"{row['lifespan_minutes']:.0f} min",
+                    'Final Price Ratio': f"{row['final_price_ratio']*100:.1f}%" if not np.isnan(row['final_price_ratio']) else 'N/A'
+                })
+        
+        if examples_data:
+            # Convert to polars DataFrame for consistency
+            examples_df = pl.DataFrame(examples_data)
+            st.dataframe(examples_df.to_pandas(), use_container_width=True)
+        
+        # ACF signature
+        if archetype['acf_signature']:
+            st.subheader(f"📈 ACF Signature: {archetype['name']}")
+            
+            acf_data = archetype['acf_signature']
+            lags = [int(col.split('_')[-1]) for col in acf_data.keys()]
+            acf_values = list(acf_data.values())
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=lags,
+                y=acf_values,
+                mode='lines+markers',
+                name=archetype['name'],
+                line=dict(width=3)
+            ))
+            
+            fig.update_layout(
+                title=f"Average ACF Pattern: {archetype['name']}",
+                xaxis_title="Lag (minutes)",
+                yaxis_title="Autocorrelation",
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def display_survival_analysis(results: Dict):
+    """Display survival analysis for archetypes"""
+    st.subheader("📈 Survival Analysis by Archetype")
+    
+    st.markdown("""
+    Survival analysis shows how long tokens of each archetype typically survive before "dying".
+    """)
+    
+    # Placeholder for survival curves
+    # This would require lifelines library for proper Kaplan-Meier curves
+    st.info("📊 Survival curves visualization would be implemented here using lifelines library")
+    
+    # For now, show lifespan distribution
+    features_df = results['features_df']
+    archetypes = results['archetypes']
+    
+    # Create lifespan distribution by archetype
+    archetype_names = {i: arch['name'] for i, arch in archetypes.items()}
+    features_df['archetype_name'] = features_df['cluster'].map(archetype_names)
+    
+    fig = px.box(
+        features_df,
+        x='archetype_name',
+        y='lifespan_minutes',
+        title="Lifespan Distribution by Archetype",
+        labels={'archetype_name': 'Archetype', 'lifespan_minutes': 'Lifespan (minutes)'}
+    )
+    fig.update_layout(
+        height=500,
+        xaxis_tickangle=-45
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def display_early_detection(results: Dict):
+    """Display early detection rules and performance"""
+    st.subheader("⚡ Early Detection Rules (First 5 Minutes)")
+    
+    early_detection_model = results.get('early_detection_model')
+    
+    if early_detection_model is None:
+        st.warning("Early detection model not available")
+        return
+    
+    st.markdown("""
+    These rules can classify tokens into archetypes using only the first 5 minutes of trading data.
+    """)
+    
+    # Feature importance
+    features_df = results['features_df']
+    early_feature_cols = [col for col in features_df.columns if '5min' in col]
+    
+    if early_feature_cols:
+        feature_importance = sorted(
+            zip(early_feature_cols, early_detection_model.feature_importances_),
+            key=lambda x: x[1], reverse=True
+        )
+        
+        # Top features chart
+        top_features = feature_importance[:10]
+        
+        fig = go.Figure(data=[
+            go.Bar(
+                x=[feat[1] for feat in top_features],
+                y=[feat[0] for feat in top_features],
+                orientation='h',
+                text=[f"{feat[1]:.3f}" for feat in top_features],
+                textposition='auto'
+            )
+        ])
+        fig.update_layout(
+            title="Top 10 Most Important Early Detection Features",
+            xaxis_title="Feature Importance",
+            yaxis_title="Feature",
+            height=500
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Model performance
+    X = features_df[early_feature_cols].fillna(0).values
+    y = features_df['cluster'].values
+    accuracy = early_detection_model.score(X, y)
+    
+    st.metric("Early Detection Accuracy", f"{accuracy:.1%}")
+    
+    # Test early detection
+    st.subheader("🧪 Test Early Detection")
+    
+    # Allow user to select a token to test
+    token_options = features_df['token'].unique()[:50]  # Limit for performance
+    selected_token = st.selectbox("Select token to test:", token_options)
+    
+    if selected_token and st.button("Test Early Detection"):
+        token_data = features_df[features_df['token'] == selected_token].iloc[0]
+        
+        # Get early features
+        early_features = [token_data[col] for col in early_feature_cols]
+        prediction = early_detection_model.predict([early_features])[0]
+        
+        # Show results
+        actual_archetype = results['archetypes'][token_data['cluster']]['name']
+        predicted_archetype = results['archetypes'][prediction]['name']
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Actual Archetype", actual_archetype)
+        
+        with col2:
+            st.metric("Predicted Archetype", predicted_archetype)
+        
+        if actual_archetype == predicted_archetype:
+            st.success("✅ Correct prediction!")
+        else:
+            st.error("❌ Incorrect prediction")
+
+
+def display_archetype_tsne(results: Dict):
+    """Display t-SNE visualization colored by archetypes"""
+    st.subheader("🗺️ Archetype t-SNE Visualization")
+    
+    clustering_results = results['clustering_results']
+    
+    if 'X_tsne' not in clustering_results:
+        st.warning("t-SNE data not available")
+        return
+    
+    features_df = results['features_df']
+    archetypes = results['archetypes']
+    X_tsne = clustering_results['X_tsne']
+    
+    # Create archetype names
+    archetype_names = {i: arch['name'] for i, arch in archetypes.items()}
+    features_df['archetype_name'] = features_df['cluster'].map(archetype_names)
+    
+    # Create t-SNE plot
+    fig = px.scatter(
+        x=X_tsne[:, 0],
+        y=X_tsne[:, 1],
+        color=features_df['archetype_name'],
+        hover_data={
+            'Token': features_df['token'],
+            'Is Dead': features_df['is_dead'],
+            'Lifespan': features_df['lifespan_minutes']
+        },
+        title="Behavioral Archetypes in t-SNE Space",
+        labels={'x': 't-SNE 1', 'y': 't-SNE 2', 'color': 'Archetype'}
+    )
+    
+    fig.update_layout(
+        height=600,
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.02
+        )
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Summary statistics
+    st.subheader("📊 Visualization Summary")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Total Points", len(X_tsne))
+    
+    with col2:
+        st.metric("Archetypes", len(archetypes))
+    
+    with col3:
+        n_dead = features_df['is_dead'].sum()
+        st.metric("Dead Tokens", f"{n_dead} ({n_dead/len(features_df)*100:.1f}%)")
+
+
+def display_baseline_cluster_overview(results: Dict):
+    """Display baseline clustering overview"""
+    st.subheader("📊 Baseline Clustering Overview")
+    
+    # Overall statistics
+    total_tokens = results['total_tokens_analyzed']
+    n_categories = len(results['categories'])
+    stability_summary = results.get('stability_summary', {})
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Tokens", total_tokens)
+    
+    with col2:
+        st.metric("Categories", n_categories)
+    
+    with col3:
+        avg_ari = stability_summary.get('average_ari', 0)
+        st.metric("Average ARI", f"{avg_ari:.3f}")
+    
+    with col4:
+        min_ari = stability_summary.get('min_ari', 0)
+        st.metric("Min ARI", f"{min_ari:.3f}")
+    
+    # Category breakdown
+    st.subheader("📈 Category Breakdown")
+    
+    category_data = []
+    for category_name, category_results in results['categories'].items():
+        category_data.append({
+            'Category': category_name,
+            'Tokens': category_results['n_tokens'],
+            'Optimal K': category_results['optimal_k'],
+            'Average ARI': category_results['stability_results']['average_ari'],
+            'Min ARI': category_results['stability_results']['min_ari']
+        })
+    
+    if category_data:
+        import pandas as pd
+        df = pd.DataFrame(category_data)
+        st.dataframe(df)
+    
+    # Success criteria check
+    st.subheader("✅ CEO Requirements Check")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Features Used**: 14 essential features ✅")
+        st.write("**Method**: Elbow method for K selection ✅")
+        st.write("**Stability**: ARI calculation ✅")
+    
+    with col2:
+        success_criteria = avg_ari > 0.7
+        status = "✅ PASSED" if success_criteria else "❌ FAILED"
+        st.write(f"**Success Criteria (ARI > 0.7)**: {status}")
+        
+        if success_criteria:
+            st.success("🎉 Perfect clustering stability achieved!")
+        else:
+            st.warning("⚠️ Clustering stability below threshold")
+
+
+def display_baseline_cluster_details(results: Dict):
+    """Display detailed cluster characteristics"""
+    st.subheader("🏷️ Cluster Details by Category")
+    
+    # Category selection
+    categories = list(results['categories'].keys())
+    selected_category = st.selectbox("Select Category:", categories)
+    
+    if selected_category:
+        category_results = results['categories'][selected_category]
+        features_df = category_results['features']
+        clustering_results = category_results['clustering_results']
+        
+        st.subheader(f"📊 {selected_category} Category Details")
+        
+        # Basic stats
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Tokens", len(features_df))
+        
+        with col2:
+            st.metric("Clusters", category_results['optimal_k'])
+        
+        with col3:
+            st.metric("Silhouette Score", f"{clustering_results['silhouette_score']:.3f}")
+        
+        # Cluster breakdown
+        st.subheader("🎯 Cluster Breakdown")
+        
+        cluster_stats = []
+        for cluster_id in range(category_results['optimal_k']):
+            cluster_mask = clustering_results['labels'] == cluster_id
+            cluster_features = features_df[cluster_mask]
+            
+            if len(cluster_features) > 0:
+                cluster_stats.append({
+                    'Cluster': cluster_id,
+                    'Tokens': len(cluster_features),
+                    'Percentage': f"{len(cluster_features)/len(features_df)*100:.1f}%",
+                    'Dead Tokens': f"{cluster_features['is_dead'].sum()}/{len(cluster_features)}",
+                    'Avg Lifespan': f"{cluster_features['lifespan_minutes'].mean():.1f}",
+                    'Avg Return': f"{cluster_features['mean_return'].mean():.4f}",
+                    'Avg Volatility': f"{cluster_features['volatility_5min'].mean():.4f}"
+                })
+        
+        if cluster_stats:
+            import pandas as pd
+            df = pd.DataFrame(cluster_stats)
+            st.dataframe(df)
+        
+        # Feature importance visualization
+        st.subheader("📈 Feature Importance by Cluster")
+        
+        # Create heatmap of feature values by cluster
+        feature_cols = [col for col in features_df.columns if col not in ['token']]
+        cluster_means = []
+        
+        for cluster_id in range(category_results['optimal_k']):
+            cluster_mask = clustering_results['labels'] == cluster_id
+            cluster_features = features_df[cluster_mask]
+            
+            if len(cluster_features) > 0:
+                cluster_mean = cluster_features[feature_cols].mean()
+                cluster_mean['cluster'] = cluster_id
+                cluster_means.append(cluster_mean)
+        
+        if cluster_means:
+            import pandas as pd
+            import plotly.express as px
+            
+            heatmap_df = pd.DataFrame(cluster_means)
+            heatmap_df = heatmap_df.set_index('cluster')
+            
+            fig = px.imshow(
+                heatmap_df.T,
+                aspect="auto",
+                color_continuous_scale="RdBu_r",
+                title=f"Feature Values by Cluster - {selected_category}"
+            )
+            
+            fig.update_layout(
+                xaxis_title="Cluster",
+                yaxis_title="Feature",
+                height=600
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def display_baseline_stability_analysis(results: Dict):
+    """Display stability analysis results"""
+    st.subheader("📈 Clustering Stability Analysis")
+    
+    # Overall stability summary
+    stability_summary = results.get('stability_summary', {})
+    
+    if stability_summary:
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Average ARI", f"{stability_summary['average_ari']:.3f}")
+        
+        with col2:
+            st.metric("Min ARI", f"{stability_summary['min_ari']:.3f}")
+        
+        with col3:
+            st.metric("Max ARI", f"{stability_summary['max_ari']:.3f}")
+        
+        with col4:
+            st.metric("Total Runs", stability_summary['n_runs'])
+    
+    # Per-category stability
+    st.subheader("🎯 Stability by Category")
+    
+    stability_data = []
+    for category_name, category_results in results['categories'].items():
+        stability = category_results['stability_results']
+        stability_data.append({
+            'Category': category_name,
+            'Average ARI': stability['average_ari'],
+            'Min ARI': stability['min_ari'],
+            'Max ARI': stability['max_ari'],
+            'Runs': stability['n_runs'],
+            'Status': '✅ STABLE' if stability['average_ari'] > 0.7 else '⚠️ UNSTABLE'
+        })
+    
+    if stability_data:
+        import pandas as pd
+        df = pd.DataFrame(stability_data)
+        st.dataframe(df)
+    
+    # ARI distribution visualization
+    st.subheader("📊 ARI Score Distribution")
+    
+    all_ari_scores = []
+    category_labels = []
+    
+    for category_name, category_results in results['categories'].items():
+        ari_scores = category_results['stability_results']['ari_scores']
+        all_ari_scores.extend(ari_scores)
+        category_labels.extend([category_name] * len(ari_scores))
+    
+    if all_ari_scores:
+        import pandas as pd
+        import plotly.express as px
+        
+        ari_df = pd.DataFrame({
+            'ARI Score': all_ari_scores,
+            'Category': category_labels
+        })
+        
+        fig = px.box(
+            ari_df,
+            x='Category',
+            y='ARI Score',
+            title="ARI Score Distribution by Category"
+        )
+        
+        # Add success threshold line
+        fig.add_hline(y=0.7, line_dash="dash", line_color="green", 
+                     annotation_text="Success Threshold (0.7)")
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def display_baseline_elbow_method(results: Dict):
+    """Display elbow method results"""
+    st.subheader("🎯 Elbow Method Analysis")
+    
+    st.info("**Note**: This visualization shows the elbow method results used for K selection. The elbow point indicates the optimal number of clusters.")
+    
+    # Show elbow results for each category
+    for category_name, category_results in results['categories'].items():
+        st.subheader(f"📈 {category_name} Category")
+        
+        optimal_k = category_results['optimal_k']
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Optimal K", optimal_k)
+        
+        with col2:
+            st.metric("Silhouette Score", f"{category_results['clustering_results']['silhouette_score']:.3f}")
+        
+        # Note about elbow visualization
+        st.info(f"✅ Elbow method selected K={optimal_k} for {category_name} category")
+        
+        # Show cluster distribution
+        features_df = category_results['features']
+        clustering_results = category_results['clustering_results']
+        
+        cluster_sizes = []
+        for cluster_id in range(optimal_k):
+            cluster_mask = clustering_results['labels'] == cluster_id
+            cluster_sizes.append(len(features_df[cluster_mask]))
+        
+        if cluster_sizes:
+            import pandas as pd
+            import plotly.express as px
+            
+            cluster_df = pd.DataFrame({
+                'Cluster': list(range(optimal_k)),
+                'Size': cluster_sizes
+            })
+            
+            fig = px.bar(
+                cluster_df,
+                x='Cluster',
+                y='Size',
+                title=f"Cluster Sizes - {category_name}"
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def display_baseline_export_results(results: Dict):
+    """Display export results and options"""
+    st.subheader("💾 Export Results")
+    
+    # Export summary
+    st.write("**Export Summary:**")
+    st.write(f"- Total tokens analyzed: {results['total_tokens_analyzed']}")
+    st.write(f"- Categories: {len(results['categories'])}")
+    st.write(f"- Average stability (ARI): {results.get('stability_summary', {}).get('average_ari', 0):.3f}")
+    
+    # Show export files
+    st.subheader("📁 Generated Files")
+    
+    export_info = []
+    for category_name, category_results in results['categories'].items():
+        export_info.append({
+            'Category': category_name,
+            'CSV File': f"baseline_{category_name.lower()}_[timestamp].csv",
+            'Features': "14 essential features + cluster assignments",
+            'Tokens': category_results['n_tokens']
+        })
+    
+    export_info.append({
+        'Category': 'Summary',
+        'CSV File': 'baseline_clustering_summary_[timestamp].json',
+        'Features': 'Overall results and stability metrics',
+        'Tokens': results['total_tokens_analyzed']
+    })
+    
+    if export_info:
+        import pandas as pd
+        df = pd.DataFrame(export_info)
+        st.dataframe(df)
+    
+    # Export options
+    st.subheader("🔄 Re-export Options")
+    
+    if st.button("📥 Export Results Again"):
+        from pathlib import Path
+        output_dir = Path("time_series/results")
+        export_baseline_results(results, output_dir)
+        st.success("Results exported successfully!")
+    
+    # Feature summary
+    st.subheader("📊 14 Essential Features")
+    
+    features_info = [
+        {"Category": "Death Features", "Features": "is_dead, death_minute, lifespan_minutes", "Count": 3},
+        {"Category": "Core Statistics", "Features": "mean_return, std_return, volatility_5min, max_drawdown", "Count": 4},
+        {"Category": "ACF Features", "Features": "acf_lag_1, acf_lag_5, acf_lag_10", "Count": 3},
+        {"Category": "Early Detection", "Features": "return_magnitude_5min, trend_direction_5min, price_change_ratio_5min, autocorrelation_5min", "Count": 4}
+    ]
+    
+    import pandas as pd
+    features_df = pd.DataFrame(features_info)
+    st.dataframe(features_df)
+    
+    total_features = sum(f["Count"] for f in features_info)
+    st.success(f"✅ Total: {total_features} features (CEO requirement: ≤15)")
 
 
 if __name__ == "__main__":

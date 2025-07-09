@@ -80,6 +80,169 @@ class AutocorrelationClusteringAnalyzer:
         print(f"Successfully loaded {len(token_data)} tokens")
         return token_data
     
+    def load_processed_categories(self, processed_dir: Path, max_tokens_per_category: Optional[int] = None) -> Dict[str, pl.DataFrame]:
+        """
+        Load tokens from processed data categories with proper token limits.
+        
+        Args:
+            processed_dir: Path to processed data directory
+            max_tokens_per_category: Maximum tokens per category (None for unlimited)
+            
+        Returns:
+            Dictionary mapping token names to DataFrames
+        """
+        token_data = {}
+        
+        # Load from 3 main categories (exclude tokens_with_gaps as they're incomplete)
+        categories = ['dead_tokens', 'normal_behavior_tokens', 'tokens_with_extremes']
+        
+        for category in categories:
+            category_path = processed_dir / category
+            if not category_path.exists():
+                print(f"Warning: Category directory not found: {category_path}")
+                continue
+                
+            parquet_files = list(category_path.glob("*.parquet"))
+            
+            # Apply token limit per category if specified
+            if max_tokens_per_category is not None:
+                parquet_files = parquet_files[:max_tokens_per_category]
+            
+            print(f"Loading {len(parquet_files)} tokens from {category}...")
+            
+            for file_path in tqdm(parquet_files, desc=f"Loading {category}"):
+                try:
+                    df = pl.read_parquet(file_path)
+                    token_name = file_path.stem
+                    
+                    # Ensure we have required columns
+                    if 'datetime' in df.columns and 'price' in df.columns:
+                        # Sort by datetime
+                        df = df.sort('datetime')
+                        
+                        # Add log price and category info
+                        df = df.with_columns([
+                            pl.col('price').log().alias('log_price'),
+                            pl.lit(category).alias('category')
+                        ])
+                        
+                        token_data[token_name] = df
+                        
+                except Exception as e:
+                    print(f"Error loading {file_path}: {e}")
+                    continue
+        
+        print(f"Successfully loaded {len(token_data)} tokens from processed categories")
+        return token_data
+    
+    def _analyze_death_distribution(self, token_data: Dict[str, pl.DataFrame]):
+        """
+        Analyze when tokens die to understand the dataset better.
+        
+        Args:
+            token_data: Dictionary mapping token names to DataFrames
+        """
+        import matplotlib.pyplot as plt
+        import json
+        from datetime import datetime
+        
+        print("\n" + "="*50)
+        print("DEATH DISTRIBUTION ANALYSIS")
+        print("="*50)
+        
+        death_times = []
+        death_stats = {
+            'total_tokens': len(token_data),
+            'dead_tokens': 0,
+            'alive_tokens': 0,
+            'death_time_bins': {},
+            'summary_stats': {}
+        }
+        
+        # Collect death times
+        for token_name, df in token_data.items():
+            prices = df['price'].to_numpy()
+            returns = np.diff(prices) / prices[:-1]
+            
+            from .archetype_utils import detect_token_death
+            death_minute = detect_token_death(prices, returns, window=30)
+            
+            if death_minute is not None:
+                death_times.append(death_minute)
+                death_stats['dead_tokens'] += 1
+            else:
+                death_stats['alive_tokens'] += 1
+        
+        if len(death_times) == 0:
+            print("No dead tokens found!")
+            return
+        
+        death_times = np.array(death_times)
+        
+        # Calculate summary statistics
+        death_stats['summary_stats'] = {
+            'median_death_time': float(np.median(death_times)),
+            'mean_death_time': float(np.mean(death_times)),
+            'min_death_time': float(np.min(death_times)),
+            'max_death_time': float(np.max(death_times)),
+            'std_death_time': float(np.std(death_times))
+        }
+        
+        # Bin analysis
+        bins = [0, 10, 30, 60, 120, 360, 720, 1440, float('inf')]
+        bin_labels = ['0-10min', '10-30min', '30-60min', '60-2h', '2-6h', '6-12h', '12-24h', '24h+']
+        
+        bin_counts, _ = np.histogram(death_times, bins=bins[:-1] + [np.max(death_times) + 1])
+        
+        print(f"Total tokens analyzed: {death_stats['total_tokens']:,}")
+        print(f"Dead tokens: {death_stats['dead_tokens']:,} ({death_stats['dead_tokens']/death_stats['total_tokens']*100:.1f}%)")
+        print(f"Alive tokens: {death_stats['alive_tokens']:,} ({death_stats['alive_tokens']/death_stats['total_tokens']*100:.1f}%)")
+        print(f"\nDeath timing statistics:")
+        print(f"  Median death time: {death_stats['summary_stats']['median_death_time']:.1f} minutes")
+        print(f"  Mean death time: {death_stats['summary_stats']['mean_death_time']:.1f} minutes")
+        print(f"  Range: {death_stats['summary_stats']['min_death_time']:.0f} - {death_stats['summary_stats']['max_death_time']:.0f} minutes")
+        
+        print(f"\nDeath distribution by time bins:")
+        for i, (label, count) in enumerate(zip(bin_labels, bin_counts)):
+            pct = count / len(death_times) * 100
+            death_stats['death_time_bins'][label] = {'count': int(count), 'percentage': float(pct)}
+            print(f"  {label}: {count:,} tokens ({pct:.1f}%)")
+        
+        # Create death distribution plot
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 1, 1)
+        plt.hist(death_times, bins=50, alpha=0.7, color='red', edgecolor='black')
+        plt.xlabel('Death Time (minutes)')
+        plt.ylabel('Number of Tokens')
+        plt.title('Death Time Distribution - All Dead Tokens')
+        plt.grid(True, alpha=0.3)
+        
+        # Log scale plot for better visibility
+        plt.subplot(2, 1, 2)
+        plt.hist(death_times, bins=50, alpha=0.7, color='red', edgecolor='black')
+        plt.xlabel('Death Time (minutes)')
+        plt.ylabel('Number of Tokens (log scale)')
+        plt.yscale('log')
+        plt.title('Death Time Distribution - Log Scale')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        output_dir = Path("time_series/results")
+        output_dir.mkdir(exist_ok=True)
+        plot_path = output_dir / f"death_distribution_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"\nDeath distribution plot saved to: {plot_path}")
+        
+        # Save statistics
+        stats_path = output_dir / f"death_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(stats_path, 'w') as f:
+            json.dump(death_stats, f, indent=2)
+        print(f"Death statistics saved to: {stats_path}")
+        
+        plt.close()  # Close to free memory
+    
     def compute_autocorrelation(self, series: np.ndarray, max_lag: Optional[int] = None) -> Dict:
         """
         Compute autocorrelation and partial autocorrelation for a series
@@ -436,9 +599,9 @@ class AutocorrelationClusteringAnalyzer:
         if find_optimal_k and method == 'kmeans':
             elbow_analysis = self.find_optimal_clusters(feature_matrix)
             if n_clusters is None:
-                # Use silhouette score as primary criterion, elbow as secondary
-                n_clusters = elbow_analysis['optimal_k_silhouette']
-                print(f"Optimal K found: {n_clusters} (silhouette), {elbow_analysis['optimal_k_elbow']} (elbow)")
+                # Use elbow method as primary criterion, silhouette as secondary
+                n_clusters = elbow_analysis['optimal_k_elbow']
+                print(f"Optimal K found: {n_clusters} (elbow), {elbow_analysis['optimal_k_silhouette']} (silhouette)")
         
         if n_clusters is None:
             n_clusters = self.n_clusters
@@ -458,6 +621,11 @@ class AutocorrelationClusteringAnalyzer:
         scaler = StandardScaler()
         features_scaled = scaler.fit_transform(feature_matrix)
         
+        # Debug: Check feature distribution
+        print(f"Feature matrix shape: {features_scaled.shape}")
+        print(f"Feature mean: {np.mean(features_scaled, axis=0)[:5]}...")  # First 5 means
+        print(f"Feature std: {np.std(features_scaled, axis=0)[:5]}...")   # First 5 stds
+        
         if method == 'kmeans':
             clusterer = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             labels = clusterer.fit_predict(features_scaled)
@@ -472,7 +640,11 @@ class AutocorrelationClusteringAnalyzer:
             
         else:
             raise ValueError(f"Unknown clustering method: {method}")
-            
+        
+        # Debug: Check cluster distribution
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        print(f"Cluster distribution: {dict(zip(unique_labels, counts))}")
+        
         result = {
             'labels': labels,
             'clusterer': clusterer,
@@ -941,18 +1113,30 @@ class AutocorrelationClusteringAnalyzer:
                     print(f"Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} returns")
                     
             elif method == 'log_returns':
-                # Use log returns
+                # Use log returns with proper handling of zero/small prices
                 if len(prices) >= target_length + 1:
-                    log_returns = np.diff(np.log(prices[-(target_length+1):]))
-                    if len(log_returns) == target_length:
-                        # Remove any inf/nan values
-                        if not np.any(np.isnan(log_returns)) and not np.any(np.isinf(log_returns)):
-                            feature_matrix.append(log_returns)
-                            final_tokens.append(valid_tokens[i])
+                    # Get the last target_length+1 prices
+                    price_slice = prices[-(target_length+1):]
+                    
+                    # Add small epsilon to avoid log(0)
+                    epsilon = 1e-10
+                    price_slice_safe = np.maximum(price_slice, epsilon)
+                    
+                    # Calculate log returns
+                    try:
+                        log_returns = np.diff(np.log(price_slice_safe))
+                        
+                        if len(log_returns) == target_length:
+                            # Remove any inf/nan values
+                            if not np.any(np.isnan(log_returns)) and not np.any(np.isinf(log_returns)):
+                                feature_matrix.append(log_returns)
+                                final_tokens.append(valid_tokens[i])
+                            else:
+                                print(f"Skipping {valid_tokens[i]} due to invalid log returns (inf/nan)")
                         else:
-                            print(f"Skipping {valid_tokens[i]} due to invalid log returns")
-                    else:
-                        print(f"Unexpected log returns length for {valid_tokens[i]}: {len(log_returns)} vs {target_length}")
+                            print(f"Unexpected log returns length for {valid_tokens[i]}: {len(log_returns)} vs {target_length}")
+                    except Exception as e:
+                        print(f"Skipping {valid_tokens[i]} due to log calculation error: {e}")
                 else:
                     print(f"Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} log returns")
                         
@@ -1147,9 +1331,10 @@ class AutocorrelationClusteringAnalyzer:
                                    max_tokens_per_category: Optional[int] = None) -> Dict:
         """
         Analyze tokens by lifespan categories: Sprint, Standard, Marathon
+        Uses processed data folders and applies death detection for accurate lifespan calculation.
         
         Args:
-            data_dir: Directory containing token data
+            data_dir: Directory containing token data (should be processed/ folder)
             method: Price transformation method
             use_log_price: Whether to use log prices
             max_tokens_per_category: Maximum tokens per category
@@ -1157,29 +1342,45 @@ class AutocorrelationClusteringAnalyzer:
         Returns:
             Dictionary with results for each lifespan category
         """
-        # Load all token data
-        all_token_data = self.load_raw_prices(data_dir)
+        # Load from processed categories
+        all_token_data = self.load_processed_categories(data_dir, max_tokens_per_category)
         
-        # Categorize tokens by lifespan
+        # Categorize tokens by active lifespan (death-aware)
         categories = {
-            'Sprint': {},      # 200-400 minutes
-            'Standard': {},    # 400-1200 minutes  
-            'Marathon': {}     # 1200+ minutes
+            'Sprint': {},      # 50-400 active minutes
+            'Standard': {},    # 400-1200 active minutes  
+            'Marathon': {}     # 1200+ active minutes
         }
         
-        for token_name, df in all_token_data.items():
-            lifespan = len(df)
-            
-            if 200 <= lifespan <= 400:
-                categories['Sprint'][token_name] = df
-            elif 400 < lifespan <= 1200:
-                categories['Standard'][token_name] = df
-            elif lifespan > 1200:
-                categories['Marathon'][token_name] = df
+        print("Applying death detection for accurate lifespan categorization...")
         
-        print(f"Token distribution by lifespan:")
+        for token_name, df in all_token_data.items():
+            # Apply death detection to get true active lifespan
+            prices = df['price'].to_numpy()
+            returns = np.diff(prices) / prices[:-1]
+            
+            # Import death detection from archetype_utils
+            from .archetype_utils import detect_token_death
+            death_minute = detect_token_death(prices, returns, window=30)
+            
+            # Calculate active lifespan (before death or full length if alive)
+            active_lifespan = death_minute if death_minute is not None else len(df)
+            
+            # Categorize by active lifespan
+            if 0 <= active_lifespan <= 400:
+                categories['Sprint'][token_name] = df
+            elif 400 < active_lifespan <= 1200:
+                categories['Standard'][token_name] = df
+            elif active_lifespan > 1200:
+                categories['Marathon'][token_name] = df
+            # Include tokens that die immediately (death_minute = 0) in Sprint category
+        
+        print(f"Token distribution by active lifespan:")
         for category, tokens in categories.items():
             print(f"  {category}: {len(tokens)} tokens")
+        
+        # Analyze death distribution for insights
+        self._analyze_death_distribution(all_token_data)
             
         # Analyze each category separately
         results_by_category = {}
@@ -1296,7 +1497,7 @@ class AutocorrelationClusteringAnalyzer:
     def _get_lifespan_range(self, category_name: str) -> str:
         """Get lifespan range description for category"""
         ranges = {
-            'Sprint': '200-400 minutes',
+            'Sprint': '0-400 minutes',
             'Standard': '400-1200 minutes', 
             'Marathon': '1200+ minutes'
         }
