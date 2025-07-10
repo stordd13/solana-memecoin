@@ -28,46 +28,58 @@ def detect_token_death(prices: np.ndarray, returns: np.ndarray, window: int = 30
     Returns:
         Index where token died, or None if token never died
     """
+    # Fix 6: Pre-fill gaps with forward-fill, then backward for edges
+    prices_series = pl.Series(prices)
+    prices = prices_series.forward_fill().backward_fill().to_numpy()
+    
     if len(prices) < window or len(returns) < window:
         return None
     
-    for i in range(len(returns) - window):
+    for i in range(len(returns) - window + 1):  # Adjusted to +1 for exact window
         window_returns = returns[i:i+window]
         window_prices = prices[i:i+window]
         
-        # Skip if window contains NaN or inf
+        # Skip if window contains NaN or inf (after fill, should be minimal)
         if np.any(np.isnan(window_returns)) or np.any(np.isinf(window_returns)):
             continue
         if np.any(np.isnan(window_prices)) or np.any(np.isinf(window_prices)):
             continue
         
+        # NEW: Skip if >5% gaps remaining (severe data issues)
+        gap_pct = np.sum(np.isnan(window_prices)) / len(window_prices)
+        if gap_pct > 0.05:
+            continue
+        
+        # Get valid prices/returns after any remaining NaN removal
+        valid_prices = window_prices[~np.isnan(window_prices)]
+        valid_returns = window_returns[~np.isnan(window_returns)]
+        
         # Check 1: All prices identical (true flatline)
-        unique_prices = np.unique(window_prices)
+        unique_prices = np.unique(valid_prices)
         if len(unique_prices) == 1:
             return i
         
         # Check 2: Relative volatility (handles small value tokens)
         # Use median absolute deviation for robustness
-        mad_returns = np.median(np.abs(window_returns - np.median(window_returns)))
-        mean_abs_return = np.mean(np.abs(window_returns))
+        mad_returns = np.median(np.abs(valid_returns - np.median(valid_returns)))
+        mean_abs_return = np.mean(np.abs(valid_returns))
         
         if mean_abs_return > 0:
-            relative_volatility = mad_returns / mean_abs_return
+            relative_volatility = safe_divide(mad_returns, mean_abs_return)
             if relative_volatility < 0.01:  # Less than 1% relative volatility
                 # Additional check: ensure it's not just a single outlier
-                if np.percentile(np.abs(window_returns), 90) < 0.001:
+                if np.percentile(np.abs(valid_returns), 90) < 0.001:
                     return i
         
         # Check 3: Tick frequency (for staircase death patterns)
-        unique_price_ratio = len(unique_prices) / len(window_prices)
-        if unique_price_ratio < 0.05:  # Less than 5% unique prices
+        unique_price_ratio = len(unique_prices) / len(valid_prices) if len(valid_prices) > 0 else 0
+        if unique_price_ratio < 0.1:  # Increased to 0.1 for staircase tolerance
             # Verify it's not just rounding - check actual price range
-            price_range = np.max(window_prices) - np.min(window_prices)
-            mean_price = np.mean(window_prices)
-            if mean_price > 0:
-                relative_range = price_range / mean_price
-                if relative_range < 0.001:  # Less than 0.1% price range
-                    return i
+            price_range = np.max(valid_prices) - np.min(valid_prices)
+            mean_price = np.mean(valid_prices)
+            relative_range = safe_divide(price_range, mean_price)
+            if relative_range < 0.001:  # Less than 0.1% price range
+                return i
     
     return None
 
@@ -113,7 +125,7 @@ def calculate_death_features(prices: np.ndarray, returns: np.ndarray,
             price_before = prices[max(0, death_minute - 10)]
             price_at_death = prices[death_minute]
             if price_before > 0:
-                features['death_velocity'] = (price_before - price_at_death) / price_before
+                features['death_velocity'] = safe_divide(price_before - price_at_death, price_before)
         
         # Pre-death volatility (30 minutes before death or available data)
         lookback = min(30, death_minute)
@@ -217,7 +229,7 @@ def calculate_skewness(returns: np.ndarray) -> float:
     
     mean = np.mean(cleaned)
     std = np.std(cleaned)
-    if std == 0:
+    if std < 1e-10:  # UPDATED: Tiny std threshold
         return 0.0
     
     return np.mean(((cleaned - mean) / std) ** 3)
@@ -365,10 +377,11 @@ def prepare_token_data(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, Option
     returns = np.zeros(len(prices) - 1)
     for i in range(1, len(prices)):
         if prices[i-1] > 0:
-            ret = (prices[i] - prices[i-1]) / prices[i-1]
-            # Use log returns for extreme movements (>100%)
-            if abs(ret) > 1.0:
-                returns[i-1] = np.log(prices[i] / prices[i-1])
+            prev = max(prices[i-1], 1e-10)  # NEW: Clip prev
+            curr = max(prices[i], 1e-10)   # NEW: Clip curr
+            ret = (curr - prev) / prev
+            if abs(ret) > 1.0:  # Existing
+                returns[i-1] = np.log(curr / prev)  # Safe now due to clips
             else:
                 returns[i-1] = ret
         else:
@@ -379,40 +392,14 @@ def prepare_token_data(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, Option
     
     return prices, returns, death_minute
 
+def safe_divide(a, b, default=0.0):
+    return np.divide(a, b, where=(np.abs(b) > 1e-10), out=np.full_like(a, default))
 
-def categorize_by_lifespan(features_df: 'pd.DataFrame') -> 'pd.DataFrame':
+
+
+def categorize_by_lifespan(token_data: Dict[str, pl.DataFrame], token_limits: Dict) -> Dict:
     """
     Categorize tokens by their active lifespan (CEO requirement).
-    
-    Args:
-        features_df: DataFrame with token features including 'lifespan_minutes'
-        
-    Returns:
-        DataFrame with added 'lifespan_category' column
-    """
-    import pandas as pd
-    
-    # Make a copy to avoid modifying the original
-    df = features_df.copy()
-    
-    # Define lifespan categories (CEO's roadmap)
-    def get_lifespan_category(lifespan_minutes):
-        if lifespan_minutes <= 400:
-            return 'Sprint'
-        elif lifespan_minutes <= 1200:
-            return 'Standard'
-        else:
-            return 'Marathon'
-    
-    # Apply categorization
-    df['lifespan_category'] = df['lifespan_minutes'].apply(get_lifespan_category)
-    
-    return df
-
-
-def categorize_by_lifespan(token_data: Dict, token_limits: Dict) -> Dict:
-    """
-    Categorize tokens by lifespan and apply limits.
     
     Args:
         token_data: Dictionary of token_name -> polars DataFrame
@@ -429,18 +416,19 @@ def categorize_by_lifespan(token_data: Dict, token_limits: Dict) -> Dict:
         'Marathon': {}
     }
     
-    # Categorize each token
+    # Categorize each token using active_lifespan
     for token_name, token_df in token_data.items():
         if token_df.is_empty():
             continue
         
-        # Get lifespan
-        lifespan_minutes = len(token_df)
+        # Compute death_minute and active_lifespan
+        prices, returns, death_minute = prepare_token_data(token_df)
+        active_lifespan = death_minute if death_minute is not None else len(token_df)
         
-        # Determine category
-        if lifespan_minutes <= 400:
+        # Determine category based on active_lifespan
+        if active_lifespan <= 400:
             category = 'Sprint'
-        elif lifespan_minutes <= 1200:
+        elif active_lifespan <= 1200:
             category = 'Standard'
         else:
             category = 'Marathon'
@@ -449,8 +437,8 @@ def categorize_by_lifespan(token_data: Dict, token_limits: Dict) -> Dict:
     
     # Apply limits (only if limit is not None)
     for category, limit in [('Sprint', token_limits['sprint']), 
-                           ('Standard', token_limits['standard']), 
-                           ('Marathon', token_limits['marathon'])]:
+                            ('Standard', token_limits['standard']), 
+                            ('Marathon', token_limits['marathon'])]:
         if limit is not None and len(categorized[category]) > limit:
             # Randomly sample
             tokens_to_keep = random.sample(list(categorized[category].keys()), limit)

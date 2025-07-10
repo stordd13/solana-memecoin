@@ -13,7 +13,9 @@ warnings.filterwarnings('ignore')
 from statsmodels.tsa.stattools import acf, pacf, ccf
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
+from sklearn.impute import SimpleImputer
+from scipy.stats import mstats
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import pdist, squareform
@@ -24,7 +26,53 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from tqdm import tqdm
+from statsmodels.tsa.stattools import adfuller
+from scipy.optimize import curve_fit
+from joblib import Parallel, delayed
 
+
+def safe_divide(a, b, default=0.0):
+    """Safe division with default value for division by zero."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    result = np.full_like(a, default, dtype=float)
+    mask = np.abs(b) > 1e-10
+    np.divide(a, b, where=mask, out=result)
+    return result
+
+
+def winsorize_array(data, limits=[0.01, 0.01]):
+    """Apply winsorization to handle extreme outliers."""
+    if len(data) == 0:
+        return data
+    return mstats.winsorize(data, limits=limits)
+
+
+def robust_feature_calculation(data, feature_func, default_value=0.0):
+    """Robust wrapper for feature calculations with NaN/inf handling."""
+    try:
+        if len(data) == 0:
+            return default_value
+        
+        # Remove NaN/inf values
+        clean_data = data[np.isfinite(data)]
+        if len(clean_data) == 0:
+            return default_value
+            
+        # Apply winsorization for extreme outliers
+        clean_data = winsorize_array(clean_data)
+        
+        # Calculate feature
+        result = feature_func(clean_data)
+        
+        # Ensure result is finite
+        if not np.isfinite(result):
+            return default_value
+            
+        return result
+        
+    except Exception:
+        return default_value
 
 class AutocorrelationClusteringAnalyzer:
     """
@@ -35,6 +83,7 @@ class AutocorrelationClusteringAnalyzer:
     def __init__(self):
         self.max_lag = 100  # Maximum lag for autocorrelation
         self.n_clusters = 5  # Default number of clusters
+        self.scaler = RobustScaler()  # Use RobustScaler for extreme outliers
         
     def load_raw_prices(self, data_dir: Path, limit: Optional[int] = None) -> Dict[str, pl.DataFrame]:
         """
@@ -66,9 +115,9 @@ class AutocorrelationClusteringAnalyzer:
                     # Sort by datetime
                     df = df.sort('datetime')
                     
-                    # Add log price
+                    # Add log price with robust preprocessing
                     df = df.with_columns([
-                        pl.col('price').log().alias('log_price')
+                        pl.col('price').clip(lower_bound=1e-10).log().alias('log_price')  # Clip before log
                     ])
                     
                     token_data[token_name] = df
@@ -80,13 +129,14 @@ class AutocorrelationClusteringAnalyzer:
         print(f"Successfully loaded {len(token_data)} tokens")
         return token_data
     
-    def load_processed_categories(self, processed_dir: Path, max_tokens_per_category: Optional[int] = None) -> Dict[str, pl.DataFrame]:
+    def load_processed_categories(self, processed_dir: Path, max_tokens_per_category: Optional[int] = None, sample_ratio: Optional[float] = None) -> Dict[str, pl.DataFrame]:
         """
         Load tokens from processed data categories with proper token limits.
         
         Args:
             processed_dir: Path to processed data directory
             max_tokens_per_category: Maximum tokens per category (None for unlimited)
+            sample_ratio: Optional sampling ratio (0.1 = 10% sample) for faster processing
             
         Returns:
             Dictionary mapping token names to DataFrames
@@ -120,9 +170,9 @@ class AutocorrelationClusteringAnalyzer:
                         # Sort by datetime
                         df = df.sort('datetime')
                         
-                        # Add log price and category info
+                        # Add log price and category info with robust preprocessing
                         df = df.with_columns([
-                            pl.col('price').log().alias('log_price'),
+                            pl.col('price').clip(lower_bound=1e-10).log().alias('log_price'),
                             pl.lit(category).alias('category')
                         ])
                         
@@ -133,6 +183,73 @@ class AutocorrelationClusteringAnalyzer:
                     continue
         
         print(f"Successfully loaded {len(token_data)} tokens from processed categories")
+        
+        # Apply stratified sampling if requested (for faster processing)
+        if sample_ratio is not None and 0 < sample_ratio < 1:
+            import random
+            from collections import defaultdict
+            
+            total_tokens = len(token_data)
+            target_sample_size = int(total_tokens * sample_ratio)
+            
+            print(f"Applying stratified sampling for {target_sample_size} tokens ({sample_ratio*100:.1f}%)...")
+            
+            # First, categorize all tokens by lifespan (quick death detection)
+            lifespan_categories = defaultdict(list)
+            
+            print("Performing quick lifespan categorization for stratified sampling...")
+            for token_name, df in token_data.items():
+                prices = df['price'].to_numpy()
+                returns = np.diff(prices) / np.maximum(prices[:-1], 1e-10)
+                
+                # Import death detection
+                from .archetype_utils import detect_token_death
+                death_minute = detect_token_death(prices, returns, window=30)
+                
+                # Calculate active lifespan (before death or full length if alive)
+                active_lifespan = death_minute if death_minute is not None else len(df)
+                
+                # Categorize by active lifespan
+                if 0 <= active_lifespan <= 400:
+                    lifespan_categories['Sprint'].append(token_name)
+                elif 400 < active_lifespan <= 1200:
+                    lifespan_categories['Standard'].append(token_name)
+                elif active_lifespan > 1200:
+                    lifespan_categories['Marathon'].append(token_name)
+            
+            # Show natural distribution
+            print("Natural lifespan distribution:")
+            total_categorized = sum(len(tokens) for tokens in lifespan_categories.values())
+            for category, tokens in lifespan_categories.items():
+                pct = len(tokens) / total_categorized * 100 if total_categorized > 0 else 0
+                print(f"  {category}: {len(tokens)} tokens ({pct:.1f}%)")
+            
+            # Apply stratified sampling to maintain proportions
+            sampled_token_data = {}
+            
+            for category, token_list in lifespan_categories.items():
+                if len(token_list) == 0:
+                    continue
+                
+                # Calculate sample size for this category (proportional)
+                category_proportion = len(token_list) / total_categorized
+                category_sample_size = max(1, int(target_sample_size * category_proportion))
+                
+                # Don't sample more than available
+                category_sample_size = min(category_sample_size, len(token_list))
+                
+                # Random sample within category
+                sampled_tokens = random.sample(token_list, category_sample_size)
+                
+                print(f"  Sampling {len(sampled_tokens)} tokens from {category}")
+                
+                # Add to sampled dataset
+                for token_name in sampled_tokens:
+                    sampled_token_data[token_name] = token_data[token_name]
+            
+            print(f"Stratified sampling complete: {len(sampled_token_data)} tokens")
+            return sampled_token_data
+        
         return token_data
     
     def _analyze_death_distribution(self, token_data: Dict[str, pl.DataFrame]):
@@ -189,10 +306,15 @@ class AutocorrelationClusteringAnalyzer:
         }
         
         # Bin analysis
-        bins = [0, 10, 30, 60, 120, 360, 720, 1440, float('inf')]
+        bins = [0, 10, 30, 60, 120, 360, 720, 1440]
         bin_labels = ['0-10min', '10-30min', '30-60min', '60-2h', '2-6h', '6-12h', '12-24h', '24h+']
         
-        bin_counts, _ = np.histogram(death_times, bins=bins[:-1] + [np.max(death_times) + 1])
+        # Create proper bin edges ensuring monotonic increase
+        max_death_time = np.max(death_times)
+        final_bin_edge = max(1441, max_death_time + 1)  # Ensure it's larger than 1440
+        histogram_bins = bins + [final_bin_edge]
+        
+        bin_counts, _ = np.histogram(death_times, bins=histogram_bins)
         
         print(f"Total tokens analyzed: {death_stats['total_tokens']:,}")
         print(f"Dead tokens: {death_stats['dead_tokens']:,} ({death_stats['dead_tokens']/death_stats['total_tokens']*100:.1f}%)")
@@ -229,7 +351,7 @@ class AutocorrelationClusteringAnalyzer:
         plt.tight_layout()
         
         # Save plot
-        output_dir = Path("time_series/results")
+        output_dir = Path(__file__).parent / "results"
         output_dir.mkdir(exist_ok=True)
         plot_path = output_dir / f"death_distribution_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
@@ -243,6 +365,7 @@ class AutocorrelationClusteringAnalyzer:
         
         plt.close()  # Close to free memory
     
+
     def compute_autocorrelation(self, series: np.ndarray, max_lag: Optional[int] = None) -> Dict:
         """
         Compute autocorrelation and partial autocorrelation for a series
@@ -265,40 +388,72 @@ class AutocorrelationClusteringAnalyzer:
                 'acf': np.array([]),
                 'pacf': np.array([]),
                 'significant_lags': [],
-                'decay_rate': np.nan
+                'decay_rate': np.nan,
+                'first_zero_crossing': max_lag,
+                'is_differenced': False
             }
         
         # Adjust max_lag if series is too short
         max_lag = min(max_lag, len(series_clean) // 2 - 1, len(series_clean) - 2)
         max_lag = max(max_lag, 1)  # Ensure at least lag 1
         
-        # Compute ACF and PACF
-        acf_values = acf(series_clean, nlags=max_lag, fft=True)
-        pacf_values = pacf(series_clean, nlags=max_lag)
+        # Fix 3: Check stationarity and difference if needed
+        is_differenced = False
+        if len(series_clean) > 10:
+            adf_result = adfuller(series_clean)
+            if adf_result[1] > 0.05:  # Non-stationary (p-value > 0.05)
+                series_diff = np.diff(series_clean)
+                if len(series_diff) >= 3:  # Ensure enough points after diff
+                    acf_values = acf(series_diff, nlags=max_lag, fft=True)
+                    pacf_values = pacf(series_diff, nlags=max_lag)
+                    is_differenced = True
+                else:
+                    # Fallback to original if diff too short
+                    acf_values = acf(series_clean, nlags=max_lag, fft=True)
+                    pacf_values = pacf(series_clean, nlags=max_lag)
+            else:
+                acf_values = acf(series_clean, nlags=max_lag, fft=True)
+                pacf_values = pacf(series_clean, nlags=max_lag)
+        else:
+            acf_values = acf(series_clean, nlags=max_lag, fft=True)
+            pacf_values = pacf(series_clean, nlags=max_lag)
         
         # Find significant lags (outside 95% confidence interval)
         n = len(series_clean)
         confidence_interval = 1.96 / np.sqrt(n)
         significant_lags = np.where(np.abs(acf_values[1:]) > confidence_interval)[0] + 1
         
-        # Estimate decay rate (for AR processes)
-        # Find first zero crossing or minimum
-        zero_crossings = np.where(np.diff(np.sign(acf_values)))[0]
-        if len(zero_crossings) > 0:
-            decay_rate = -np.log(np.abs(acf_values[1])) if acf_values[1] != 0 else np.inf
+        # Fix 4: Robust decay rate estimation with exponential fit
+        def exp_decay(lag, rho):
+            return np.exp(-rho * lag)
+        
+        if len(acf_values) > 2:
+            lags = np.arange(1, min(6, len(acf_values)))  # Use first 5 lags for fit
+            abs_acf = np.abs(acf_values[1:len(lags)+1])
+            abs_acf = np.clip(abs_acf, 1e-10, 1.0)  # Avoid log(0) or invalid fit
+            try:
+                params, _ = curve_fit(exp_decay, lags, abs_acf, p0=0.1, bounds=(0, np.inf))
+                decay_rate = params[0]
+            except:
+                # Fallback to simple method
+                decay_rate = -np.log(abs_acf[0]) if abs_acf[0] > 0 else np.inf
         else:
             decay_rate = np.nan
-            
+        
+        # Estimate first zero crossing
+        zero_crossings = np.where(np.diff(np.sign(acf_values)))[0]
+        
         return {
             'acf': acf_values,
             'pacf': pacf_values,
             'significant_lags': significant_lags.tolist(),
             'decay_rate': decay_rate,
-            'first_zero_crossing': int(zero_crossings[0]) if len(zero_crossings) > 0 else max_lag
+            'first_zero_crossing': int(zero_crossings[0]) if len(zero_crossings) > 0 else max_lag,
+            'is_differenced': is_differenced  # New from Fix 3
         }
     
     def compute_all_autocorrelations(self, token_data: Dict[str, pl.DataFrame], 
-                                   use_log_price: bool = True) -> Dict[str, Dict]:
+                                    use_log_price: bool = True) -> Dict[str, Dict]:
         """
         Compute autocorrelation for all tokens
         
@@ -314,13 +469,23 @@ class AutocorrelationClusteringAnalyzer:
         
         print(f"Computing autocorrelations for {len(token_data)} tokens...")
         
-        for token_name, df in tqdm(token_data.items(), desc="Computing ACF"):
+        # Fix 12: Parallel processing
+        def _compute(token, df, price_col):
             if price_col in df.columns:
                 prices = df[price_col].to_numpy()
-                results[token_name] = self.compute_autocorrelation(prices)
+                return token, self.compute_autocorrelation(prices)
             else:
-                print(f"Warning: {token_name} missing {price_col} column")
-                
+                print(f"Warning: {token} missing {price_col} column")
+                return token, None
+        
+        parallel_results = Parallel(n_jobs=-1)(
+            delayed(_compute)(token, df, price_col) for token, df in token_data.items()
+        )
+        
+        for token, result in parallel_results:
+            if result is not None:
+                results[token] = result
+                    
         return results
     
     def extract_time_series_features(self, series: np.ndarray, acf_result: Dict) -> np.ndarray:
@@ -343,57 +508,77 @@ class AutocorrelationClusteringAnalyzer:
         
         features = []
         
-        # Basic statistics (5 features)
+        # Basic statistics (5 features) with robust calculations
         features.extend([
-            np.mean(series_clean),
-            np.std(series_clean),
-            np.median(series_clean),
-            np.percentile(series_clean, 25),
-            np.percentile(series_clean, 75)
+            robust_feature_calculation(series_clean, np.mean),
+            robust_feature_calculation(series_clean, np.std),
+            robust_feature_calculation(series_clean, np.median),
+            robust_feature_calculation(series_clean, lambda x: np.percentile(x, 25)),
+            robust_feature_calculation(series_clean, lambda x: np.percentile(x, 75))
         ])
         
-        # Returns statistics (4 features)
-        returns = np.diff(series_clean) / series_clean[:-1]
-        returns_clean = returns[~np.isnan(returns)]
-        
-        if len(returns_clean) > 0:
-            features.extend([
-                np.mean(returns_clean),
-                np.std(returns_clean),
-                np.min(returns_clean),
-                np.max(returns_clean)
-            ])
+        # Returns statistics (4 features) with robust calculations
+        if len(series_clean) > 1:
+            returns = safe_divide(np.diff(series_clean), series_clean[:-1])
+            returns_clean = returns[np.isfinite(returns)]
+            
+            if len(returns_clean) > 0:
+                features.extend([
+                    robust_feature_calculation(returns_clean, np.mean),
+                    robust_feature_calculation(returns_clean, np.std),
+                    robust_feature_calculation(returns_clean, np.min),
+                    robust_feature_calculation(returns_clean, np.max)
+                ])
+            else:
+                features.extend([0, 0, 0, 0])
         else:
             features.extend([0, 0, 0, 0])
         
-        # ACF features (6 features)
+        # ACF features (6 features) with robust extraction
         if 'acf' in acf_result and len(acf_result['acf']) > 10:
-            # ACF at lags 1, 5, 10
+            # ACF at lags 1, 5, 10 with bounds checking and NaN handling
+            acf_values = acf_result['acf']
             features.extend([
-                acf_result['acf'][1],
-                acf_result['acf'][5],
-                acf_result['acf'][10]
+                robust_feature_calculation(np.array([acf_values[1]]), lambda x: x[0]) if len(acf_values) > 1 else 0,
+                robust_feature_calculation(np.array([acf_values[5]]), lambda x: x[0]) if len(acf_values) > 5 else 0,
+                robust_feature_calculation(np.array([acf_values[10]]), lambda x: x[0]) if len(acf_values) > 10 else 0
             ])
-            # Number of significant lags
-            features.append(len(acf_result['significant_lags']))
-            # Decay rate
-            features.append(acf_result['decay_rate'] if not np.isnan(acf_result['decay_rate']) else 0)
-            # First zero crossing
-            features.append(acf_result['first_zero_crossing'])
+            # Number of significant lags (clipped to reasonable range)
+            n_sig_lags = len(acf_result['significant_lags'])
+            features.append(min(n_sig_lags, 100))  # Cap at 100 for stability
+            # Decay rate (with NaN handling)
+            decay_rate = acf_result['decay_rate'] if not np.isnan(acf_result['decay_rate']) else 0
+            features.append(np.clip(decay_rate, -10, 10))  # Reasonable bounds
+            # First zero crossing (with bounds)
+            zero_cross = acf_result['first_zero_crossing']
+            features.append(min(zero_cross, 1000))  # Cap at 1000 for stability
         else:
             features.extend([0, 0, 0, 0, 0, 0])
         
-        # Trend measure (1 feature)
+        # Trend measure (1 feature) with robust calculation
         if len(series_clean) > 1:
             x = np.arange(len(series_clean))
-            slope = np.polyfit(x, series_clean, 1)[0]
-            features.append(slope)
+            try:
+                slope = np.polyfit(x, series_clean, 1)[0]
+                slope = np.clip(slope, -1e6, 1e6)  # Reasonable bounds
+                features.append(slope if np.isfinite(slope) else 0)
+            except Exception:
+                features.append(0)
         else:
             features.append(0)
         
-        # Convert to numpy array and handle any remaining NaN/inf values
+        # Convert to numpy array and apply robust processing
         features = np.array(features, dtype=float)
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Apply winsorization to handle extreme outliers
+        if len(features) > 0:
+            features = winsorize_array(features, limits=[0.05, 0.05])  # 5% winsorization
+        
+        # Handle any remaining NaN/inf values
+        features = np.nan_to_num(features, nan=0.0, posinf=1e10, neginf=-1e10)
+        
+        # Final clipping to reasonable bounds
+        features = np.clip(features, -1e10, 1e10)
         
         # Ensure exactly 16 features (5 + 4 + 6 + 1 = 16)
         if len(features) != 16:
@@ -432,12 +617,11 @@ class AutocorrelationClusteringAnalyzer:
                     print(f"Warning: Skipping {token_name} due to NaN features")
                     
         feature_matrix = np.array(feature_matrix)
-        
+        from sklearn.impute import KNNImputer
         # Final check for any remaining NaN values
         if np.any(np.isnan(feature_matrix)):
-            print("Warning: NaN values detected in feature matrix, applying imputation...")
-            from sklearn.impute import SimpleImputer
-            imputer = SimpleImputer(strategy='median')
+            print("Applying KNN imputation...")
+            imputer = KNNImputer(n_neighbors=5)
             feature_matrix = imputer.fit_transform(feature_matrix)
                 
         return feature_matrix, token_names
@@ -469,13 +653,28 @@ class AutocorrelationClusteringAnalyzer:
         print(f"Feature variance: {np.var(feature_matrix, axis=0)}")
         print(f"Features with zero variance: {np.sum(np.var(feature_matrix, axis=0) == 0)}")
         
-        # Standardize features
-        scaler = StandardScaler()
+        # Use RobustScaler for better outlier handling
+        scaler = RobustScaler()
         features_scaled = scaler.fit_transform(feature_matrix)
+        
+        # Apply final safety check
+        if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
+            print("Warning: Issues detected after scaling, applying final cleanup...")
+            features_scaled = np.nan_to_num(features_scaled, nan=0.0, posinf=3.0, neginf=-3.0)
+            features_scaled = np.clip(features_scaled, -5.0, 5.0)
         
         # Check for any remaining issues after scaling
         print(f"Scaled features - any NaN: {np.any(np.isnan(features_scaled))}")
         print(f"Scaled features - any Inf: {np.any(np.isinf(features_scaled))}")
+        
+        # Fix NaN/Inf values before K-means clustering
+        if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
+            print("Warning: NaN/Inf values detected in scaled features, applying KNN imputation...")
+            from sklearn.impute import KNNImputer
+            imputer = KNNImputer(n_neighbors=5)
+            features_scaled = imputer.fit_transform(features_scaled)
+            print(f"After imputation - any NaN: {np.any(np.isnan(features_scaled))}")
+            print(f"After imputation - any Inf: {np.any(np.isinf(features_scaled))}")
         
         # Test different numbers of clusters
         k_range = range(2, min(max_clusters + 1, len(features_scaled)))
@@ -509,10 +708,12 @@ class AutocorrelationClusteringAnalyzer:
             # Method 1: Use the "kneedle" algorithm approach
             # Normalize the data to [0,1] range
             k_norm = np.array(list(k_range)) - min(k_range)
-            k_norm = k_norm / max(k_norm) if max(k_norm) > 0 else k_norm
+            if len(k_norm) > 0 and max(k_norm) > 0:
+                k_norm = k_norm / max(k_norm)
             
             inertias_norm = np.array(inertias) - min(inertias)
-            inertias_norm = inertias_norm / max(inertias_norm) if max(inertias_norm) > 0 else inertias_norm
+            if len(inertias_norm) > 0 and max(inertias_norm) > 0:
+                inertias_norm = inertias_norm / max(inertias_norm)
             
             # Calculate distance from each point to line connecting first and last points
             distances = []
@@ -559,7 +760,10 @@ class AutocorrelationClusteringAnalyzer:
         print(f"K range tested: {list(k_range)}")
         print(f"Inertias: {[f'{x:.2f}' for x in inertias]}")
         print(f"Silhouette scores: {[f'{x:.3f}' for x in silhouette_scores]}")
-        print(f"Best silhouette score: {max(silhouette_scores):.3f} at K={optimal_k_silhouette}")
+        if silhouette_scores:
+            print(f"Best silhouette score: {max(silhouette_scores):.3f} at K={optimal_k_silhouette}")
+        else:
+            print("No valid silhouette scores computed")
         print(f"Selected elbow K: {optimal_k_elbow}")
         
         return {
@@ -617,9 +821,15 @@ class AutocorrelationClusteringAnalyzer:
             n_clusters = max(2, n_samples // 2)
             print(f"Adjusting n_clusters to {n_clusters} for small dataset")
             
-        # Standardize features
-        scaler = StandardScaler()
+        # Use RobustScaler for better outlier handling
+        scaler = RobustScaler()
         features_scaled = scaler.fit_transform(feature_matrix)
+        
+        # Apply final safety check
+        if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
+            print("Warning: Issues detected after scaling, applying final cleanup...")
+            features_scaled = np.nan_to_num(features_scaled, nan=0.0, posinf=3.0, neginf=-3.0)
+            features_scaled = np.clip(features_scaled, -5.0, 5.0)
         
         # Debug: Check feature distribution
         print(f"Feature matrix shape: {features_scaled.shape}")
@@ -669,9 +879,15 @@ class AutocorrelationClusteringAnalyzer:
         Returns:
             t-SNE embedded coordinates
         """
-        # Standardize features
-        scaler = StandardScaler()
+        # Use RobustScaler for better outlier handling
+        scaler = RobustScaler()
         features_scaled = scaler.fit_transform(feature_matrix)
+        
+        # Apply final safety check
+        if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
+            print("Warning: Issues detected after scaling, applying final cleanup...")
+            features_scaled = np.nan_to_num(features_scaled, nan=0.0, posinf=3.0, neginf=-3.0)
+            features_scaled = np.clip(features_scaled, -5.0, 5.0)
         
         # Apply PCA first if high dimensional or if we have more features than samples
         n_samples, n_features = features_scaled.shape
@@ -1103,7 +1319,10 @@ class AutocorrelationClusteringAnalyzer:
                 # Use returns (more stationary)
                 # We already calculated target_length to account for this
                 if len(prices) >= target_length + 1:
-                    returns = np.diff(prices[-(target_length+1):])  # Get target_length returns
+                    price_slice = prices[-(target_length+1):]
+                    clipped_slice = np.maximum(price_slice, 1e-10)  # Clip tiny/zero to avoid div0/inf
+                    returns = np.diff(clipped_slice) / clipped_slice[:-1]
+                    returns = np.nan_to_num(returns, nan=0.0, posinf=1e10, neginf=-1e10)  # Handle any remaining inf as large finite
                     if len(returns) == target_length:
                         feature_matrix.append(returns)
                         final_tokens.append(valid_tokens[i])
@@ -1121,11 +1340,9 @@ class AutocorrelationClusteringAnalyzer:
                     # Add small epsilon to avoid log(0)
                     epsilon = 1e-10
                     price_slice_safe = np.maximum(price_slice, epsilon)
-                    
                     # Calculate log returns
                     try:
                         log_returns = np.diff(np.log(price_slice_safe))
-                        
                         if len(log_returns) == target_length:
                             # Remove any inf/nan values
                             if not np.any(np.isnan(log_returns)) and not np.any(np.isinf(log_returns)):
@@ -1210,7 +1427,7 @@ class AutocorrelationClusteringAnalyzer:
         if len(feature_matrix) > 0:
             if np.any(np.isnan(feature_matrix)) or np.any(np.isinf(feature_matrix)):
                 print("Warning: Found NaN/inf values in feature matrix, cleaning...")
-                feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+                feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=1e10, neginf=-1e10)
         
         print(f"Price-only feature matrix shape: {feature_matrix.shape}")
         print(f"Method: {method}, Valid tokens: {len(final_tokens)}")
@@ -1328,7 +1545,8 @@ class AutocorrelationClusteringAnalyzer:
     def analyze_by_lifespan_category(self, data_dir: Path, 
                                    method: str = 'returns',
                                    use_log_price: bool = True,
-                                   max_tokens_per_category: Optional[int] = None) -> Dict:
+                                   max_tokens_per_category: Optional[int] = None,
+                                   sample_ratio: Optional[float] = None) -> Dict:
         """
         Analyze tokens by lifespan categories: Sprint, Standard, Marathon
         Uses processed data folders and applies death detection for accurate lifespan calculation.
@@ -1338,12 +1556,13 @@ class AutocorrelationClusteringAnalyzer:
             method: Price transformation method
             use_log_price: Whether to use log prices
             max_tokens_per_category: Maximum tokens per category
+            sample_ratio: Optional sampling ratio (0.1 = 10% sample) for faster processing
             
         Returns:
             Dictionary with results for each lifespan category
         """
         # Load from processed categories
-        all_token_data = self.load_processed_categories(data_dir, max_tokens_per_category)
+        all_token_data = self.load_processed_categories(data_dir, max_tokens_per_category, sample_ratio)
         
         # Categorize tokens by active lifespan (death-aware)
         categories = {
@@ -1595,7 +1814,9 @@ class AutocorrelationClusteringAnalyzer:
                 try:
                     # Use DTW distance with window constraint for efficiency
                     window_size = max(10, int(0.1 * max(len(price_series[i]), len(price_series[j]))))
-                    dist = dtw.distance(price_series[i], price_series[j], window=window_size)
+                    series_i = (price_series[i] - np.mean(price_series[i])) / np.std(price_series[i]) if np.std(price_series[i]) > 0 else price_series[i]
+                    series_j = (price_series[j] - np.mean(price_series[j])) / np.std(price_series[j]) if np.std(price_series[j]) > 0 else price_series[j]
+                    dist = dtw.distance(series_i, series_j, window=window_size)
                     
                     # Handle invalid distance values
                     if np.isnan(dist) or np.isinf(dist) or dist < 0:

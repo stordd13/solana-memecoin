@@ -12,6 +12,7 @@ sys.path.insert(0, str(project_root))
 import streamlit as st
 import polars as pl
 import numpy as np
+from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -27,7 +28,7 @@ from time_series.autocorrelation_clustering import AutocorrelationClusteringAnal
 from time_series.behavioral_archetype_analysis import BehavioralArchetypeAnalyzer
 
 
-def run_baseline_clustering_analysis(processed_data_path, token_limits, k_range, n_stability_runs, export_results):
+def run_baseline_clustering_analysis(processed_data_path, token_limits, k_range, n_stability_runs, export_results, sample_ratio=None):
     """
     Run baseline clustering analysis with CEO requirements (14 features, elbow method, stability testing).
     """
@@ -39,17 +40,44 @@ def run_baseline_clustering_analysis(processed_data_path, token_limits, k_range,
     # Initialize analyzer
     analyzer = BehavioralArchetypeAnalyzer()
     
-    # Load tokens from processed categories
+    # Load tokens from processed categories (WITHOUT sampling here)
     st.info("Loading categorized token data...")
-    token_data = analyzer.load_categorized_tokens(processed_data_path, limit=None)
+    token_data = analyzer.load_categorized_tokens(processed_data_path, limit=None, sample_ratio=None)  # No sampling yet
     
     if not token_data:
         st.error("No token data found!")
         return {}
     
-    # Categorize by lifespan
+    # Categorize by lifespan FIRST
     st.info("Categorizing tokens by lifespan...")
     categorized_tokens = categorize_by_lifespan(token_data, token_limits)
+    
+    # THEN apply sampling to maintain category proportions
+    if sample_ratio is not None and 0 < sample_ratio < 1:
+        st.info(f"Applying stratified sampling ({sample_ratio*100:.1f}%)...")
+        sampled_categorized_tokens = {}
+        
+        for category_name, category_tokens in categorized_tokens.items():
+            if len(category_tokens) == 0:
+                sampled_categorized_tokens[category_name] = {}
+                continue
+                
+            # Calculate sample size for this category
+            category_sample_size = max(1, int(len(category_tokens) * sample_ratio))
+            category_sample_size = min(category_sample_size, len(category_tokens))
+            
+            # Random sample within category
+            import random
+            token_names = list(category_tokens.keys())
+            sampled_names = random.sample(token_names, category_sample_size)
+            
+            sampled_categorized_tokens[category_name] = {
+                name: category_tokens[name] for name in sampled_names
+            }
+            
+            st.info(f"  {category_name}: {len(sampled_names)} tokens (from {len(category_tokens)})")
+        
+        categorized_tokens = sampled_categorized_tokens
     
     # Extract 14 features for each category
     st.info("Extracting 14 essential features...")
@@ -125,7 +153,7 @@ def run_baseline_clustering_analysis(processed_data_path, token_limits, k_range,
     # Export results if requested
     if export_results:
         st.info("Exporting results...")
-        export_baseline_results(results, processed_data_path.parent / "time_series" / "results")
+        export_baseline_results(results, project_root / "time_series" / "results")
     
     return results
 
@@ -141,10 +169,23 @@ def export_baseline_results(results, output_dir):
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # Helper function to convert numpy arrays to lists for JSON serialization
+    def numpy_to_json(obj):
+        """Convert numpy arrays to lists recursively"""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: numpy_to_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [numpy_to_json(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        return obj
+    
     # Export summary
     summary_file = output_dir / f"baseline_clustering_summary_{timestamp}.json"
     with open(summary_file, 'w') as f:
-        json.dump({
+        json.dump(numpy_to_json({
             'analysis_type': results['analysis_type'],
             'total_tokens_analyzed': results['total_tokens_analyzed'],
             'stability_summary': results['stability_summary'],
@@ -153,7 +194,7 @@ def export_baseline_results(results, output_dir):
                 'optimal_k': cat['optimal_k'],
                 'stability_results': cat['stability_results']
             } for name, cat in results['categories'].items()}
-        }, f, indent=2)
+        }), f, indent=2)
     
     # Export detailed results per category
     for category_name, category_results in results['categories'].items():
@@ -162,11 +203,18 @@ def export_baseline_results(results, output_dir):
         clustering_results = category_results['clustering_results']
         
         # Add cluster assignments to features
-        features_with_clusters = features_df.copy()
-        features_with_clusters['cluster'] = clustering_results['labels']
+        # Use Polars-compatible method instead of .copy()
+        features_with_clusters = features_df.with_columns([
+            pl.Series('cluster', clustering_results['labels'])
+        ])
         
-        # Save to CSV
-        features_with_clusters.to_csv(category_file, index=False)
+        # Convert to pandas for CSV export if needed
+        if hasattr(features_with_clusters, 'to_pandas'):
+            # Polars DataFrame - convert to pandas for CSV export
+            features_with_clusters.to_pandas().to_csv(category_file, index=False)
+        else:
+            # Pandas DataFrame - use direct method
+            features_with_clusters.to_csv(category_file, index=False)
     
     st.success(f"Results exported to: {output_dir}")
 
@@ -343,6 +391,15 @@ def main():
                 st.error("Invalid input. Please enter a number or 'none'")
                 max_tokens_per_category = 1000
             
+            # Sampling option for faster processing
+            enable_sampling = st.checkbox(
+                "🔬 Enable sampling (10%) for faster processing", 
+                value=False,
+                help="Sample 10% of tokens for faster debugging/testing (reduces processing time by ~90%)"
+            )
+            
+            sample_ratio = 0.1 if enable_sampling else None
+            
             enable_dtw_clustering = st.checkbox(
                 "Enable DTW clustering",
                 value=False,
@@ -518,7 +575,8 @@ def main():
                         processed_data_path,
                         method=multi_method,
                         use_log_price=use_log_price,
-                        max_tokens_per_category=max_tokens_per_category
+                        max_tokens_per_category=max_tokens_per_category,
+                        sample_ratio=sample_ratio
                     )
                     
                     # If DTW clustering is enabled, run it on each category
@@ -558,7 +616,8 @@ def main():
                             },
                             k_range=(k_range_min, k_range_max),
                             n_stability_runs=n_stability_runs,
-                            export_results=export_results
+                            export_results=export_results,
+                            sample_ratio=sample_ratio
                         )
                         
                         # Merge baseline results into main results
@@ -576,8 +635,16 @@ def main():
                         max_tokens=max_tokens
                     )
                 
-                # Store results in session state
+                # Store results in session state with caching metadata
                 st.session_state['results'] = results
+                st.session_state['analysis_metadata'] = {
+                    'analysis_type': analysis_type,
+                    'sample_ratio': sample_ratio if analysis_type == "Multi-Resolution ACF + Baseline Clustering" else None,
+                    'baseline_clustering_enabled': enable_baseline_clustering if analysis_type == "Multi-Resolution ACF + Baseline Clustering" else False,
+                    'processed_data_path': str(processed_data_path) if analysis_type == "Multi-Resolution ACF + Baseline Clustering" else None,
+                    'total_tokens_analyzed': results.get('total_tokens_analyzed', 0),
+                    'timestamp': datetime.now().isoformat()
+                }
                 
                 # Success message depends on analysis type
                 if analysis_type == "Multi-Resolution ACF + Baseline Clustering":
@@ -1733,12 +1800,15 @@ def display_multi_resolution_overview(results: Dict):
         summary_df = pd.DataFrame(summary_data)
         st.dataframe(summary_df, use_container_width=True)
         
-        # Category distribution chart
-        fig = px.bar(summary_df, x='Category', y='Tokens', 
-                    title="Token Distribution by Lifespan Category",
-                    color='Category')
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        # Category distribution chart (only if we have data)
+        if not summary_df.empty and len(summary_df) > 0:
+            fig = px.bar(summary_df, x='Category', y='Tokens', 
+                        title="Token Distribution by Lifespan Category",
+                        color='Category')
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("No data available for category distribution chart.")
     
     # Key insights
     st.subheader("🎯 Key Insights")
@@ -2128,6 +2198,39 @@ def display_combined_tsne(results: Dict):
         st.warning("No t-SNE data available for visualization")
 
 
+def extract_tokens_from_baseline_results(baseline_results: Dict) -> Dict[str, pl.DataFrame]:
+    """
+    Extract token data from cached baseline clustering results to avoid reloading.
+    
+    Args:
+        baseline_results: Results from baseline clustering analysis
+        
+    Returns:
+        Dictionary mapping token names to DataFrames
+    """
+    token_data = {}
+    
+    # Extract tokens from each category in baseline results
+    categories = baseline_results.get('categories', {})
+    
+    for category_name, category_data in categories.items():
+        if 'token_data' in category_data:
+            category_tokens = category_data['token_data']
+            
+            # Add tokens from this category
+            for token_name, token_df in category_tokens.items():
+                # Ensure the token has the required columns
+                if 'datetime' in token_df.columns and 'price' in token_df.columns:
+                    # Add category information if not present
+                    if 'category' not in token_df.columns:
+                        token_df = token_df.with_columns([
+                            pl.lit(category_name).alias('category')
+                        ])
+                    token_data[token_name] = token_df
+    
+    return token_data
+
+
 def display_behavioral_archetypes(results: Dict):
     """Display behavioral archetype analysis interface"""
     st.header("🎭 Behavioral Archetype Analysis")
@@ -2141,6 +2244,21 @@ def display_behavioral_archetypes(results: Dict):
     - Early detection rules using only first 5 minutes of data
     - Survival analysis and return profiles
     """)
+    
+    # Check if we can use cached multi-resolution results
+    can_use_cached = False
+    cached_metadata = st.session_state.get('analysis_metadata', {})
+    
+    if cached_metadata.get('analysis_type') == "Multi-Resolution ACF + Baseline Clustering":
+        can_use_cached = True
+        st.info("✅ Using cached multi-resolution analysis results for faster processing!")
+        
+        with st.expander("📊 Cached Analysis Details", expanded=False):
+            st.write(f"**Analysis Type**: {cached_metadata.get('analysis_type')}")
+            st.write(f"**Tokens Analyzed**: {cached_metadata.get('total_tokens_analyzed', 'Unknown')}")
+            st.write(f"**Sample Ratio**: {cached_metadata.get('sample_ratio', 'None (full dataset)')}")
+            st.write(f"**Baseline Clustering**: {'Yes' if cached_metadata.get('baseline_clustering_enabled') else 'No'}")
+            st.write(f"**Analysis Timestamp**: {cached_metadata.get('timestamp', 'Unknown')}")
     
     # Initialize behavioral analyzer
     if 'behavioral_analyzer' not in st.session_state:
@@ -2195,6 +2313,15 @@ def display_behavioral_archetypes(results: Dict):
             default=[6, 7, 8],
             help="Range of cluster numbers to test"
         )
+        
+        # Sampling option for faster processing
+        enable_sampling = st.checkbox(
+            "🔬 Enable sampling for faster processing", 
+            value=False,
+            help="Sample 10% of tokens for faster debugging/testing"
+        )
+        
+        sample_ratio = 0.1 if enable_sampling else None
     
     with col3:
         # Output options
@@ -2205,8 +2332,28 @@ def display_behavioral_archetypes(results: Dict):
             st.write(f"**Output directory**: `{output_dir}`")
             output_dir.mkdir(exist_ok=True)
     
+    # Add option to use cached results if available
+    use_cached_data = False
+    if can_use_cached:
+        col_cached1, col_cached2 = st.columns(2)
+        
+        with col_cached1:
+            use_cached_data = st.checkbox(
+                "🔄 Use cached multi-resolution tokens", 
+                value=True,
+                help="Use the same tokens from the multi-resolution analysis for consistency"
+            )
+        
+        with col_cached2:
+            if use_cached_data:
+                st.info("Will use tokens from cached analysis with same sampling ratio")
+            else:
+                st.warning("Will load fresh tokens (may have different sampling)")
+
     # Run analysis button
-    if st.button("🚀 Run Behavioral Archetype Analysis", type="primary"):
+    run_fresh = st.button("🚀 Run Behavioral Archetype Analysis", type="primary")
+    
+    if run_fresh or (can_use_cached and use_cached_data):
         if not processed_dir.exists():
             st.error("Processed data directory not found")
             return
@@ -2220,13 +2367,28 @@ def display_behavioral_archetypes(results: Dict):
         status_text = st.empty()
         
         try:
-            # Step 1: Load data
-            status_text.text("Loading categorized token data...")
-            progress_bar.progress(10)
-            
-            token_data = behavioral_analyzer.load_categorized_tokens(
-                processed_dir, limit=token_limit
-            )
+            # Step 1: Load data (use cached tokens if available)
+            if use_cached_data and 'baseline_clustering' in results:
+                status_text.text("Extracting tokens from cached baseline clustering results...")
+                progress_bar.progress(10)
+                
+                # Extract tokens from cached baseline clustering
+                token_data = extract_tokens_from_baseline_results(results['baseline_clustering'])
+                st.info(f"✅ Loaded {len(token_data)} tokens from cached baseline clustering results")
+                
+                # Override sampling parameters to match cached analysis
+                cached_sample_ratio = cached_metadata.get('sample_ratio')
+                if cached_sample_ratio:
+                    sample_ratio = cached_sample_ratio
+                    st.info(f"Using cached sampling ratio: {sample_ratio}")
+                
+            else:
+                status_text.text("Loading categorized token data...")
+                progress_bar.progress(10)
+                
+                token_data = behavioral_analyzer.load_categorized_tokens(
+                    processed_dir, limit=token_limit, sample_ratio=sample_ratio
+                )
             
             if not token_data:
                 st.error("No token data found")
@@ -2966,8 +3128,7 @@ def display_baseline_export_results(results: Dict):
     st.subheader("🔄 Re-export Options")
     
     if st.button("📥 Export Results Again"):
-        from pathlib import Path
-        output_dir = Path("time_series/results")
+        output_dir = project_root / "time_series" / "results"
         export_baseline_results(results, output_dir)
         st.success("Results exported successfully!")
     
