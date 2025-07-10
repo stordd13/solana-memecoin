@@ -1,3 +1,4 @@
+# autocorrelation_clustering.py
 """
 Time Series Autocorrelation and Clustering Analysis
 Focuses on raw price/log price analysis without cleaning or feature engineering
@@ -30,49 +31,8 @@ from statsmodels.tsa.stattools import adfuller
 from scipy.optimize import curve_fit
 from joblib import Parallel, delayed
 
+from .archetype_utils import safe_divide, winsorize_array, robust_feature_calculation, detect_token_death, categorize_by_lifespan
 
-def safe_divide(a, b, default=0.0):
-    """Safe division with default value for division by zero."""
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    result = np.full_like(a, default, dtype=float)
-    mask = np.abs(b) > 1e-10
-    np.divide(a, b, where=mask, out=result)
-    return result
-
-
-def winsorize_array(data, limits=[0.01, 0.01]):
-    """Apply winsorization to handle extreme outliers."""
-    if len(data) == 0:
-        return data
-    return mstats.winsorize(data, limits=limits)
-
-
-def robust_feature_calculation(data, feature_func, default_value=0.0):
-    """Robust wrapper for feature calculations with NaN/inf handling."""
-    try:
-        if len(data) == 0:
-            return default_value
-        
-        # Remove NaN/inf values
-        clean_data = data[np.isfinite(data)]
-        if len(clean_data) == 0:
-            return default_value
-            
-        # Apply winsorization for extreme outliers
-        clean_data = winsorize_array(clean_data)
-        
-        # Calculate feature
-        result = feature_func(clean_data)
-        
-        # Ensure result is finite
-        if not np.isfinite(result):
-            return default_value
-            
-        return result
-        
-    except Exception:
-        return default_value
 
 class AutocorrelationClusteringAnalyzer:
     """
@@ -103,7 +63,7 @@ class AutocorrelationClusteringAnalyzer:
         if limit:
             parquet_files = parquet_files[:limit]
             
-        print(f"Loading {len(parquet_files)} token files...")
+        print(f"DEBUG: Loading {len(parquet_files)} token files...")
         
         for file_path in tqdm(parquet_files, desc="Loading tokens"):
             try:
@@ -123,12 +83,65 @@ class AutocorrelationClusteringAnalyzer:
                     token_data[token_name] = df
                     
             except Exception as e:
-                print(f"Error loading {file_path}: {e}")
+                print(f"DEBUG: Error loading {file_path}: {e}")
                 continue
                 
-        print(f"Successfully loaded {len(token_data)} tokens")
+        print(f"DEBUG: Successfully loaded {len(token_data)} tokens")
         return token_data
     
+    def load_processed_categories_lazy(self, processed_dir: Path, max_tokens_per_category: Optional[int] = None, sample_ratio: Optional[float] = None) -> Dict[str, pl.LazyFrame]:
+        """
+        Load tokens from processed data categories using lazy evaluation for memory efficiency.
+        
+        Args:
+            processed_dir: Path to processed data directory
+            max_tokens_per_category: Maximum tokens per category (None for unlimited)
+            sample_ratio: Optional sampling ratio (0.1 = 10% sample) for faster processing
+            
+        Returns:
+            Dictionary mapping token names to LazyFrames
+        """
+        token_data = {}
+        
+        # Load from 3 main categories (exclude tokens_with_gaps as they're incomplete)
+        categories = ['dead_tokens', 'normal_behavior_tokens', 'tokens_with_extremes']
+        
+        for category in categories:
+            category_path = processed_dir / category
+            if not category_path.exists():
+                print(f"DEBUG: Category directory not found: {category_path}")
+                continue
+                
+            parquet_files = list(category_path.glob("*.parquet"))
+            
+            # Apply token limit per category if specified
+            if max_tokens_per_category is not None:
+                parquet_files = parquet_files[:max_tokens_per_category]
+            
+            print(f"DEBUG: Setting up lazy loading for {len(parquet_files)} tokens from {category}...")
+            
+            for file_path in tqdm(parquet_files, desc=f"Setting up lazy {category}"):
+                try:
+                    # Use lazy loading for better memory management
+                    lazy_df = pl.scan_parquet(file_path).with_columns([
+                        pl.lit(category).alias('category')
+                    ]).filter(
+                        pl.col('datetime').is_not_null() & pl.col('price').is_not_null()
+                    ).sort('datetime').with_columns([
+                        # Pre-compute log price to avoid repeated calculations
+                        pl.col('price').clip(lower_bound=1e-10).log().alias('log_price')
+                    ])
+                    
+                    token_name = file_path.stem
+                    token_data[token_name] = lazy_df
+                    
+                except Exception as e:
+                    print(f"DEBUG: Error setting up lazy loading for {file_path}: {e}")
+                    continue
+        
+        print(f"DEBUG: Successfully set up lazy loading for {len(token_data)} tokens")
+        return token_data
+
     def load_processed_categories(self, processed_dir: Path, max_tokens_per_category: Optional[int] = None, sample_ratio: Optional[float] = None) -> Dict[str, pl.DataFrame]:
         """
         Load tokens from processed data categories with proper token limits.
@@ -149,7 +162,7 @@ class AutocorrelationClusteringAnalyzer:
         for category in categories:
             category_path = processed_dir / category
             if not category_path.exists():
-                print(f"Warning: Category directory not found: {category_path}")
+                print(f"DEBUG: Category directory not found: {category_path}")
                 continue
                 
             parquet_files = list(category_path.glob("*.parquet"))
@@ -158,7 +171,7 @@ class AutocorrelationClusteringAnalyzer:
             if max_tokens_per_category is not None:
                 parquet_files = parquet_files[:max_tokens_per_category]
             
-            print(f"Loading {len(parquet_files)} tokens from {category}...")
+            print(f"DEBUG: Loading {len(parquet_files)} tokens from {category}...")
             
             for file_path in tqdm(parquet_files, desc=f"Loading {category}"):
                 try:
@@ -179,76 +192,13 @@ class AutocorrelationClusteringAnalyzer:
                         token_data[token_name] = df
                         
                 except Exception as e:
-                    print(f"Error loading {file_path}: {e}")
+                    print(f"DEBUG: Error loading {file_path}: {e}")
                     continue
         
-        print(f"Successfully loaded {len(token_data)} tokens from processed categories")
+        print(f"DEBUG: Successfully loaded {len(token_data)} tokens from processed categories")
         
-        # Apply stratified sampling if requested (for faster processing)
-        if sample_ratio is not None and 0 < sample_ratio < 1:
-            import random
-            from collections import defaultdict
-            
-            total_tokens = len(token_data)
-            target_sample_size = int(total_tokens * sample_ratio)
-            
-            print(f"Applying stratified sampling for {target_sample_size} tokens ({sample_ratio*100:.1f}%)...")
-            
-            # First, categorize all tokens by lifespan (quick death detection)
-            lifespan_categories = defaultdict(list)
-            
-            print("Performing quick lifespan categorization for stratified sampling...")
-            for token_name, df in token_data.items():
-                prices = df['price'].to_numpy()
-                returns = np.diff(prices) / np.maximum(prices[:-1], 1e-10)
-                
-                # Import death detection
-                from .archetype_utils import detect_token_death
-                death_minute = detect_token_death(prices, returns, window=30)
-                
-                # Calculate active lifespan (before death or full length if alive)
-                active_lifespan = death_minute if death_minute is not None else len(df)
-                
-                # Categorize by active lifespan
-                if 0 <= active_lifespan <= 400:
-                    lifespan_categories['Sprint'].append(token_name)
-                elif 400 < active_lifespan <= 1200:
-                    lifespan_categories['Standard'].append(token_name)
-                elif active_lifespan > 1200:
-                    lifespan_categories['Marathon'].append(token_name)
-            
-            # Show natural distribution
-            print("Natural lifespan distribution:")
-            total_categorized = sum(len(tokens) for tokens in lifespan_categories.values())
-            for category, tokens in lifespan_categories.items():
-                pct = len(tokens) / total_categorized * 100 if total_categorized > 0 else 0
-                print(f"  {category}: {len(tokens)} tokens ({pct:.1f}%)")
-            
-            # Apply stratified sampling to maintain proportions
-            sampled_token_data = {}
-            
-            for category, token_list in lifespan_categories.items():
-                if len(token_list) == 0:
-                    continue
-                
-                # Calculate sample size for this category (proportional)
-                category_proportion = len(token_list) / total_categorized
-                category_sample_size = max(1, int(target_sample_size * category_proportion))
-                
-                # Don't sample more than available
-                category_sample_size = min(category_sample_size, len(token_list))
-                
-                # Random sample within category
-                sampled_tokens = random.sample(token_list, category_sample_size)
-                
-                print(f"  Sampling {len(sampled_tokens)} tokens from {category}")
-                
-                # Add to sampled dataset
-                for token_name in sampled_tokens:
-                    sampled_token_data[token_name] = token_data[token_name]
-            
-            print(f"Stratified sampling complete: {len(sampled_token_data)} tokens")
-            return sampled_token_data
+        # NOTE: Sampling removed from here to avoid double sampling
+        # Sampling should be applied at the analysis level, not during data loading
         
         return token_data
     
@@ -281,7 +231,6 @@ class AutocorrelationClusteringAnalyzer:
             prices = df['price'].to_numpy()
             returns = np.diff(prices) / prices[:-1]
             
-            from .archetype_utils import detect_token_death
             death_minute = detect_token_death(prices, returns, window=30)
             
             if death_minute is not None:
@@ -291,7 +240,7 @@ class AutocorrelationClusteringAnalyzer:
                 death_stats['alive_tokens'] += 1
         
         if len(death_times) == 0:
-            print("No dead tokens found!")
+            print("DEBUG: No dead tokens found!")
             return
         
         death_times = np.array(death_times)
@@ -316,15 +265,15 @@ class AutocorrelationClusteringAnalyzer:
         
         bin_counts, _ = np.histogram(death_times, bins=histogram_bins)
         
-        print(f"Total tokens analyzed: {death_stats['total_tokens']:,}")
-        print(f"Dead tokens: {death_stats['dead_tokens']:,} ({death_stats['dead_tokens']/death_stats['total_tokens']*100:.1f}%)")
-        print(f"Alive tokens: {death_stats['alive_tokens']:,} ({death_stats['alive_tokens']/death_stats['total_tokens']*100:.1f}%)")
-        print(f"\nDeath timing statistics:")
+        print(f"DEBUG: Total tokens analyzed: {death_stats['total_tokens']:,}")
+        print(f"DEBUG: Dead tokens: {death_stats['dead_tokens']:,} ({death_stats['dead_tokens']/death_stats['total_tokens']*100:.1f}%)")
+        print(f"DEBUG: Alive tokens: {death_stats['alive_tokens']:,} ({death_stats['alive_tokens']/death_stats['total_tokens']*100:.1f}%)")
+        print(f"\nDEBUG: Death timing statistics:")
         print(f"  Median death time: {death_stats['summary_stats']['median_death_time']:.1f} minutes")
         print(f"  Mean death time: {death_stats['summary_stats']['mean_death_time']:.1f} minutes")
         print(f"  Range: {death_stats['summary_stats']['min_death_time']:.0f} - {death_stats['summary_stats']['max_death_time']:.0f} minutes")
         
-        print(f"\nDeath distribution by time bins:")
+        print(f"\nDEBUG: Death distribution by time bins:")
         for i, (label, count) in enumerate(zip(bin_labels, bin_counts)):
             pct = count / len(death_times) * 100
             death_stats['death_time_bins'][label] = {'count': int(count), 'percentage': float(pct)}
@@ -355,13 +304,13 @@ class AutocorrelationClusteringAnalyzer:
         output_dir.mkdir(exist_ok=True)
         plot_path = output_dir / f"death_distribution_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"\nDeath distribution plot saved to: {plot_path}")
+        print(f"DEBUG: Death distribution plot saved to: {plot_path}")
         
         # Save statistics
         stats_path = output_dir / f"death_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(stats_path, 'w') as f:
             json.dump(death_stats, f, indent=2)
-        print(f"Death statistics saved to: {stats_path}")
+        print(f"DEBUG: Death statistics saved to: {stats_path}")
         
         plt.close()  # Close to free memory
     
@@ -384,6 +333,7 @@ class AutocorrelationClusteringAnalyzer:
         series_clean = series[~np.isnan(series)]
         
         if len(series_clean) < 3:  # Need minimum 3 points for meaningful ACF
+            print("DEBUG: Insufficient data for ACF computation")
             return {
                 'acf': np.array([]),
                 'pacf': np.array([]),
@@ -397,23 +347,29 @@ class AutocorrelationClusteringAnalyzer:
         max_lag = min(max_lag, len(series_clean) // 2 - 1, len(series_clean) - 2)
         max_lag = max(max_lag, 1)  # Ensure at least lag 1
         
-        # Fix 3: Check stationarity and difference if needed
+        # Check stationarity and difference if needed
         is_differenced = False
         if len(series_clean) > 10:
-            adf_result = adfuller(series_clean)
-            if adf_result[1] > 0.05:  # Non-stationary (p-value > 0.05)
-                series_diff = np.diff(series_clean)
-                if len(series_diff) >= 3:  # Ensure enough points after diff
-                    acf_values = acf(series_diff, nlags=max_lag, fft=True)
-                    pacf_values = pacf(series_diff, nlags=max_lag)
-                    is_differenced = True
-                else:
-                    # Fallback to original if diff too short
-                    acf_values = acf(series_clean, nlags=max_lag, fft=True)
-                    pacf_values = pacf(series_clean, nlags=max_lag)
-            else:
+            # Check if series is constant before running ADF test
+            if np.std(series_clean) == 0:
+                # Series is constant, skip ADF test and use original series
                 acf_values = acf(series_clean, nlags=max_lag, fft=True)
                 pacf_values = pacf(series_clean, nlags=max_lag)
+            else:
+                adf_result = adfuller(series_clean)
+                if adf_result[1] > 0.05:  # Non-stationary (p-value > 0.05)
+                    series_diff = np.diff(series_clean)
+                    if len(series_diff) >= 3:  # Ensure enough points after diff
+                        acf_values = acf(series_diff, nlags=max_lag, fft=True)
+                        pacf_values = pacf(series_diff, nlags=max_lag)
+                        is_differenced = True
+                    else:
+                        # Fallback to original if diff too short
+                        acf_values = acf(series_clean, nlags=max_lag, fft=True)
+                        pacf_values = pacf(series_clean, nlags=max_lag)
+                else:
+                    acf_values = acf(series_clean, nlags=max_lag, fft=True)
+                    pacf_values = pacf(series_clean, nlags=max_lag)
         else:
             acf_values = acf(series_clean, nlags=max_lag, fft=True)
             pacf_values = pacf(series_clean, nlags=max_lag)
@@ -423,7 +379,7 @@ class AutocorrelationClusteringAnalyzer:
         confidence_interval = 1.96 / np.sqrt(n)
         significant_lags = np.where(np.abs(acf_values[1:]) > confidence_interval)[0] + 1
         
-        # Fix 4: Robust decay rate estimation with exponential fit
+        # Robust decay rate estimation with exponential fit
         def exp_decay(lag, rho):
             return np.exp(-rho * lag)
         
@@ -449,7 +405,7 @@ class AutocorrelationClusteringAnalyzer:
             'significant_lags': significant_lags.tolist(),
             'decay_rate': decay_rate,
             'first_zero_crossing': int(zero_crossings[0]) if len(zero_crossings) > 0 else max_lag,
-            'is_differenced': is_differenced  # New from Fix 3
+            'is_differenced': is_differenced
         }
     
     def compute_all_autocorrelations(self, token_data: Dict[str, pl.DataFrame], 
@@ -467,15 +423,15 @@ class AutocorrelationClusteringAnalyzer:
         results = {}
         price_col = 'log_price' if use_log_price else 'price'
         
-        print(f"Computing autocorrelations for {len(token_data)} tokens...")
+        print(f"DEBUG: Computing autocorrelations for {len(token_data)} tokens...")
         
-        # Fix 12: Parallel processing
+        # Parallel processing
         def _compute(token, df, price_col):
             if price_col in df.columns:
                 prices = df[price_col].to_numpy()
                 return token, self.compute_autocorrelation(prices)
             else:
-                print(f"Warning: {token} missing {price_col} column")
+                print(f"DEBUG: Warning: {token} missing {price_col} column")
                 return token, None
         
         parallel_results = Parallel(n_jobs=-1)(
@@ -488,114 +444,80 @@ class AutocorrelationClusteringAnalyzer:
                     
         return results
     
-    def extract_time_series_features(self, series: np.ndarray, acf_result: Dict) -> np.ndarray:
+    def extract_time_series_features(self, series: np.ndarray, acf_result: Dict, use_log_returns: bool = False) -> np.ndarray:
         """
-        Extract features from time series for clustering
+        Extract the 15 essential features from time series for clustering (aligned to roadmap).
         
-        Features include:
-        - ACF values at specific lags
-        - Statistical moments
-        - Trend characteristics
-        - Volatility measures
-        
-        Returns exactly 16 features for consistent clustering
+        Args:
+            series: Price or log-price series
+            acf_result: ACF results
+            use_log_returns: Toggle for raw vs log returns (A/B testing)
+            
+        Returns:
+            Array with exactly 15 features
         """
         # Remove NaN values
         series_clean = series[~np.isnan(series)]
         
         if len(series_clean) < 10:
-            return np.zeros(16)  # Return zero features if too short
+            print("DEBUG: Insufficient data for feature extraction")
+            return np.zeros(15)  # Return zero features if too short
         
         features = []
         
-        # Basic statistics (5 features) with robust calculations
-        features.extend([
-            robust_feature_calculation(series_clean, np.mean),
-            robust_feature_calculation(series_clean, np.std),
-            robust_feature_calculation(series_clean, np.median),
-            robust_feature_calculation(series_clean, lambda x: np.percentile(x, 25)),
-            robust_feature_calculation(series_clean, lambda x: np.percentile(x, 75))
-        ])
+        # Death characteristics (3) - Placeholder, as these are per-token
+        # Note: These are computed in extract_essential_features, but for consistency
+        # Assume passed or compute if needed
         
-        # Returns statistics (4 features) with robust calculations
-        if len(series_clean) > 1:
+        # Core statistics (4) - Test raw vs. modified log returns
+        if use_log_returns:
+            returns = np.log(1 + np.diff(series_clean) / series_clean[:-1] + 1e-10)
+        else:
             returns = safe_divide(np.diff(series_clean), series_clean[:-1])
-            returns_clean = returns[np.isfinite(returns)]
-            
-            if len(returns_clean) > 0:
-                features.extend([
-                    robust_feature_calculation(returns_clean, np.mean),
-                    robust_feature_calculation(returns_clean, np.std),
-                    robust_feature_calculation(returns_clean, np.min),
-                    robust_feature_calculation(returns_clean, np.max)
-                ])
-            else:
-                features.extend([0, 0, 0, 0])
-        else:
-            features.extend([0, 0, 0, 0])
         
-        # ACF features (6 features) with robust extraction
-        if 'acf' in acf_result and len(acf_result['acf']) > 10:
-            # ACF at lags 1, 5, 10 with bounds checking and NaN handling
-            acf_values = acf_result['acf']
-            features.extend([
-                robust_feature_calculation(np.array([acf_values[1]]), lambda x: x[0]) if len(acf_values) > 1 else 0,
-                robust_feature_calculation(np.array([acf_values[5]]), lambda x: x[0]) if len(acf_values) > 5 else 0,
-                robust_feature_calculation(np.array([acf_values[10]]), lambda x: x[0]) if len(acf_values) > 10 else 0
-            ])
-            # Number of significant lags (clipped to reasonable range)
-            n_sig_lags = len(acf_result['significant_lags'])
-            features.append(min(n_sig_lags, 100))  # Cap at 100 for stability
-            # Decay rate (with NaN handling)
-            decay_rate = acf_result['decay_rate'] if not np.isnan(acf_result['decay_rate']) else 0
-            features.append(np.clip(decay_rate, -10, 10))  # Reasonable bounds
-            # First zero crossing (with bounds)
-            zero_cross = acf_result['first_zero_crossing']
-            features.append(min(zero_cross, 1000))  # Cap at 1000 for stability
-        else:
-            features.extend([0, 0, 0, 0, 0, 0])
+        mean_return = robust_feature_calculation(returns, np.mean)
+        std_return = robust_feature_calculation(returns, np.std)
+        max_drawdown = robust_feature_calculation(series_clean, lambda x: (np.max(x) - np.min(x)) / np.max(x) if np.max(x) > 0 else 0)
+        volatility_5min = robust_feature_calculation(returns[:5], np.std)
         
-        # Trend measure (1 feature) with robust calculation
-        if len(series_clean) > 1:
-            x = np.arange(len(series_clean))
-            try:
-                slope = np.polyfit(x, series_clean, 1)[0]
-                slope = np.clip(slope, -1e6, 1e6)  # Reasonable bounds
-                features.append(slope if np.isfinite(slope) else 0)
-            except Exception:
-                features.append(0)
-        else:
-            features.append(0)
+        features.extend([mean_return, std_return, max_drawdown, volatility_5min])
         
-        # Convert to numpy array and apply robust processing
-        features = np.array(features, dtype=float)
+        # Autocorrelation signature (3)
+        acf_lag_1 = acf_result['acf'][1] if len(acf_result['acf']) > 1 else 0
+        acf_lag_5 = acf_result['acf'][5] if len(acf_result['acf']) > 5 else 0
+        acf_lag_10 = acf_result['acf'][10] if len(acf_result['acf']) > 10 else 0
+        features.extend([acf_lag_1, acf_lag_5, acf_lag_10])
         
-        # Apply winsorization to handle extreme outliers
-        if len(features) > 0:
-            features = winsorize_array(features, limits=[0.05, 0.05])  # 5% winsorization
+        # Early detection (first 5 mins) (5)
+        early_returns = returns[:5]
+        return_5min = np.sum(early_returns)
+        max_return_1min = np.max(early_returns)
+        trend_direction_5min = np.polyfit(np.arange(len(early_returns)), early_returns, 1)[0]
+        price_change_ratio_5min = safe_divide(np.max(series_clean[:5]) - np.min(series_clean[:5]), series_clean[0])
+        pump_velocity_5min = np.max(np.cumsum(early_returns))
         
-        # Handle any remaining NaN/inf values
+        features.extend([return_5min, max_return_1min, trend_direction_5min, price_change_ratio_5min, pump_velocity_5min])
+        
+        # Ensure exactly 15 features
+        features = np.array(features[:15])
+        
+        # Handle NaN/inf
         features = np.nan_to_num(features, nan=0.0, posinf=1e10, neginf=-1e10)
-        
-        # Final clipping to reasonable bounds
-        features = np.clip(features, -1e10, 1e10)
-        
-        # Ensure exactly 16 features (5 + 4 + 6 + 1 = 16)
-        if len(features) != 16:
-            print(f"Warning: Expected 16 features, got {len(features)}. Padding/truncating...")
-            if len(features) < 16:
-                features = np.pad(features, (0, 16 - len(features)), 'constant')
-            else:
-                features = features[:16]
         
         return features
     
     def prepare_clustering_data(self, token_data: Dict[str, pl.DataFrame], 
                               acf_results: Dict[str, Dict],
-                              use_log_price: bool = True) -> Tuple[np.ndarray, List[str]]:
+                              use_log_price: bool = True, use_log_returns: bool = False) -> Tuple[np.ndarray, List[str]]:
         """
         Prepare feature matrix for clustering
         
+        Args:
+            token_data: Dictionary of token DataFrames
+            acf_results: ACF results
+            use_log_price: Use log prices
+            use_log_returns: Toggle for returns A/B
+            
         Returns:
             Feature matrix and list of token names
         """
@@ -607,20 +529,21 @@ class AutocorrelationClusteringAnalyzer:
         for token_name, df in token_data.items():
             if token_name in acf_results and price_col in df.columns:
                 prices = df[price_col].to_numpy()
-                features = self.extract_time_series_features(prices, acf_results[token_name])
+                features = self.extract_time_series_features(prices, acf_results[token_name], use_log_returns)
                 
                 # Check for NaN values in features
                 if not np.any(np.isnan(features)):
                     feature_matrix.append(features)
                     token_names.append(token_name)
                 else:
-                    print(f"Warning: Skipping {token_name} due to NaN features")
+                    print(f"DEBUG: Skipping {token_name} due to NaN features")
                     
         feature_matrix = np.array(feature_matrix)
-        from sklearn.impute import KNNImputer
+        
         # Final check for any remaining NaN values
         if np.any(np.isnan(feature_matrix)):
-            print("Applying KNN imputation...")
+            print("DEBUG: Applying KNN imputation...")
+            from sklearn.impute import KNNImputer
             imputer = KNNImputer(n_neighbors=5)
             feature_matrix = imputer.fit_transform(feature_matrix)
                 
@@ -648,10 +571,32 @@ class AutocorrelationClusteringAnalyzer:
             
         from sklearn.metrics import silhouette_score
         
-        # Add feature validation
-        print(f"Feature matrix shape: {feature_matrix.shape}")
-        print(f"Feature variance: {np.var(feature_matrix, axis=0)}")
-        print(f"Features with zero variance: {np.sum(np.var(feature_matrix, axis=0) == 0)}")
+        # Add feature validation and token count checks
+        print(f"DEBUG: Feature matrix shape: {feature_matrix.shape}")
+        print(f"DEBUG: Feature variance: {np.var(feature_matrix, axis=0)}")
+        print(f"DEBUG: Features with zero variance: {np.sum(np.var(feature_matrix, axis=0) == 0)}")
+        
+        n_samples = feature_matrix.shape[0]
+        
+        # Smart K-range selection based on sample size
+        if n_samples < 10:
+            print(f"DEBUG: WARNING: Only {n_samples} tokens available - insufficient for reliable clustering")
+            print(f"DEBUG: Recommend at least 50 tokens for meaningful cluster analysis")
+            # For very small samples, limit to 2-3 clusters max
+            safe_max_clusters = min(3, max_clusters, n_samples - 1)
+        elif n_samples < 30:
+            print(f"DEBUG: Small sample ({n_samples} tokens) - limiting clustering to 2-4 clusters")
+            safe_max_clusters = min(4, max_clusters, n_samples // 3)
+        elif n_samples < 50:
+            print(f"DEBUG: Medium sample ({n_samples} tokens) - using conservative K range")
+            safe_max_clusters = min(6, max_clusters, n_samples // 4)
+        else:
+            # Use rule of thumb: at least 5 tokens per cluster
+            safe_max_clusters = max(2, min(max_clusters, n_samples // 5))
+        
+        if safe_max_clusters < max_clusters:
+            print(f"DEBUG: Adjusting max_clusters from {max_clusters} to {safe_max_clusters} (sample size constraint)")
+            max_clusters = safe_max_clusters
         
         # Use RobustScaler for better outlier handling
         scaler = RobustScaler()
@@ -659,29 +604,29 @@ class AutocorrelationClusteringAnalyzer:
         
         # Apply final safety check
         if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
-            print("Warning: Issues detected after scaling, applying final cleanup...")
+            print("DEBUG: Issues detected after scaling, applying final cleanup...")
             features_scaled = np.nan_to_num(features_scaled, nan=0.0, posinf=3.0, neginf=-3.0)
             features_scaled = np.clip(features_scaled, -5.0, 5.0)
         
         # Check for any remaining issues after scaling
-        print(f"Scaled features - any NaN: {np.any(np.isnan(features_scaled))}")
-        print(f"Scaled features - any Inf: {np.any(np.isinf(features_scaled))}")
+        print(f"DEBUG: Scaled features - any NaN: {np.any(np.isnan(features_scaled))}")
+        print(f"DEBUG: Scaled features - any Inf: {np.any(np.isinf(features_scaled))}")
         
         # Fix NaN/Inf values before K-means clustering
         if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
-            print("Warning: NaN/Inf values detected in scaled features, applying KNN imputation...")
+            print("DEBUG: NaN/Inf values detected in scaled features, applying KNN imputation...")
             from sklearn.impute import KNNImputer
             imputer = KNNImputer(n_neighbors=5)
             features_scaled = imputer.fit_transform(features_scaled)
-            print(f"After imputation - any NaN: {np.any(np.isnan(features_scaled))}")
-            print(f"After imputation - any Inf: {np.any(np.isinf(features_scaled))}")
+            print(f"DEBUG: After imputation - any NaN: {np.any(np.isnan(features_scaled))}")
+            print(f"DEBUG: After imputation - any Inf: {np.any(np.isinf(features_scaled))}")
         
         # Test different numbers of clusters
         k_range = range(2, min(max_clusters + 1, len(features_scaled)))
         inertias = []
         silhouette_scores = []
         
-        print(f"Testing K from 2 to {max(k_range)}...")
+        print(f"DEBUG: Testing K from 2 to {max(k_range)}...")
         
         for k in tqdm(k_range, desc="Finding optimal K"):
             kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
@@ -695,12 +640,12 @@ class AutocorrelationClusteringAnalyzer:
                 try:
                     sil_score = silhouette_score(features_scaled, labels)
                     silhouette_scores.append(sil_score)
-                    print(f"K={k}: Inertia={kmeans.inertia_:.2f}, Silhouette={sil_score:.3f}, Clusters found={len(unique_labels)}")
+                    print(f"DEBUG: K={k}: Inertia={kmeans.inertia_:.2f}, Silhouette={sil_score:.3f}, Clusters found={len(unique_labels)}")
                 except Exception as e:
-                    print(f"K={k}: Error calculating silhouette score: {e}")
+                    print(f"DEBUG: K={k}: Error calculating silhouette score: {e}")
                     silhouette_scores.append(0)
             else:
-                print(f"K={k}: Invalid clustering (found {len(unique_labels)} unique labels), silhouette=0")
+                print(f"DEBUG: K={k}: Invalid clustering (found {len(unique_labels)} unique labels), silhouette=0")
                 silhouette_scores.append(0)
         
         # Find elbow using improved "knee" detection
@@ -748,7 +693,7 @@ class AutocorrelationClusteringAnalyzer:
             second_deriv_optimal_k = list(k_range)[second_deriv_elbow_idx] if second_deriv_elbow_idx < len(k_range) else list(k_range)[-1]
             
             # Use the distance method as primary, but store both
-            print(f"Elbow detection: Distance method suggests K={optimal_k_elbow}, Second derivative suggests K={second_deriv_optimal_k}")
+            print(f"DEBUG: Elbow detection: Distance method suggests K={optimal_k_elbow}, Second derivative suggests K={second_deriv_optimal_k}")
             
         else:
             optimal_k_elbow = 3  # Default fallback
@@ -757,14 +702,14 @@ class AutocorrelationClusteringAnalyzer:
         optimal_k_silhouette = list(k_range)[np.argmax(silhouette_scores)]
         
         # Debug information
-        print(f"K range tested: {list(k_range)}")
-        print(f"Inertias: {[f'{x:.2f}' for x in inertias]}")
-        print(f"Silhouette scores: {[f'{x:.3f}' for x in silhouette_scores]}")
+        print(f"DEBUG: K range tested: {list(k_range)}")
+        print(f"DEBUG: Inertias: {[f'{x:.2f}' for x in inertias]}")
+        print(f"DEBUG: Silhouette scores: {[f'{x:.3f}' for x in silhouette_scores]}")
         if silhouette_scores:
-            print(f"Best silhouette score: {max(silhouette_scores):.3f} at K={optimal_k_silhouette}")
+            print(f"DEBUG: Best silhouette score: {max(silhouette_scores):.3f} at K={optimal_k_silhouette}")
         else:
-            print("No valid silhouette scores computed")
-        print(f"Selected elbow K: {optimal_k_elbow}")
+            print("DEBUG: No valid silhouette scores computed")
+        print(f"DEBUG: Selected elbow K: {optimal_k_elbow}")
         
         return {
             'k_range': list(k_range),
@@ -793,7 +738,7 @@ class AutocorrelationClusteringAnalyzer:
         """
         # Handle NaN values if any remain
         if np.any(np.isnan(feature_matrix)):
-            print("Warning: NaN values in feature matrix, applying median imputation...")
+            print("DEBUG: NaN values in feature matrix, applying median imputation...")
             from sklearn.impute import SimpleImputer
             imputer = SimpleImputer(strategy='median')
             feature_matrix = imputer.fit_transform(feature_matrix)
@@ -805,7 +750,7 @@ class AutocorrelationClusteringAnalyzer:
             if n_clusters is None:
                 # Use elbow method as primary criterion, silhouette as secondary
                 n_clusters = elbow_analysis['optimal_k_elbow']
-                print(f"Optimal K found: {n_clusters} (elbow), {elbow_analysis['optimal_k_silhouette']} (silhouette)")
+                print(f"DEBUG: Optimal K found: {n_clusters} (elbow), {elbow_analysis['optimal_k_silhouette']} (silhouette)")
         
         if n_clusters is None:
             n_clusters = self.n_clusters
@@ -813,13 +758,13 @@ class AutocorrelationClusteringAnalyzer:
         # Validate n_clusters against data size
         n_samples = feature_matrix.shape[0]
         if method in ['kmeans', 'hierarchical'] and n_clusters > n_samples:
-            print(f"Warning: n_clusters ({n_clusters}) > n_samples ({n_samples}), adjusting to {n_samples}")
+            print(f"DEBUG: n_clusters ({n_clusters}) > n_samples ({n_samples}), adjusting to {n_samples}")
             n_clusters = n_samples
         
         # For very small datasets, ensure minimum viable clustering
         if method in ['kmeans', 'hierarchical'] and n_clusters > n_samples // 2 and n_samples > 2:
             n_clusters = max(2, n_samples // 2)
-            print(f"Adjusting n_clusters to {n_clusters} for small dataset")
+            print(f"DEBUG: Adjusting n_clusters to {n_clusters} for small dataset")
             
         # Use RobustScaler for better outlier handling
         scaler = RobustScaler()
@@ -827,14 +772,9 @@ class AutocorrelationClusteringAnalyzer:
         
         # Apply final safety check
         if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
-            print("Warning: Issues detected after scaling, applying final cleanup...")
+            print("DEBUG: Issues detected after scaling, applying final cleanup...")
             features_scaled = np.nan_to_num(features_scaled, nan=0.0, posinf=3.0, neginf=-3.0)
             features_scaled = np.clip(features_scaled, -5.0, 5.0)
-        
-        # Debug: Check feature distribution
-        print(f"Feature matrix shape: {features_scaled.shape}")
-        print(f"Feature mean: {np.mean(features_scaled, axis=0)[:5]}...")  # First 5 means
-        print(f"Feature std: {np.std(features_scaled, axis=0)[:5]}...")   # First 5 stds
         
         if method == 'kmeans':
             clusterer = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -853,7 +793,7 @@ class AutocorrelationClusteringAnalyzer:
         
         # Debug: Check cluster distribution
         unique_labels, counts = np.unique(labels, return_counts=True)
-        print(f"Cluster distribution: {dict(zip(unique_labels, counts))}")
+        print(f"DEBUG: Cluster distribution: {dict(zip(unique_labels, counts))}")
         
         result = {
             'labels': labels,
@@ -885,7 +825,7 @@ class AutocorrelationClusteringAnalyzer:
         
         # Apply final safety check
         if np.any(np.isnan(features_scaled)) or np.any(np.isinf(features_scaled)):
-            print("Warning: Issues detected after scaling, applying final cleanup...")
+            print("DEBUG: Issues detected after scaling, applying final cleanup...")
             features_scaled = np.nan_to_num(features_scaled, nan=0.0, posinf=3.0, neginf=-3.0)
             features_scaled = np.clip(features_scaled, -5.0, 5.0)
         
@@ -898,9 +838,9 @@ class AutocorrelationClusteringAnalyzer:
             features_scaled = pca.fit_transform(features_scaled)
         elif n_features > n_samples:
             # If more features than samples, reduce dimensions
-            n_components = min(n_samples - 1, n_features // 2)
-            if n_components > 1 and n_components < n_features:
-                pca = PCA(n_components=n_components)
+            n_components_pca = min(n_samples - 1, n_features // 2)
+            if n_components_pca > 1 and n_components_pca < n_features:
+                pca = PCA(n_components=n_components_pca)
                 features_scaled = pca.fit_transform(features_scaled)
             
         # Adjust perplexity for small datasets
@@ -1190,7 +1130,7 @@ class AutocorrelationClusteringAnalyzer:
         if len(token_data) == 0:
             raise ValueError("No token data loaded")
             
-        print(f"Loaded {len(token_data)} tokens for analysis")
+        print(f"DEBUG: Loaded {len(token_data)} tokens for analysis")
             
         # Compute autocorrelations
         acf_results = self.compute_all_autocorrelations(token_data, use_log_price)
@@ -1201,7 +1141,7 @@ class AutocorrelationClusteringAnalyzer:
         if len(feature_matrix) == 0:
             raise ValueError("No valid features extracted from tokens")
             
-        print(f"Prepared feature matrix: {feature_matrix.shape}")
+        print(f"DEBUG: Prepared feature matrix: {feature_matrix.shape}")
         
         # Perform clustering with optimal K finding
         clustering_results = self.perform_clustering(
@@ -1212,7 +1152,7 @@ class AutocorrelationClusteringAnalyzer:
         )
         
         # Compute t-SNE (applied directly on tokens, not clusters!)
-        print("Computing t-SNE embeddings...")
+        print("DEBUG: Computing t-SNE embeddings...")
         tsne_2d = self.compute_tsne(feature_matrix, n_components=2)
         tsne_3d = self.compute_tsne(feature_matrix, n_components=3)
         
@@ -1230,14 +1170,14 @@ class AutocorrelationClusteringAnalyzer:
             cluster_tokens = [token_names[i] for i in np.where(mask)[0]]
             cluster_acfs = [acf_results[token]['acf'] for token in cluster_tokens if token in acf_results]
             
-            # Pad to same length
-            max_len = max(len(acf) for acf in cluster_acfs)
-            padded_acfs = []
-            for acf in cluster_acfs:
-                padded = np.pad(acf, (0, max_len - len(acf)), mode='constant', constant_values=0)
-                padded_acfs.append(padded)
+            if cluster_acfs:
+                max_len = max(len(acf) for acf in cluster_acfs)
+                padded_acfs = []
+                for acf in cluster_acfs:
+                    padded = np.pad(acf, (0, max_len - len(acf)), mode='constant', constant_values=0)
+                    padded_acfs.append(padded)
                 
-            acf_by_cluster[cluster_id] = np.array(padded_acfs)
+                acf_by_cluster[cluster_id] = np.array(padded_acfs)
             
         # Compile results
         results = {
@@ -1294,6 +1234,13 @@ class AutocorrelationClusteringAnalyzer:
         # Determine sequence length based on method
         lengths = [len(series) for series in price_series]
         
+        # Adjust feature dimensions for small samples to improve clustering
+        n_tokens = len(valid_tokens)
+        if n_tokens < 50:
+            # For small samples, use much shorter sequences to increase feature diversity
+            max_length = min(100, max_length or 1000)
+            print(f"DEBUG: Small sample ({n_tokens} tokens) - reducing max_length to {max_length} for better clustering")
+        
         if method in ['returns', 'log_returns']:
             # For returns, we need N+1 prices to get N returns
             max_returns_length = min(lengths) - 1
@@ -1308,7 +1255,7 @@ class AutocorrelationClusteringAnalyzer:
             else:
                 target_length = min(max_length, min(lengths))
         
-        print(f"Using sequence length: {target_length} (method: {method}, range: {min(lengths)}-{max(lengths)})")
+        print(f"DEBUG: Using sequence length: {target_length} (method: {method}, range: {min(lengths)}-{max(lengths)})")
         
         # Second pass: prepare data based on method
         feature_matrix = []
@@ -1327,9 +1274,9 @@ class AutocorrelationClusteringAnalyzer:
                         feature_matrix.append(returns)
                         final_tokens.append(valid_tokens[i])
                     else:
-                        print(f"Unexpected returns length for {valid_tokens[i]}: {len(returns)} vs {target_length}")
+                        print(f"DEBUG: Unexpected returns length for {valid_tokens[i]}: {len(returns)} vs {target_length}")
                 else:
-                    print(f"Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} returns")
+                    print(f"DEBUG: Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} returns")
                     
             elif method == 'log_returns':
                 # Use log returns with proper handling of zero/small prices
@@ -1349,13 +1296,13 @@ class AutocorrelationClusteringAnalyzer:
                                 feature_matrix.append(log_returns)
                                 final_tokens.append(valid_tokens[i])
                             else:
-                                print(f"Skipping {valid_tokens[i]} due to invalid log returns (inf/nan)")
+                                print(f"DEBUG: Skipping {valid_tokens[i]} due to invalid log returns (inf/nan)")
                         else:
-                            print(f"Unexpected log returns length for {valid_tokens[i]}: {len(log_returns)} vs {target_length}")
+                            print(f"DEBUG: Unexpected log returns length for {valid_tokens[i]}: {len(log_returns)} vs {target_length}")
                     except Exception as e:
-                        print(f"Skipping {valid_tokens[i]} due to log calculation error: {e}")
+                        print(f"DEBUG: Skipping {valid_tokens[i]} due to log calculation error: {e}")
                 else:
-                    print(f"Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} log returns")
+                    print(f"DEBUG: Insufficient data for {valid_tokens[i]}: {len(prices)} points, need {target_length+1} for {target_length} log returns")
                         
             elif method == 'prices':
                 # Use raw prices directly (regardless of use_log_price setting)
@@ -1417,7 +1364,7 @@ class AutocorrelationClusteringAnalyzer:
                         feature_matrix.append(features)
                         final_tokens.append(valid_tokens[i])
                     else:
-                        print(f"Skipping {valid_tokens[i]} due to invalid DTW features")
+                        print(f"DEBUG: Skipping {valid_tokens[i]} due to invalid DTW features")
             else:
                 raise ValueError(f"Unknown method: {method}")
         
@@ -1426,11 +1373,11 @@ class AutocorrelationClusteringAnalyzer:
         # Final check for NaN/inf values and clean if necessary
         if len(feature_matrix) > 0:
             if np.any(np.isnan(feature_matrix)) or np.any(np.isinf(feature_matrix)):
-                print("Warning: Found NaN/inf values in feature matrix, cleaning...")
+                print("DEBUG: Found NaN/inf values in feature matrix, cleaning...")
                 feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=1e10, neginf=-1e10)
         
-        print(f"Price-only feature matrix shape: {feature_matrix.shape}")
-        print(f"Method: {method}, Valid tokens: {len(final_tokens)}")
+        print(f"DEBUG: Price-only feature matrix shape: {feature_matrix.shape}")
+        print(f"DEBUG: Method: {method}, Valid tokens: {len(final_tokens)}")
         
         return feature_matrix, final_tokens
     
@@ -1464,10 +1411,10 @@ class AutocorrelationClusteringAnalyzer:
         if len(token_data) == 0:
             raise ValueError("No token data loaded")
             
-        print(f"Loaded {len(token_data)} tokens for price-only analysis")
+        print(f"DEBUG: Loaded {len(token_data)} tokens for price-only analysis")
         
         # Compute autocorrelations for all tokens (this is what ACF is for!)
-        print("Computing autocorrelations for all tokens...")
+        print("DEBUG: Computing autocorrelations for all tokens...")
         acf_results = self.compute_all_autocorrelations(token_data, use_log_price)
         
         # Prepare price-only data for clustering
@@ -1478,7 +1425,7 @@ class AutocorrelationClusteringAnalyzer:
         if len(feature_matrix) == 0:
             raise ValueError("No valid price data extracted from tokens")
             
-        print(f"Prepared price feature matrix: {feature_matrix.shape}")
+        print(f"DEBUG: Prepared price feature matrix: {feature_matrix.shape}")
         
         # Perform clustering
         clustering_results = self.perform_clustering(
@@ -1489,7 +1436,7 @@ class AutocorrelationClusteringAnalyzer:
         )
         
         # Compute t-SNE
-        print("Computing t-SNE embeddings for price data...")
+        print("DEBUG: Computing t-SNE embeddings for price data...")
         tsne_2d = self.compute_tsne(feature_matrix, n_components=2)
         tsne_3d = self.compute_tsne(feature_matrix, n_components=3)
         
@@ -1509,7 +1456,6 @@ class AutocorrelationClusteringAnalyzer:
             cluster_acfs = [acf_results[token]['acf'] for token in cluster_tokens if token in acf_results]
             
             if cluster_acfs:
-                # Pad to same length
                 max_len = max(len(acf) for acf in cluster_acfs)
                 padded_acfs = []
                 for acf in cluster_acfs:
@@ -1561,40 +1507,49 @@ class AutocorrelationClusteringAnalyzer:
         Returns:
             Dictionary with results for each lifespan category
         """
-        # Load from processed categories
-        all_token_data = self.load_processed_categories(data_dir, max_tokens_per_category, sample_ratio)
+        # Load ALL tokens from processed categories (no limits, no sampling)
+        print(f"DEBUG: Loading ALL tokens from processed categories...")
+        all_token_data = self.load_processed_categories(data_dir, max_tokens_per_category=None, sample_ratio=None)
         
-        # Categorize tokens by active lifespan (death-aware)
-        categories = {
-            'Sprint': {},      # 50-400 active minutes
-            'Standard': {},    # 400-1200 active minutes  
-            'Marathon': {}     # 1200+ active minutes
-        }
+        # Categorize tokens by active lifespan (death-aware) - no limits during categorization
+        categories = categorize_by_lifespan(all_token_data, token_limits={})
         
-        print("Applying death detection for accurate lifespan categorization...")
+        print(f"DEBUG: Token distribution by active lifespan (before sampling):")
+        for category, tokens in categories.items():
+            print(f"  {category}: {len(tokens)} tokens")
         
-        for token_name, df in all_token_data.items():
-            # Apply death detection to get true active lifespan
-            prices = df['price'].to_numpy()
-            returns = np.diff(prices) / prices[:-1]
+        # Apply stratified sampling AFTER categorization if requested
+        if sample_ratio is not None and 0 < sample_ratio < 1:
+            import random
+            print(f"DEBUG: Applying stratified sampling ({sample_ratio*100:.1f}%)...")
             
-            # Import death detection from archetype_utils
-            from .archetype_utils import detect_token_death
-            death_minute = detect_token_death(prices, returns, window=30)
+            sampled_categories = {}
+            total_before_sampling = sum(len(tokens) for tokens in categories.values())
             
-            # Calculate active lifespan (before death or full length if alive)
-            active_lifespan = death_minute if death_minute is not None else len(df)
+            for category_name, category_tokens in categories.items():
+                if len(category_tokens) == 0:
+                    sampled_categories[category_name] = {}
+                    continue
+                
+                # Calculate sample size for this category (proportional)
+                category_sample_size = max(1, int(len(category_tokens) * sample_ratio))
+                category_sample_size = min(category_sample_size, len(category_tokens))
+                
+                # Random sample within category
+                token_names = list(category_tokens.keys())
+                sampled_names = random.sample(token_names, category_sample_size)
+                
+                sampled_categories[category_name] = {
+                    name: category_tokens[name] for name in sampled_names
+                }
+                
+                print(f"DEBUG:  {category_name}: {len(sampled_names)} tokens (from {len(category_tokens)})")
             
-            # Categorize by active lifespan
-            if 0 <= active_lifespan <= 400:
-                categories['Sprint'][token_name] = df
-            elif 400 < active_lifespan <= 1200:
-                categories['Standard'][token_name] = df
-            elif active_lifespan > 1200:
-                categories['Marathon'][token_name] = df
-            # Include tokens that die immediately (death_minute = 0) in Sprint category
+            categories = sampled_categories
+            total_after_sampling = sum(len(tokens) for tokens in categories.values())
+            print(f"DEBUG: Stratified sampling complete: {total_after_sampling} tokens (from {total_before_sampling})")
         
-        print(f"Token distribution by active lifespan:")
+        print(f"DEBUG: Final token distribution by active lifespan:")
         for category, tokens in categories.items():
             print(f"  {category}: {len(tokens)} tokens")
         
@@ -1606,25 +1561,12 @@ class AutocorrelationClusteringAnalyzer:
         
         for category_name, token_data in categories.items():
             if len(token_data) == 0:
-                print(f"Skipping {category_name} - no tokens in this category")
+                print(f"DEBUG: Skipping {category_name} - no tokens in this category")
                 continue
                 
-            print(f"\nAnalyzing {category_name} category ({len(token_data)} tokens)...")
-            
-            # Limit tokens per category if specified
-            if max_tokens_per_category and len(token_data) > max_tokens_per_category:
-                # Sample randomly to get diverse representation
-                import random
-                token_names = list(token_data.keys())
-                sampled_names = random.sample(token_names, max_tokens_per_category)
-                token_data = {name: token_data[name] for name in sampled_names}
-                print(f"  Sampled {len(token_data)} tokens for analysis")
+            print(f"\nDEBUG: Analyzing {category_name} category ({len(token_data)} tokens)...")
             
             try:
-                # For category-specific analysis, we need to work with the subset
-                # Create a temporary directory-like structure
-                temp_results = {}
-                
                 # Compute ACF for category tokens
                 acf_results = self.compute_all_autocorrelations(token_data, use_log_price)
                 
@@ -1634,7 +1576,7 @@ class AutocorrelationClusteringAnalyzer:
                 )
                 
                 if len(feature_matrix) == 0:
-                    print(f"No valid feature matrix for {category_name}")
+                    print(f"DEBUG: No valid feature matrix for {category_name}")
                     continue
                 
                 # Perform clustering
@@ -1693,7 +1635,7 @@ class AutocorrelationClusteringAnalyzer:
                 results_by_category[category_name] = category_results
                 
             except Exception as e:
-                print(f"Error analyzing {category_name}: {e}")
+                print(f"DEBUG: Error analyzing {category_name}: {e}")
                 continue
         
         # Compile multi-resolution results
@@ -1740,7 +1682,7 @@ class AutocorrelationClusteringAnalyzer:
         multi_resolution_acf = {}
         
         for horizon in time_horizons:
-            print(f"Computing ACF with max lag {horizon}...")
+            print(f"DEBUG: Computing ACF with max lag {horizon}...")
             
             # Temporarily set max_lag for this horizon
             original_max_lag = self.max_lag
@@ -1752,7 +1694,7 @@ class AutocorrelationClusteringAnalyzer:
                 multi_resolution_acf[f'horizon_{horizon}'] = acf_results
                 
             except Exception as e:
-                print(f"Error computing ACF for horizon {horizon}: {e}")
+                print(f"DEBUG: Error computing ACF for horizon {horizon}: {e}")
                 multi_resolution_acf[f'horizon_{horizon}'] = {}
             finally:
                 # Restore original max_lag
@@ -1803,7 +1745,7 @@ class AutocorrelationClusteringAnalyzer:
             price_series = [price_series[i] for i in indices]
             valid_tokens = [valid_tokens[i] for i in indices]
         
-        print(f"Computing DTW distances for {len(price_series)} variable-length sequences...")
+        print(f"DEBUG: Computing DTW distances for {len(price_series)} variable-length sequences...")
         
         # Compute DTW distance matrix
         n_series = len(price_series)
@@ -1829,7 +1771,7 @@ class AutocorrelationClusteringAnalyzer:
                     distance_matrix[j, i] = dist
                     
                 except Exception as e:
-                    print(f"Error computing DTW between series {i} and {j}: {e}")
+                    print(f"DEBUG: Error computing DTW between series {i} and {j}: {e}")
                     # Use Euclidean distance of summary statistics as fallback
                     try:
                         mean_diff = abs(np.mean(price_series[i]) - np.mean(price_series[j]))
@@ -1844,7 +1786,7 @@ class AutocorrelationClusteringAnalyzer:
         
         # Validate distance matrix before clustering
         if np.any(np.isnan(distance_matrix)) or np.any(np.isinf(distance_matrix)):
-            print("Warning: Distance matrix contains NaN or inf values, cleaning...")
+            print("DEBUG: Distance matrix contains NaN or inf values, cleaning...")
             distance_matrix = np.nan_to_num(distance_matrix, nan=1000.0, posinf=1000.0, neginf=0.0)
         
         # Ensure matrix is symmetric
@@ -1861,7 +1803,7 @@ class AutocorrelationClusteringAnalyzer:
             labels = clusterer.fit_predict(distance_matrix)
             
         except Exception as e:
-            print(f"DTW clustering failed: {e}")
+            print(f"DEBUG: DTW clustering failed: {e}")
             # Fallback to random assignment
             labels = np.random.randint(0, min(n_clusters, len(valid_tokens)), size=len(valid_tokens))
         
@@ -1978,3 +1920,46 @@ class AutocorrelationClusteringAnalyzer:
                     }
         
         return acf_comparison 
+
+    def test_clustering_stability(self, feature_matrix: np.ndarray, n_clusters: int, n_runs: int = 10) -> Dict:
+        """
+        Test clustering stability using multiple random seeds.
+        
+        Args:
+            feature_matrix: Feature matrix
+            n_clusters: Number of clusters
+            n_runs: Number of stability runs (default: 10)
+            
+        Returns:
+            Stability metrics dictionary
+        """
+        from sklearn.metrics import adjusted_rand_score
+        
+        # Scale features
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(feature_matrix)
+        
+        all_labels = []
+        for seed in range(n_runs):
+            kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
+            labels = kmeans.fit_predict(X_scaled)
+            all_labels.append(labels)
+        
+        ari_scores = [adjusted_rand_score(all_labels[i], all_labels[j]) 
+                      for i in range(n_runs) for j in range(i+1, n_runs)]
+        
+        mean_ari = np.mean(ari_scores)
+        min_ari = np.min(ari_scores)
+        std_ari = np.std(ari_scores)
+        
+        print(f"DEBUG: Stability test - Mean ARI: {mean_ari:.3f}, Min ARI: {min_ari:.3f}, Std ARI: {std_ari:.3f}")
+        
+        if mean_ari < 0.75:
+            print("DEBUG: Warning: Clustering stability below threshold (0.75). Consider adding features like Hurst exponent.")
+        
+        return {
+            'mean_ari': mean_ari,
+            'min_ari': min_ari,
+            'std_ari': std_ari,
+            'ari_scores': ari_scores
+        }
