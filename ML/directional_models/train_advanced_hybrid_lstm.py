@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore')
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/features"),
+    'base_dir': Path("data/features_with_targets"),
     'results_dir': Path("ML/results/advanced_hybrid_lstm"),
     'categories': [
         "normal_behavior_tokens",
@@ -122,93 +122,102 @@ class AdvancedHybridDataset(Dataset):
         print(f"Created {len(self.samples)} multi-scale samples")
     
     def _create_multi_scale_samples(self, features: np.ndarray, prices: np.ndarray, token_id: str):
-        """Create samples with multiple fixed windows + expanding window"""
+        """Create samples with multiple fixed windows and expanding window"""
         
-        max_horizon = max(self.horizons)
-        max_window = max(self.fixed_windows)
+        # Apply winsorization
+        winsorizer = self.token_winsorizers[token_id]
+        features_norm = winsorizer.transform(features)
         
-        # Start from the point where we have enough history for largest fixed window
-        for current_idx in range(max_window, len(features) - max_horizon):
-            # Skip if expanding window would be too large
-            expanding_length = min(current_idx, self.expanding_max)
-            if expanding_length < self.expanding_min:
+        # Calculate the minimum start position
+        min_fixed_start = max(self.fixed_windows)
+        
+        # Process expanding window range
+        for exp_end in range(self.expanding_min, min(self.expanding_max + 1, len(features_norm))):
+            # Skip if we don't have enough data after expanding window
+            if exp_end + max(self.horizons) >= len(features_norm):
                 continue
             
-            sample = {
-                'token_id': token_id,
-                'fixed_sequences': {},
-                'expanding_sequence': None,
-                'current_idx': current_idx,
-                'labels': []
-            }
+            # Create fixed window sequences
+            fixed_seqs = {}
+            valid = True
             
-            # Extract fixed window sequences
-            valid_sample = True
-            for window_size in self.fixed_windows:
-                start_idx = current_idx - window_size
-                if start_idx >= 0:
-                    seq = features[start_idx:current_idx]
-                    if np.isnan(seq).sum() / seq.size > 0.1:  # Too many NaNs
-                        valid_sample = False
-                        break
-                    sample['fixed_sequences'][window_size] = seq
-                else:
-                    valid_sample = False
+            for window in self.fixed_windows:
+                start_idx = exp_end - window
+                if start_idx < 0:
+                    valid = False
                     break
+                fixed_seq = features_norm[start_idx:exp_end]
+                
+                # Skip if too many NaNs
+                if np.isnan(fixed_seq).sum() / fixed_seq.size > 0.1:
+                    valid = False
+                    break
+                fixed_seqs[window] = fixed_seq
             
-            if not valid_sample:
+            if not valid:
                 continue
             
-            # Extract expanding window sequence
-            expanding_start = max(0, current_idx - expanding_length)
-            expanding_seq = features[expanding_start:current_idx]
-            if np.isnan(expanding_seq).sum() / expanding_seq.size > 0.1:
-                continue
-            sample['expanding_sequence'] = expanding_seq
-            sample['expanding_length'] = len(expanding_seq)
+            # Create expanding window sequence
+            expanding_seq = features_norm[:exp_end]
             
-            # Create labels for all horizons (Option 1: Per-horizon validation)
-            current_price = prices[current_idx]
+            # Create labels and returns for all horizons
+            current_price = prices[exp_end]
             if np.isnan(current_price):
                 continue
             
-            sample['labels'] = []
-            sample['valid_horizons_mask'] = []
-            any_valid_horizon = False
+            labels = []
+            returns = []
+            valid_mask = []
             
             for h in self.horizons:
-                future_idx = current_idx + h
+                future_idx = exp_end + h
                 if future_idx < len(prices):
                     future_price = prices[future_idx]
                     if not np.isnan(future_price):
-                        # Valid horizon
                         label = 1.0 if future_price > current_price else 0.0
-                        sample['labels'].append(label)
-                        sample['valid_horizons_mask'].append(True)
-                        any_valid_horizon = True
+                        ret = (future_price - current_price) / current_price
+                        labels.append(label)
+                        returns.append(ret)
+                        valid_mask.append(True)
                     else:
-                        # Invalid horizon (NaN price)
-                        sample['labels'].append(0.0)  # Placeholder (will be masked)
-                        sample['valid_horizons_mask'].append(False)
+                        labels.append(0.0)
+                        returns.append(0.0)
+                        valid_mask.append(False)
                 else:
-                    # Invalid horizon (beyond token data)
-                    sample['labels'].append(0.0)  # Placeholder (will be masked)
-                    sample['valid_horizons_mask'].append(False)
+                    labels.append(0.0)
+                    returns.append(0.0)
+                    valid_mask.append(False)
             
-            # Keep sample if at least one horizon is valid
-            if any_valid_horizon:
-                self.samples.append(sample)
+            # Only add if we have at least one valid horizon
+            if any(valid_mask):
+                self.samples.append({
+                    'fixed_sequences': fixed_seqs,
+                    'expanding_sequence': expanding_seq,
+                    'labels': np.array(labels, dtype=np.float32),
+                    'returns': np.array(returns, dtype=np.float32),
+                    'valid_mask': np.array(valid_mask, dtype=bool),
+                    'expanding_length': len(expanding_seq),
+                    'token_id': token_id
+                })
     
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        
+        # Convert to tensors
+        fixed_tensors = {
+            window: torch.FloatTensor(seq) 
+            for window, seq in sample['fixed_sequences'].items()
+        }
+        
         return (
-            sample['fixed_sequences'],
-            sample['expanding_sequence'],
+            fixed_tensors,
+            torch.FloatTensor(sample['expanding_sequence']),
             torch.FloatTensor(sample['labels']),
-            torch.BoolTensor(sample['valid_horizons_mask']),
+            torch.FloatTensor(sample['returns']),
+            torch.BoolTensor(sample['valid_mask']),
             sample['expanding_length']
         )
 
@@ -218,10 +227,11 @@ def collate_hybrid_batch(batch):
     fixed_seqs_batch = {window: [] for window in CONFIG['fixed_windows']}
     expanding_seqs = []
     labels = []
-    valid_horizons_masks = []
+    returns = []
+    valid_masks = []
     expanding_lengths = []
     
-    for fixed_seqs, expanding_seq, label, valid_mask, exp_len in batch:
+    for fixed_seqs, expanding_seq, label, ret, valid_mask, exp_len in batch:
         # Collect fixed sequences
         for window, seq in fixed_seqs.items():
             fixed_seqs_batch[window].append(torch.FloatTensor(seq))
@@ -229,7 +239,8 @@ def collate_hybrid_batch(batch):
         # Collect expanding sequences
         expanding_seqs.append(torch.FloatTensor(expanding_seq))
         labels.append(label)
-        valid_horizons_masks.append(valid_mask)
+        returns.append(ret)
+        valid_masks.append(valid_mask)
         expanding_lengths.append(exp_len)
     
     # Stack fixed sequences (all same length per window)
@@ -244,7 +255,8 @@ def collate_hybrid_batch(batch):
         fixed_tensors,
         expanding_padded,
         torch.stack(labels),
-        torch.stack(valid_horizons_masks),
+        torch.stack(returns),
+        torch.stack(valid_masks),
         torch.LongTensor(expanding_lengths)
     )
 
@@ -253,10 +265,10 @@ def collate_hybrid_batch(batch):
 class AdvancedHybridLSTM(nn.Module):
     """
     Advanced LSTM with:
-    1. Multi-scale fixed window processing
-    2. Expanding window with attention
-    3. Cross-attention between scales
-    4. Multi-horizon prediction heads
+    - Multi-scale fixed window processing
+    - Expanding window with attention
+    - Cross-modal attention between fixed and expanding
+    - Batch normalization for improved training
     """
     
     def __init__(self,
@@ -269,70 +281,68 @@ class AdvancedHybridLSTM(nn.Module):
                  horizons: List[int] = [15, 30, 60, 120, 240, 360, 720]):
         super().__init__()
         
-        self.fixed_windows = sorted(fixed_windows)
+        self.fixed_windows = fixed_windows
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
         
-        # Multi-scale fixed window LSTMs
-        self.fixed_lstms = nn.ModuleDict({
-            str(window): nn.LSTM(
-                input_size=input_size,
-                hidden_size=hidden_size // len(fixed_windows),
-                num_layers=1,
+        # Fixed window LSTMs with batch norm
+        self.fixed_lstms = nn.ModuleDict()
+        self.fixed_bns = nn.ModuleDict()
+        for window in fixed_windows:
+            self.fixed_lstms[str(window)] = nn.LSTM(
+                input_size, hidden_size, num_layers,
                 dropout=dropout if num_layers > 1 else 0,
                 batch_first=True
-            ) for window in fixed_windows
-        })
+            )
+            self.fixed_bns[str(window)] = nn.BatchNorm1d(hidden_size)
         
-        # Expanding window LSTM (larger capacity)
+        # Expanding window LSTM with batch norm
         self.expanding_lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
+            input_size, hidden_size, num_layers,
             dropout=dropout if num_layers > 1 else 0,
             batch_first=True
         )
+        self.expanding_bn = nn.BatchNorm1d(hidden_size)
         
         # Self-attention for expanding window
         self.self_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=attention_heads,
-            dropout=dropout,
-            batch_first=True
+            hidden_size, attention_heads, dropout=dropout, batch_first=True
         )
+        self.self_attention_bn = nn.BatchNorm1d(hidden_size)
         
-        # Cross-attention between fixed and expanding features
-        combined_fixed_size = hidden_size  # Sum of all fixed LSTM outputs
+        # Cross-attention (expanding queries, fixed keys/values)
+        combined_fixed_size = hidden_size * len(fixed_windows)
         self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=attention_heads,
-            dropout=dropout,
-            batch_first=True
+            hidden_size, attention_heads, dropout=dropout, batch_first=True
         )
+        self.cross_attention_bn = nn.BatchNorm1d(hidden_size)
         
-        # Feature fusion layer
+        # Fusion layer with batch norm
         self.fusion_layer = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # Final feature extraction
+        # Final feature extraction with batch norm
         self.feature_extractor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, hidden_size // 2),
+            nn.BatchNorm1d(hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # Multi-horizon prediction heads
+        # Multi-horizon prediction heads with batch norm
         self.horizon_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_size // 2, hidden_size // 4),
+                nn.BatchNorm1d(hidden_size // 4),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_size // 4, 1)
@@ -347,8 +357,10 @@ class AdvancedHybridLSTM(nn.Module):
         for window in self.fixed_windows:
             seq = fixed_sequences[window]
             lstm_out, (h_n, _) = self.fixed_lstms[str(window)](seq)
-            # Use last hidden state
-            fixed_features.append(h_n[-1])
+            # Use last hidden state and apply batch norm
+            h_n_last = h_n[-1]
+            h_n_norm = self.fixed_bns[str(window)](h_n_last)
+            fixed_features.append(h_n_norm)
         
         # Concatenate fixed features
         fixed_combined = torch.cat(fixed_features, dim=-1)
@@ -381,6 +393,9 @@ class AdvancedHybridLSTM(nn.Module):
             expanding_final.append(attended_exp[i, length-1])
         expanding_final = torch.stack(expanding_final)
         
+        # Apply batch norm to attention output
+        expanding_final = self.self_attention_bn(expanding_final)
+        
         # Cross-attention: expanding queries, fixed keys/values
         # Expand fixed features to sequence format for attention
         fixed_expanded = fixed_combined.unsqueeze(1)  # (batch, 1, hidden)
@@ -392,6 +407,7 @@ class AdvancedHybridLSTM(nn.Module):
             fixed_expanded
         )
         cross_attended = cross_attended.squeeze(1)
+        cross_attended = self.cross_attention_bn(cross_attended)
         
         # Fusion of all features
         fused_features = self.fusion_layer(
@@ -477,12 +493,13 @@ def train_advanced_model(model, train_loader, val_loader, config):
         train_batches = 0
         
         for batch_data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']}"):
-            fixed_seqs, expanding_seq, labels, valid_masks, exp_lengths = batch_data
+            fixed_seqs, expanding_seq, labels, returns, valid_masks, exp_lengths = batch_data
             
             # Move to device
             fixed_seqs = {k: v.to(device) for k, v in fixed_seqs.items()}
             expanding_seq = expanding_seq.to(device)
             labels = labels.to(device)
+            returns = returns.to(device)
             valid_masks = valid_masks.to(device)
             exp_lengths = exp_lengths.to(device)
             
@@ -510,11 +527,12 @@ def train_advanced_model(model, train_loader, val_loader, config):
         
         with torch.no_grad():
             for batch_data in val_loader:
-                fixed_seqs, expanding_seq, labels, valid_masks, exp_lengths = batch_data
+                fixed_seqs, expanding_seq, labels, returns, valid_masks, exp_lengths = batch_data
                 
                 fixed_seqs = {k: v.to(device) for k, v in fixed_seqs.items()}
                 expanding_seq = expanding_seq.to(device)
                 labels = labels.to(device)
+                returns = returns.to(device)
                 valid_masks = valid_masks.to(device)
                 exp_lengths = exp_lengths.to(device)
                 
@@ -564,7 +582,8 @@ def train_advanced_model(model, train_loader, val_loader, config):
 
 
 def evaluate_advanced_model(model, test_loader, horizons, device=None):
-    """Evaluate the advanced model with detailed metrics"""
+    """Evaluate the advanced model with detailed metrics including financial metrics"""
+    from ML.utils.metrics_helpers import financial_classification_metrics
     
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -574,11 +593,12 @@ def evaluate_advanced_model(model, test_loader, horizons, device=None):
     model.eval()
     all_preds = []
     all_labels = []
+    all_returns = []
     all_valid_masks = []
     
     with torch.no_grad():
         for batch_data in tqdm(test_loader, desc="Evaluating"):
-            fixed_seqs, expanding_seq, labels, valid_masks, exp_lengths = batch_data
+            fixed_seqs, expanding_seq, labels, returns, valid_masks, exp_lengths = batch_data
             
             fixed_seqs = {k: v.to(device) for k, v in fixed_seqs.items()}
             expanding_seq = expanding_seq.to(device)
@@ -588,10 +608,12 @@ def evaluate_advanced_model(model, test_loader, horizons, device=None):
             
             all_preds.append(outputs.cpu().numpy())
             all_labels.append(labels.numpy())
+            all_returns.append(returns.numpy())
             all_valid_masks.append(valid_masks.numpy())
     
     predictions = np.vstack(all_preds)
     targets = np.vstack(all_labels)
+    returns = np.vstack(all_returns)
     valid_masks = np.vstack(all_valid_masks)
     
     # Calculate metrics for each horizon (only on valid samples)
@@ -601,10 +623,11 @@ def evaluate_advanced_model(model, test_loader, horizons, device=None):
         horizon_mask = valid_masks[:, i]
         valid_preds = predictions[horizon_mask, i]
         valid_targets = targets[horizon_mask, i]
+        valid_returns = returns[horizon_mask, i]
         
         if len(valid_preds) == 0:
             # No valid samples for this horizon
-            horizon_name = f'{h}m' if h < 60 else f'{h//60}h'
+            horizon_name = f'{h}min'
             metrics[horizon_name] = {
                 'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 
                 'f1_score': 0.0, 'roc_auc': 0.5, 'valid_samples': 0
@@ -612,21 +635,23 @@ def evaluate_advanced_model(model, test_loader, horizons, device=None):
             continue
         
         binary_preds = (valid_preds > 0.5).astype(int)
-        horizon_name = f'{h}m' if h < 60 else f'{h//60}h'
+        horizon_name = f'{h}min'
         
-        metrics[horizon_name] = {
-            'accuracy': accuracy_score(valid_targets, binary_preds),
-            'precision': precision_score(valid_targets, binary_preds, zero_division=0),
-            'recall': recall_score(valid_targets, binary_preds, zero_division=0),
-            'f1_score': f1_score(valid_targets, binary_preds, zero_division=0),
-            'roc_auc': roc_auc_score(valid_targets, valid_preds) if len(np.unique(valid_targets)) > 1 else 0.5,
-            'valid_samples': len(valid_preds)
-        }
+        # Get comprehensive financial metrics
+        horizon_metrics = financial_classification_metrics(
+            y_true=valid_targets,
+            y_pred=binary_preds,
+            returns=valid_returns,
+            y_prob=valid_preds
+        )
         
-        # Add class distribution info
-        pos_ratio = np.mean(valid_targets)
-        metrics[horizon_name]['positive_class_ratio'] = pos_ratio
-        metrics[horizon_name]['predictions_positive_ratio'] = np.mean(binary_preds)
+        # Add additional metrics
+        horizon_metrics['valid_samples'] = len(valid_preds)
+        horizon_metrics['positive_class_ratio'] = np.mean(valid_targets)
+        horizon_metrics['predictions_positive_ratio'] = np.mean(binary_preds)
+        
+        # Store with horizon prefix
+        metrics[horizon_name] = {f"{horizon_name}_{k}": v for k, v in horizon_metrics.items()}
     
     return metrics
 
@@ -638,6 +663,7 @@ def main():
     print("="*60)
     print("🚀 Advanced Hybrid LSTM Training")
     print("Features: Multi-scale extraction, Attention, Hybrid windows")
+    print("WITH WALK-FORWARD VALIDATION")
     print("="*60)
     
     # Create results directory
@@ -658,10 +684,121 @@ def main():
     
     print(f"\nTotal files: {len(all_paths)}")
     
-    # Smart data split
-    from ML.directional_models.train_unified_lstm_model import smart_data_split
-    train_paths, val_paths, test_paths = smart_data_split(all_paths)
+    # Import walk-forward splitter
+    from ML.utils.walk_forward_splitter import WalkForwardSplitter
     
+    print("\n🔄 Using Walk-Forward Validation for Advanced Hybrid LSTM")
+    
+    # Load all data first to prepare for walk-forward splitting
+    print("\n📊 Loading all feature data for walk-forward validation...")
+    
+    all_data_frames = []
+    for path in tqdm(all_paths, desc="Loading feature files"):
+        try:
+            df = pl.read_parquet(path)
+            if len(df) < 400:  # Minimum token length
+                continue
+            
+            # Add token identifier
+            df = df.with_columns(pl.lit(path.stem).alias('token_id'))
+            all_data_frames.append(df)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
+    
+    if not all_data_frames:
+        print("ERROR: No valid feature files found!")
+        return
+    
+    # Combine all data
+    combined_data = pl.concat(all_data_frames)
+    print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
+    
+    # Setup smart memecoin-aware walk-forward splitter
+    splitter = WalkForwardSplitter()  # Auto-adapts to data length
+    
+    # Use smart splits that adapt to memecoin data characteristics
+    print("\n🔀 Creating smart memecoin-aware walk-forward splits...")
+    global_splits, feasible_horizons = splitter.smart_split_for_memecoins(
+        combined_data, 
+        horizons=CONFIG['horizons'],
+        time_column='datetime'
+    )
+    
+    print(f"Created {len(global_splits)} walk-forward folds")
+    print(f"Original horizons: {CONFIG['horizons']}")
+    print(f"Feasible horizons: {feasible_horizons}")
+    
+    if len(feasible_horizons) < len(CONFIG['horizons']):
+        skipped = [h for h in CONFIG['horizons'] if h not in feasible_horizons]
+        print(f"⚠️  Skipped horizons (too long for data): {skipped}")
+    
+    if not global_splits or not feasible_horizons:
+        print("❌ No valid folds or feasible horizons!")
+        return
+    
+    # Update config to use only feasible horizons
+    CONFIG['horizons'] = feasible_horizons
+    
+    # Collect all folds for training
+    all_train_data = []
+    all_val_data = []  
+    all_test_data = []
+    
+    # Use first N-1 folds for training/validation, last fold for testing
+    if len(global_splits) < 2:
+        print("❌ Need at least 2 global folds for training!")
+        return
+        
+    # Use last fold as test, split remaining into train/val
+    *train_val_folds, test_fold = global_splits
+    test_train_df, test_test_df = test_fold
+    all_test_data.append(test_test_df)
+    
+    # Split train_val_folds into train and validation (80/20)
+    n_train_folds = max(1, int(len(train_val_folds) * 0.8))
+    
+    for i, (fold_train_df, fold_test_df) in enumerate(train_val_folds):
+        if i < n_train_folds:
+            all_train_data.append(fold_test_df)  # Use 'test' part of fold for training
+        else:
+            all_val_data.append(fold_test_df)    # Use for validation
+    
+    print(f"\n📈 Walk-forward data split:")
+    print(f"  Train folds: {len(all_train_data)} DataFrames")
+    print(f"  Val folds: {len(all_val_data)} DataFrames")  
+    print(f"  Test folds: {len(all_test_data)} DataFrames")
+    
+    # Create datasets from walk-forward splits
+    print("\nCreating datasets with walk-forward splits...")
+    
+    # Convert DataFrames back to paths for compatibility with existing dataset code
+    # Save temporary files for each split
+    temp_dir = CONFIG['results_dir'] / 'temp_splits'
+    temp_dir.mkdir(exist_ok=True)
+    
+    train_paths = []
+    val_paths = []
+    test_paths = []
+    
+    # Save train splits
+    for i, df in enumerate(all_train_data):
+        temp_path = temp_dir / f'train_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        train_paths.append(temp_path)
+    
+    # Save val splits
+    for i, df in enumerate(all_val_data):
+        temp_path = temp_dir / f'val_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        val_paths.append(temp_path)
+        
+    # Save test splits
+    for i, df in enumerate(all_test_data):
+        temp_path = temp_dir / f'test_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        test_paths.append(temp_path)
+
     # Create datasets
     print("\nCreating advanced hybrid datasets...")
     train_dataset = AdvancedHybridDataset(
@@ -688,7 +825,7 @@ def main():
         CONFIG['horizons']
     )
     
-    print(f"\nDataset sizes:")
+    print(f"\nDataset sizes (walk-forward):")
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Val: {len(val_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
@@ -744,7 +881,7 @@ def main():
     )
     
     # Evaluate on test set
-    print("\nEvaluating on test set...")
+    print("\nEvaluating on test set (walk-forward)...")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if torch.backends.mps.is_available():
         device = 'mps'
@@ -754,27 +891,25 @@ def main():
     
     # Print results
     print("\n" + "="*60)
-    print("TEST SET RESULTS")
+    print("TEST SET RESULTS (Walk-Forward Validation)")
     print("="*60)
     
     for horizon, m in metrics.items():
         print(f"\nHorizon {horizon}:")
-        print(f"  Accuracy: {m['accuracy']:.2%}")
-        print(f"  Precision: {m['precision']:.2%}")
-        print(f"  Recall: {m['recall']:.2%}")
-        print(f"  F1 Score: {m['f1_score']:.2%}")
-        print(f"  ROC AUC: {m['roc_auc']:.2%}")
-        print(f"  Positive class ratio: {m['positive_class_ratio']:.2%}")
+        for metric_name, value in m.items():
+            if isinstance(value, (int, float)):
+                print(f"  {metric_name}: {value:.2%}")
     
     # Save model and results
-    model_path = CONFIG['results_dir'] / 'advanced_hybrid_lstm_model.pth'
+    model_path = CONFIG['results_dir'] / 'advanced_hybrid_lstm_model_walkforward.pth'
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': CONFIG,
         'token_winsorizers': train_dataset.token_winsorizers,
         'metrics': metrics,
         'input_size': input_size,
-        'training_history': training_history
+        'training_history': training_history,
+        'validation_method': 'walk_forward'
     }, model_path)
     
     print(f"\nModel saved to: {model_path}")
@@ -784,29 +919,31 @@ def main():
     training_fig = plot_training_curves(
         training_history['train_losses'],
         training_history['val_losses'],
-        title="Advanced Hybrid LSTM Training Progress"
+        title="Advanced Hybrid LSTM Training Progress (Walk-Forward)"
     )
-    training_path = CONFIG['results_dir'] / 'training_curves.html'
+    training_path = CONFIG['results_dir'] / 'training_curves_walkforward.html'
     training_fig.write_html(training_path)
     
     # 2. Performance comparison plot
     from ML.directional_models.train_unified_lstm_model import plot_metrics
     metrics_fig = plot_metrics(metrics)
-    metrics_fig.update_layout(title="Advanced Hybrid LSTM Performance")
-    metrics_path = CONFIG['results_dir'] / 'performance_metrics.html'
+    metrics_fig.update_layout(title="Advanced Hybrid LSTM Performance (Walk-Forward)")
+    metrics_path = CONFIG['results_dir'] / 'performance_metrics_walkforward.html'
     metrics_fig.write_html(metrics_path)
     
     # 3. Save metrics JSON
-    metrics_json_path = CONFIG['results_dir'] / 'metrics.json'
+    metrics_json_path = CONFIG['results_dir'] / 'metrics_walkforward.json'
     with open(metrics_json_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     
-    # Clean up
-    if os.path.exists('best_advanced_model.pth'):
-        os.remove('best_advanced_model.pth')
+    # Clean up temporary files
+    import shutil
+    shutil.rmtree(temp_dir)
+    print("Cleaned up temporary split files")
     
     print(f"\nResults saved to: {CONFIG['results_dir']}")
-    print("\n✅ Advanced Hybrid LSTM training complete!")
+    print("\n✅ Advanced Hybrid LSTM training complete with walk-forward validation!")
+    print(f"   More realistic metrics due to temporal validation")
     
     return model, metrics
 

@@ -85,56 +85,70 @@ class AdvancedFeatureEngineer:
             return self._empty_feature_report(token_name, f"Error: {str(e)}")
     
     def _calculate_log_returns(self, df: pl.DataFrame) -> Dict:
-        """Calculate log-returns and basic price statistics using pure Polars"""
+        """Calculate log returns and SAFE statistical features (NO GLOBAL FEATURES)"""
         
-        # Calculate log-returns using Polars - CRITICAL ROADMAP REQUIREMENT
         price_col = 'close' if 'close' in df.columns else 'price'
         
-        # Calculate log-returns with Polars
-        df_with_returns = df.with_columns([
-            (pl.col(price_col).log() - pl.col(price_col).shift(1).log()).alias('log_returns')
-        ])
+        if len(df) < 10:
+            return {
+                'log_returns': np.array([]),
+                'cumulative_log_returns': np.array([]),
+                'price_stats': {}
+            }
         
-        # Extract log-returns and remove NaN values using Polars
-        log_returns_series = df_with_returns['log_returns'].drop_nulls()
-        log_returns_clean = log_returns_series.to_numpy()
-        
-        # Calculate cumulative log-returns
-        cumulative_log_returns = np.cumsum(log_returns_clean)
-        
-        # Basic price statistics using Polars
-        price_stats_polars = df.select([
-            pl.col(price_col).first().alias('first_price'),
-            pl.col(price_col).last().alias('last_price'),
-            pl.col(price_col).max().alias('max_price'),
-            pl.col(price_col).min().alias('min_price')
-        ]).row(0)
-        
-        first_price, last_price, max_price, min_price = price_stats_polars
-        
-        # Calculate returns using Polars aggregations
-        log_return_stats = df_with_returns.select([
-            pl.col('log_returns').mean().alias('mean'),
-            pl.col('log_returns').std().alias('std')
-        ]).row(0)
-        
-        log_return_mean, log_return_std = log_return_stats
-        
-        price_stats = {
-            'total_return_pct': ((last_price - first_price) / first_price) * 100,
-            'max_gain_pct': ((max_price - first_price) / first_price) * 100,
-            'max_drawdown_pct': ((min_price - max_price) / max_price) * 100,
-            'price_range_pct': ((max_price - min_price) / first_price) * 100,
-            'log_return_mean': log_return_mean or 0,
-            'log_return_std': log_return_std or 0,
-            'log_return_sharpe': (log_return_mean / log_return_std) if log_return_std and log_return_std > 0 else 0
-        }
-        
-        return {
-            'log_returns': log_returns_clean,
-            'cumulative_log_returns': cumulative_log_returns,
-            'price_stats': price_stats
-        }
+        try:
+            # Calculate log returns
+            prices = df[price_col].to_numpy()
+            log_returns = np.diff(np.log(prices))
+            cumulative_log_returns = np.cumsum(log_returns)
+            
+            # Clean the returns
+            log_returns_clean = log_returns[~np.isnan(log_returns)]
+            
+            # Basic statistics (safe)
+            if len(log_returns_clean) > 0:
+                log_return_stats = (np.mean(log_returns_clean), np.std(log_returns_clean))
+            else:
+                log_return_stats = (0, 0)
+                
+            log_return_mean, log_return_std = log_return_stats
+            
+            # REMOVED: Global price statistics that cause data leakage
+            # OLD CODE (DANGEROUS):
+            # price_stats = {
+            #     'total_return_pct': ((last_price - first_price) / first_price) * 100,    # 🚨 USES FINAL PRICE!
+            #     'max_gain_pct': ((max_price - first_price) / first_price) * 100,         # 🚨 USES MAX PRICE EVER!
+            #     'max_drawdown_pct': ((min_price - max_price) / max_price) * 100,         # 🚨 USES GLOBAL MIN/MAX!
+            # }
+            
+            # NEW CODE (SAFE): Only use statistics based on returns, not global price stats
+            price_stats = {
+                # Safe statistics based on returns distribution
+                'log_return_mean': log_return_mean or 0,
+                'log_return_std': log_return_std or 0,
+                'log_return_sharpe': (log_return_mean / log_return_std) if log_return_std and log_return_std > 0 else 0,
+                
+                # Safe statistics (current values only)
+                'current_price': float(prices[-1]) if len(prices) > 0 else 0,
+                'price_change_last_10': float((prices[-1] / prices[-10] - 1) * 100) if len(prices) >= 10 else 0,
+                'volatility_recent': float(log_return_std) if log_return_std else 0,
+                
+                # Safe note for debugging
+                'note': 'safe_features_only_no_global_stats'
+            }
+            
+            return {
+                'log_returns': log_returns_clean,
+                'cumulative_log_returns': cumulative_log_returns,
+                'price_stats': price_stats
+            }
+            
+        except Exception as e:
+            return {
+                'log_returns': np.array([]),
+                'cumulative_log_returns': np.array([]),
+                'price_stats': {'error': str(e)}
+            }
     
     def _calculate_advanced_technical_indicators(self, df: pl.DataFrame) -> Dict:
         """Calculate advanced technical indicators using pure Polars"""
@@ -825,7 +839,9 @@ def save_features_to_files(features_dict: Dict[str, Dict],
                     # Save ML-safe features
                     safe_features_df = pl.DataFrame(ml_safe_features)
                     output_path = category_dir / f"{token_name}_features.parquet"
-                    safe_features_df.write_parquet(output_path)
+                    safe_features_df.write_parquet(output_path,
+                                                   compression="zstd", 
+                                                   compression_level=3)
                     saved_count += 1
                 
         except Exception as e:
@@ -1198,7 +1214,9 @@ def main(fast_mode: bool = False):
                 category_dir = output_dir / category
                 category_dir.mkdir(parents=True, exist_ok=True)
                 out_path = category_dir / f"{token_name}.parquet"
-                rolling_df.write_parquet(out_path)
+                rolling_df.write_parquet(out_path,
+                                         compression="zstd", 
+                                         compression_level=3)
                 saved += 1
                 category_counts[category] = category_counts.get(category, 0) + 1
             except Exception as e:
@@ -1245,7 +1263,8 @@ def main(fast_mode: bool = False):
                 category_dir = output_dir / category
                 category_dir.mkdir(parents=True, exist_ok=True)
                 out_path = category_dir / f"{token_name}.parquet"
-                rolling_df.write_parquet(out_path)
+                rolling_df.write_parquet(out_path, compression="zstd", 
+                                         compression_level=3)
                 saved += 1
                 category_counts[category] = category_counts.get(category, 0) + 1
             except Exception as e:

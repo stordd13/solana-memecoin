@@ -31,8 +31,8 @@ from ML.utils.training_plots import plot_training_curves, create_learning_summar
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
-    'features_dir': Path("data/features"),  # Pre-engineered features directory
+    'base_dir': Path("data/features_with_targets"),  # CHANGED: Read from features_with_targets dir
+    'features_dir': Path("data/features_with_targets"),  # Pre-engineered features with targets directory
     'results_dir': Path("ML/results/unified_lstm"),
     'categories': [
         "normal_behavior_tokens",      # Highest quality for training
@@ -42,67 +42,20 @@ CONFIG = {
     ],
     'sequence_length': 60,  # 1 hour lookback
     'horizons': [15, 30, 60, 120, 240, 360, 720],  # All prediction horizons
-    'batch_size': 128,
+    'batch_size': 16,
     'epochs': 50,
     'learning_rate': 0.001,
     'random_state': 42,
     'early_stopping_patience': 10,
     'val_size': 0.2,
     'test_size': 0.2,
-    'hidden_size': 32,   # Larger due to more horizons
-    'num_layers': 2,     # Deeper network
+    'hidden_size': 16,   # Larger due to more horizons
+    'num_layers': 1,     # Deeper network
     'dropout': 0.2,
     'focal_alpha': 0.25,
     'focal_gamma': 2.0,
     # Note: deduplicate_tokens removed - handled upstream in data_analysis
 }
-
-def smart_data_split(all_paths: List[Path]) -> Tuple[List[Path], List[Path], List[Path]]:
-    """Split data intelligently with stratification by category"""
-    print("\nAnalyzing data distribution...")
-    
-    # Note: Token deduplication is now handled upstream in data_analysis
-    # Each token should appear in exactly one category folder
-    
-    # Group paths by category
-    category_paths = {}
-    for path in all_paths:
-        category = path.parent.name
-        if category not in category_paths:
-            category_paths[category] = []
-        category_paths[category].append(path)
-    
-    # Display distribution
-    print("\nFiles per category:")
-    for cat, paths in category_paths.items():
-        print(f"  {cat}: {len(paths)} files")
-    
-    # Stratified split by category
-    train_paths, val_paths, test_paths = [], [], []
-    
-    for category, paths in category_paths.items():
-        np.random.shuffle(paths)
-        n = len(paths)
-        n_train = int(n * 0.7)
-        n_val = int(n * 0.15)
-        
-        train_paths.extend(paths[:n_train])
-        val_paths.extend(paths[n_train:n_train + n_val])
-        test_paths.extend(paths[n_train + n_val:])
-        
-        print(f"\n{category}:")
-        print(f"  Train: {n_train}, Val: {n_val}, Test: {n - n_train - n_val}")
-    
-    np.random.shuffle(train_paths)
-    np.random.shuffle(val_paths)
-    np.random.shuffle(test_paths)
-    
-    print(f"\nTotal split:")
-    print(f"  Train: {len(train_paths)} files")
-    print(f"  Val: {len(val_paths)} files")
-    print(f"  Test: {len(test_paths)} files")
-    
-    return train_paths, val_paths, test_paths
 
 # --- Dataset Class with Pre-Engineered Features ---
 class UnifiedDirectionalDataset(Dataset):
@@ -118,6 +71,7 @@ class UnifiedDirectionalDataset(Dataset):
         
         self.sequences = []
         self.labels = []
+        self.returns = []
         self.token_scalers = {}  # Per-token scalers for features
         
         self._load_data(data_paths)
@@ -132,7 +86,8 @@ class UnifiedDirectionalDataset(Dataset):
         for path in tqdm(data_paths, desc="1/2 Validating feature files"):
             try:
                 token_name = path.stem
-                features_path = CONFIG['features_dir'] / f"{token_name}_features.parquet"
+                # Features are now organized by category - path already points to the correct file
+                features_path = path
                 
                 if not features_path.exists():
                     continue
@@ -190,39 +145,40 @@ class UnifiedDirectionalDataset(Dataset):
         if len(self.sequences) > 0:
             self.sequences = torch.FloatTensor(self.sequences)
             self.labels = torch.FloatTensor(self.labels)
+            self.returns = torch.FloatTensor(self.returns)
         else:
             print("WARNING: No feature sequences were created! Check feature engineering output.")
     
     def _create_sequences(self, feature_matrix: np.ndarray, prices: np.ndarray, token_id: str, winsorizer: Winsorizer):
-        """Create sequences from pre-engineered features."""
+        """Create sequences from normalized features with proper handling of NaN values"""
+        
+        # Apply winsorization to features
         features_norm = winsorizer.transform(feature_matrix)
         
-        # Create overlapping sequences
-        max_horizon = max(self.horizons)
-        for i in range(len(features_norm) - self.sequence_length - max_horizon + 1):
-            # Use sequence of features instead of raw prices
-            seq = features_norm[i:i + self.sequence_length]
+        for i in range(self.sequence_length, len(features_norm)):
+            # Extract sequence
+            seq = features_norm[i-self.sequence_length:i]
             
-            # Skip if too many NaNs in inputs
-            nan_ratio = np.isnan(seq).sum() / seq.size
-            if nan_ratio > 0.1:
-                continue
-
-            current_price = prices[i + self.sequence_length - 1]
+            # Check if we have valid prices for all required horizons
+            valid_sequence = True
+            horizon_labels = []
+            horizon_returns = []
+            
+            current_price = prices[i]
             if np.isnan(current_price):
                 continue
                 
-            horizon_labels = []
-            valid_sequence = True
             for h in self.horizons:
-                future_idx = i + self.sequence_length + h - 1
-                if future_idx < len(prices):
-                    future_price = prices[future_idx]
-                    if np.isnan(future_price):
+                if i + h < len(prices):
+                    future_price = prices[i + h]
+                    if not np.isnan(future_price):
+                        label = 1.0 if future_price > current_price else 0.0
+                        horizon_labels.append(label)
+                        # Calculate return for financial metrics
+                        horizon_returns.append((future_price - current_price) / current_price)
+                    else:
                         valid_sequence = False
                         break
-                    label = 1.0 if future_price > current_price else 0.0
-                    horizon_labels.append(label)
                 else:
                     valid_sequence = False
                     break
@@ -240,12 +196,13 @@ class UnifiedDirectionalDataset(Dataset):
 
             self.sequences.append(seq)
             self.labels.append(horizon_labels)
+            self.returns.append(horizon_returns)
             
     def __len__(self):
         return len(self.sequences)
     
     def __getitem__(self, idx):
-        return self.sequences[idx], self.labels[idx]
+        return self.sequences[idx], self.labels[idx], self.returns[idx]
 
 
 # --- Unified Model Architecture ---
@@ -268,17 +225,22 @@ class UnifiedLSTMPredictor(nn.Module):
             batch_first=True
         )
         
-        # Shared feature extractor
+        # Add batch normalization after LSTM
+        self.lstm_bn = nn.BatchNorm1d(hidden_size)
+        
+        # Shared feature extractor with batch normalization
         self.feature_extractor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
         
-        # Create a separate output head for each prediction horizon
+        # Create a separate output head for each prediction horizon with batch norm
         self.output_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_size, hidden_size // 2),
+                nn.BatchNorm1d(hidden_size // 2),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_size // 2, 1)
@@ -289,6 +251,9 @@ class UnifiedLSTMPredictor(nn.Module):
         # x is already feature sequences, not raw prices
         lstm_out, _ = self.lstm(x)
         last_hidden = lstm_out[:, -1, :]
+        
+        # Apply batch normalization to LSTM output
+        last_hidden = self.lstm_bn(last_hidden)
         
         # Extract shared features
         features = self.feature_extractor(last_hidden)
@@ -351,8 +316,8 @@ def train_model(model, train_loader, val_loader, config):
         # Add progress bar for training batches
         from tqdm import tqdm
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']} - Training")
-        for batch_x, batch_y in train_pbar:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        for batch_x, batch_y, batch_r in train_pbar:
+            batch_x, batch_y, batch_r = batch_x.to(device), batch_y.to(device), batch_r.to(device)
             optimizer.zero_grad()
             outputs = model(batch_x)
             loss = criterion(outputs, batch_y)
@@ -371,8 +336,8 @@ def train_model(model, train_loader, val_loader, config):
         val_loss = 0
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['epochs']} - Validation", leave=False)
-            for batch_x, batch_y in val_pbar:
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            for batch_x, batch_y, batch_r in val_pbar:
+                batch_x, batch_y, batch_r = batch_x.to(device), batch_y.to(device), batch_r.to(device)
                 outputs = model(batch_x)
                 loss = criterion(outputs, batch_y)
                 val_loss += loss.item()
@@ -404,46 +369,48 @@ def train_model(model, train_loader, val_loader, config):
     
     return model, training_history
 
-def evaluate_model(model, test_loader, horizons):
-    """Evaluate using classification metrics for each horizon."""
-    # Use MPS (Apple Silicon GPU) if available, then CUDA, then CPU
-    if torch.backends.mps.is_available():
-        device = 'mps'
-    elif torch.cuda.is_available():
-        device = 'cuda'
-    else:
+def evaluate_model(model, test_loader, horizons, device='cpu'):
+    """Evaluate the model on the test set with both standard and financial metrics."""
+    from ML.utils.metrics_helpers import financial_classification_metrics
+    
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    elif device == 'cuda' and not torch.cuda.is_available():
+        print("WARNING: CUDA requested but not available. Using CPU.")
         device = 'cpu'
     model.eval()
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_returns = [], [], []
     with torch.no_grad():
         test_pbar = tqdm(test_loader, desc="Evaluating on test set")
-        for batch_x, batch_y in test_pbar:
+        for batch_x, batch_y, batch_r in test_pbar:
             batch_x = batch_x.to(device)
             predictions = model(batch_x)
             all_preds.append(predictions.cpu().numpy())
             all_targets.append(batch_y.numpy())
+            all_returns.append(batch_r.numpy())
             
     predictions = np.vstack(all_preds)
     targets = np.vstack(all_targets)
+    returns = np.vstack(all_returns)
     
     metrics = {}
     for i, h in enumerate(horizons):
         preds_h = predictions[:, i]
         targets_h = targets[:, i]
-        binary_preds_h = (preds_h > 0.5).astype(int)
+        returns_h = returns[:, i]
+        binary_preds_h = (preds_h >= 0.5).astype(int)
         
-        if h >= 60:
-            horizon_name = f'{h//60}h'
-        else:
-            horizon_name = f'{h}m'
+        # Get comprehensive financial metrics
+        horizon_metrics = financial_classification_metrics(
+            y_true=targets_h,
+            y_pred=binary_preds_h,
+            returns=returns_h,
+            y_prob=preds_h
+        )
         
-        metrics[horizon_name] = {
-            'accuracy': accuracy_score(targets_h, binary_preds_h),
-            'precision': precision_score(targets_h, binary_preds_h, zero_division=0),
-            'recall': recall_score(targets_h, binary_preds_h, zero_division=0),
-            'f1_score': f1_score(targets_h, binary_preds_h, zero_division=0),
-            'roc_auc': roc_auc_score(targets_h, preds_h)
-        }
+        # Add horizon prefix to all metrics
+        metrics[f"{h}min"] = {f"{h}min_{k}": v for k, v in horizon_metrics.items()}
+        
     return metrics
 
 def plot_metrics(metrics: Dict):
@@ -508,6 +475,7 @@ def main():
     print("Training Unified LSTM Directional Model")
     print("USING PRE-ENGINEERED FEATURES")
     print("All Horizons: 15min, 30min, 1h, 2h, 4h, 6h, 12h")
+    print("WITH WALK-FORWARD VALIDATION")
     print("="*50)
     
     # Check if feature engineering has been run
@@ -533,25 +501,137 @@ def main():
         print(f"ERROR: No files found in {CONFIG['base_dir']}. Exiting.")
         return
 
-    train_paths, val_paths, test_paths = smart_data_split(all_paths)
+    # Import walk-forward splitter
+    from ML.utils.walk_forward_splitter import WalkForwardSplitter
     
-    # Create datasets
-    print("\nCreating datasets with pre-engineered features...")
+    print("\n🔄 Using Walk-Forward Validation instead of temporal split")
+    
+    # For LSTM, we'll use per-token walk-forward validation
+    # Load all data first to prepare for walk-forward splitting
+    print("\n📊 Loading all feature data for walk-forward validation...")
+    
+    all_data_frames = []
+    for path in tqdm(all_paths, desc="Loading feature files"):
+        try:
+            df = pl.read_parquet(path)
+            if len(df) < 400:  # Minimum token length
+                continue
+            
+            # Add token identifier
+            df = df.with_columns(pl.lit(path.stem).alias('token_id'))
+            all_data_frames.append(df)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
+    
+    if not all_data_frames:
+        print("ERROR: No valid feature files found!")
+        return
+    
+    # Combine all data
+    combined_data = pl.concat(all_data_frames)
+    print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
+    
+    # Setup walk-forward splitter
+    splitter = WalkForwardSplitter(
+        config='medium',  # Good for 400-2000 minute tokens
+        horizon_buffer=720  # 12 hours buffer for longest horizon
+    )
+    
+    # Split by token (per-token walk-forward)
+    print("\n🔀 Creating per-token walk-forward splits...")
+    token_splits = splitter.split_by_token(
+        combined_data, 
+        token_column='token_id',
+        time_column='datetime',  # Assuming datetime column exists
+        min_token_length=400
+    )
+    
+    print(f"Created walk-forward splits for {len(token_splits)} tokens")
+    
+    # Collect all folds for training
+    all_train_data = []
+    all_val_data = []  
+    all_test_data = []
+    
+    # Use first N-1 folds for training/validation, last fold for testing
+    print("📊 Processing token folds for train/val/test splits...")
+    for token_id, folds in tqdm(token_splits.items(), desc="Processing token folds"):
+        if len(folds) < 2:
+            continue  # Need at least 2 folds
+            
+        # Use last fold as test, split remaining into train/val
+        *train_val_folds, test_fold = folds
+        test_train_df, test_test_df = test_fold
+        all_test_data.append(test_test_df)
+        
+        # Split train_val_folds into train and validation
+        n_train_folds = max(1, int(len(train_val_folds) * 0.8))
+        
+        for i, (fold_train_df, fold_test_df) in enumerate(train_val_folds):
+            if i < n_train_folds:
+                all_train_data.append(fold_test_df)  # Use 'test' part of fold for training
+            else:
+                all_val_data.append(fold_test_df)    # Use for validation
+    
+    print(f"\n📈 Walk-forward data split:")
+    print(f"  Train folds: {len(all_train_data)} DataFrames")
+    print(f"  Val folds: {len(all_val_data)} DataFrames")  
+    print(f"  Test folds: {len(all_test_data)} DataFrames")
+    
+    # Create datasets from walk-forward splits
+    print("\nCreating datasets with walk-forward splits...")
+    
+    # Convert DataFrames back to paths for compatibility with existing dataset code
+    # Save temporary files for each split
+    temp_dir = CONFIG['results_dir'] / 'temp_splits'
+    temp_dir.mkdir(exist_ok=True)
+    
+    train_paths = []
+    val_paths = []
+    test_paths = []
+    
+    # Save train splits
+    print("💾 Saving train splits...")
+    for i, df in enumerate(tqdm(all_train_data, desc="Saving train folds")):
+        temp_path = temp_dir / f'train_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        train_paths.append(temp_path)
+    
+    # Save val splits
+    print("💾 Saving validation splits...")
+    for i, df in enumerate(tqdm(all_val_data, desc="Saving val folds")):
+        temp_path = temp_dir / f'val_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        val_paths.append(temp_path)
+        
+    # Save test splits
+    print("💾 Saving test splits...")
+    for i, df in enumerate(tqdm(all_test_data, desc="Saving test folds")):
+        temp_path = temp_dir / f'test_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        test_paths.append(temp_path)
+    
+    # Create datasets using the saved splits
+    print("🔄 Creating training dataset from walk-forward splits...")
     train_dataset = UnifiedDirectionalDataset(train_paths, CONFIG['sequence_length'], CONFIG['horizons'])
     if len(train_dataset) == 0:
         print("ERROR: Training dataset is empty. Check feature engineering output.")
         return
 
+    print("🔄 Creating validation dataset...")
     val_dataset = UnifiedDirectionalDataset(val_paths, CONFIG['sequence_length'], CONFIG['horizons'])
+    
+    print("🔄 Creating test dataset...")
     test_dataset = UnifiedDirectionalDataset(test_paths, CONFIG['sequence_length'], CONFIG['horizons'])
     
-    print(f"\n📊 Dataset sizes:")
+    print(f"\n📊 Dataset sizes (walk-forward):")
     print(f"  Training: {len(train_dataset):,} sequences")
     print(f"  Validation: {len(val_dataset):,} sequences") 
     print(f"  Test: {len(test_dataset):,} sequences")
     
     # Determine input size from first batch
-    sample_sequence, _ = train_dataset[0]
+    sample_sequence, _, _ = train_dataset[0]
     input_size = sample_sequence.shape[1]  # Number of features per timestep
     print(f"Using {input_size} features per timestep for LSTM input")
     
@@ -572,30 +652,32 @@ def main():
     model, training_history = train_model(model, train_loader, val_loader, CONFIG)
     
     # Evaluate
-    print("\nEvaluating on test set...")
+    print("\nEvaluating on test set (walk-forward)...")
     metrics = evaluate_model(model, test_loader, CONFIG['horizons'])
     
-    print("\nTest Set Metrics:")
+    print("\nTest Set Metrics (Walk-Forward Validation):")
     for horizon, m in metrics.items():
         print(f"  Horizon {horizon}:")
         for name, val in m.items():
             print(f"    {name.title()}: {val:.2%}")
 
     # Save model and results
-    model_path = CONFIG['results_dir'] / 'unified_lstm_model.pth'
+    model_path = CONFIG['results_dir'] / 'unified_lstm_model_walkforward.pth'
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': CONFIG,
         'token_scalers': train_dataset.token_scalers,
         'metrics': metrics,
         'input_size': input_size,
-        'training_history': training_history
+        'training_history': training_history,
+        'validation_method': 'walk_forward'
     }, model_path)
     print(f"\nModel saved to: {model_path}")
     
     # Create and save performance metrics plot
     fig = plot_metrics(metrics)
-    metrics_path = CONFIG['results_dir'] / 'unified_lstm_metrics.html'
+    fig.update_layout(title="Unified LSTM Performance (Walk-Forward Validation)")
+    metrics_path = CONFIG['results_dir'] / 'unified_lstm_metrics_walkforward.html'
     fig.write_html(metrics_path)
     print(f"Metrics plot saved to: {metrics_path}")
     
@@ -603,17 +685,26 @@ def main():
     training_fig = plot_training_curves(
         training_history['train_losses'],
         training_history['val_losses'],
-        title="Unified LSTM Training Progress"
+        title="Unified LSTM Training Progress (Walk-Forward)"
     )
-    training_path = CONFIG['results_dir'] / 'training_curves.html'
+    training_path = CONFIG['results_dir'] / 'training_curves_walkforward.html'
     training_fig.write_html(training_path)
     print(f"Training curves saved to: {training_path}")
     
     # Save metrics as JSON for easy analysis
-    metrics_json_path = CONFIG['results_dir'] / 'metrics.json'
+    metrics_json_path = CONFIG['results_dir'] / 'metrics_walkforward.json'
     with open(metrics_json_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"Metrics JSON saved to: {metrics_json_path}")
+    
+    # Clean up temporary files
+    import shutil
+    shutil.rmtree(temp_dir)
+    print("Cleaned up temporary split files")
+    
+    print(f"\n✅ Walk-forward validation training complete!")
+    print(f"   More realistic metrics due to temporal validation")
+    print(f"   Results saved to: {CONFIG['results_dir']}")
 
 # --- Data Preparation ---
 def prepare_data_fixed(data_paths: List[Path], 
@@ -637,9 +728,9 @@ def prepare_data_fixed(data_paths: List[Path],
             # which is the actual feature file - no need to reconstruct the path
             token_name = path.stem
             
-            # Since we're already reading from features dir, just load directly
+            # Since we're already reading from features_with_targets dir, just load directly
             if path.exists() and path.suffix == '.parquet':
-                features_df = load_features_from_file(path)
+                features_df = pl.read_parquet(path)
             else:
                 print(f"Feature file not found: {path}")
                 continue
@@ -647,8 +738,7 @@ def prepare_data_fixed(data_paths: List[Path],
             if features_df is None or len(features_df) == 0:
                 continue
             
-            # Create directional labels
-            features_df = create_labels_for_horizons(features_df, horizons)
+            # Labels are already created in pipeline - no need to create them again
             
             # CRITICAL FIX: Split FIRST, then create sequences
             n_rows = len(features_df) if hasattr(features_df, '__len__') else features_df.height

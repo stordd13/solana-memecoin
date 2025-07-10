@@ -19,6 +19,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from data_analysis.export_utils import export_parquet_files
 from data_analysis.price_analysis import PriceAnalyzer
+from streamlit_utils.formatting import format_large_number, format_percentage, format_data_points
 
 logger = logging.getLogger(__name__)
 
@@ -193,11 +194,11 @@ class DataQualityAnalyzer:
             price_stats = pa._calculate_price_stats(df)
             volatility_metrics = pa._calculate_volatility_metrics(df)
             total_return = price_stats['total_return']
-            price_range = (price_stats['max_price'] - price_stats['min_price']) / price_stats['min_price'] if price_stats['min_price'] else 0
+            price_range = (price_stats['max_price'] - price_stats['min_price']) / price_stats['min_price'] if price_stats.get('min_price') and price_stats['min_price'] > 0 else 0
             avg_volatility = volatility_metrics['avg_volatility']
             # Extreme if > 100x (10,000%)
             has_extreme_volatility = avg_volatility > 100
-            has_extreme_return = abs(total_return) > 100
+            has_extreme_return = abs(total_return) > 1000
             has_extreme_range = price_range > 100
             # ---
             
@@ -838,7 +839,7 @@ class DataQualityAnalyzer:
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
-                st.metric("Total Tokens", len(quality_reports))
+                st.metric("Total Tokens", format_large_number(len(quality_reports)))
                 st.metric("Average Quality Score", f"{quality_df['quality_score'].mean():.1f}")
             
             with col2:

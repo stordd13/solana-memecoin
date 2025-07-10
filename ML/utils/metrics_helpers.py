@@ -42,6 +42,26 @@ def financial_classification_metrics(y_true, y_pred, returns, y_prob=None):
     y_pred = np.array(y_pred)
     returns = np.array(returns)
     
+    # ADDED: Winsorize returns to handle extreme memecoin gains/losses
+    # Cap at 0.5% and 99.5% percentiles to remove outliers
+    if len(returns) > 0:
+        lower_bound = np.percentile(returns, 0.5)
+        upper_bound = np.percentile(returns, 99.5)
+        returns_winsorized = np.clip(returns, lower_bound, upper_bound)
+        
+        # Store both for comparison
+        metrics['returns_winsorized_applied'] = True
+        metrics['returns_raw_min'] = float(np.min(returns))
+        metrics['returns_raw_max'] = float(np.max(returns))
+        metrics['returns_winsorized_min'] = float(np.min(returns_winsorized))
+        metrics['returns_winsorized_max'] = float(np.max(returns_winsorized))
+    else:
+        returns_winsorized = returns
+        metrics['returns_winsorized_applied'] = False
+    
+    # Use winsorized returns for financial calculations
+    returns = returns_winsorized
+    
     # Financial-weighted metrics
     try:
         # Calculate return-weighted recall
@@ -159,4 +179,144 @@ def regression_metrics(y_true, y_pred):
         'mse': mse,
         'rmse': np.sqrt(mse),
         'r2': r2_score(y_true, y_pred)
-    } 
+    }
+
+
+def calculate_classification_metrics(y_true, y_pred, y_proba=None):
+    """
+    Calculate classification metrics with mathematical validation.
+    
+    Args:
+        y_true: True binary labels
+        y_pred: Predicted binary labels  
+        y_proba: Prediction probabilities (optional)
+        
+    Returns:
+        Dictionary with classification metrics and confusion matrix
+    """
+    # Calculate confusion matrix components
+    tp = np.sum((y_true == 1) & (y_pred == 1))
+    tn = np.sum((y_true == 0) & (y_pred == 0))
+    fp = np.sum((y_true == 0) & (y_pred == 1))
+    fn = np.sum((y_true == 1) & (y_pred == 0))
+    
+    # Calculate metrics using exact formulas
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'confusion_matrix': {
+            'true_positive': tp,
+            'true_negative': tn,
+            'false_positive': fp,
+            'false_negative': fn
+        }
+    }
+    
+    # Add ROC AUC if probabilities provided
+    if y_proba is not None:
+        try:
+            metrics['roc_auc'] = roc_auc_score(y_true, y_proba)
+        except ValueError:
+            metrics['roc_auc'] = 0.5  # Default for edge cases
+    
+    return metrics
+
+
+def calculate_financial_metrics(returns, risk_free_rate=0.02):
+    """
+    Calculate financial performance metrics with mathematical validation.
+    
+    Args:
+        returns: Array of returns
+        risk_free_rate: Annual risk-free rate (default 2%)
+        
+    Returns:
+        Dictionary with financial metrics
+    """
+    returns = np.array(returns)
+    
+    if len(returns) == 0:
+        return {
+            'mean_return': 0,
+            'volatility': 0,
+            'sharpe_ratio': 0,
+            'sortino_ratio': 0,
+            'max_drawdown': 0,
+            'calmar_ratio': 0
+        }
+    
+    # Basic statistics
+    mean_return = np.mean(returns)
+    volatility = np.std(returns, ddof=1)
+    
+    # Risk-adjusted metrics
+    daily_rf_rate = risk_free_rate / 252  # Convert annual to daily
+    excess_returns = returns - daily_rf_rate
+    mean_excess_return = np.mean(excess_returns)
+    
+    # Sharpe ratio
+    sharpe_ratio = mean_excess_return / volatility if volatility > 0 else 0
+    
+    # Sortino ratio (downside deviation)
+    downside_returns = returns[returns < 0]
+    if len(downside_returns) > 1:
+        downside_deviation = np.std(downside_returns, ddof=1)
+    else:
+        downside_deviation = volatility
+    
+    sortino_ratio = mean_excess_return / downside_deviation if downside_deviation > 0 else 0
+    
+    # Maximum drawdown
+    cumulative_returns = np.cumprod(1 + returns)
+    peak = np.maximum.accumulate(cumulative_returns)
+    drawdown = (cumulative_returns - peak) / peak
+    max_drawdown = np.min(drawdown)
+    
+    # Calmar ratio
+    annualized_return = mean_return * 252
+    calmar_ratio = annualized_return / abs(max_drawdown) if max_drawdown != 0 else 0
+    
+    return {
+        'mean_return': mean_return,
+        'volatility': volatility,
+        'sharpe_ratio': sharpe_ratio,
+        'sortino_ratio': sortino_ratio,
+        'max_drawdown': max_drawdown,
+        'calmar_ratio': calmar_ratio
+    }
+
+
+def calculate_regression_metrics(y_true, y_pred):
+    """
+    Calculate regression metrics with mathematical validation.
+    
+    Args:
+        y_true: True values
+        y_pred: Predicted values
+        
+    Returns:
+        Dictionary with regression metrics
+    """
+    # Calculate metrics using exact formulas
+    mae = np.mean(np.abs(y_true - y_pred))
+    mse = np.mean((y_true - y_pred) ** 2)
+    rmse = np.sqrt(mse)
+    
+    # R² calculation
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    
+    return {
+        'mae': mae,
+        'mse': mse,
+        'rmse': rmse,
+        'r2': r2
+    }

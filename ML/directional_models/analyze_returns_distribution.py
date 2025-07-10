@@ -3,6 +3,7 @@ Quick Analysis: Positive vs Negative Returns Distribution
 Analyzes how many tokens have positive/negative returns over different time horizons
 """
 
+import os
 import polars as pl
 import numpy as np
 from pathlib import Path
@@ -14,7 +15,13 @@ def analyze_returns_distribution():
     """Analyze positive vs negative returns across all tokens"""
     
     # Configuration
-    base_dir = Path("data/cleaned")
+    # ---------------------------------------------------------------------------
+    # Base directory selection
+    # You can override with environment variable:
+    #     BASE_DIR=data/features python analyze_returns_distribution.py
+    # ---------------------------------------------------------------------------
+
+    base_dir = Path(os.environ.get("BASE_DIR", "data/cleaned"))
     categories = [
         "normal_behavior_tokens",
         "tokens_with_gaps", 
@@ -47,7 +54,9 @@ def analyze_returns_distribution():
         try:
             df = pl.read_parquet(file_path)
             
-            if 'price' not in df.columns or len(df) < max(horizons) + 10:
+            # Require a price column but do NOT impose a global length threshold.
+            # Length is now checked per-horizon further below.
+            if 'price' not in df.columns:
                 continue
             
             prices = df['price'].to_numpy()

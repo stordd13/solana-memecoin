@@ -14,15 +14,15 @@ class Winsorizer(BaseEstimator, TransformerMixin):
     
     Parameters
     ----------
-    lower_percentile : float, default=0.005
-        Lower percentile for capping (0.5%)
-    upper_percentile : float, default=0.995  
-        Upper percentile for capping (99.5%)
+    limits : tuple, default=(0.005, 0.995)
+        Lower and upper percentiles for capping (0.5%, 99.5%)
     """
     
-    def __init__(self, lower_percentile=0.005, upper_percentile=0.995):
-        self.lower_percentile = lower_percentile
-        self.upper_percentile = upper_percentile
+    def __init__(self, limits=(0.005, 0.995)):
+        self.limits = limits
+        # Backward compatibility
+        self.lower_percentile = limits[0] 
+        self.upper_percentile = limits[1]
         
     def fit(self, X, y=None):
         """Compute the percentile bounds for winsorization"""
@@ -32,18 +32,25 @@ class Winsorizer(BaseEstimator, TransformerMixin):
         self.lower_bounds_ = np.zeros(n_features)
         self.upper_bounds_ = np.zeros(n_features)
         
+        # Create limits_ attribute for compatibility with tests
+        self.limits_ = []
+        
         for i in range(n_features):
             col = X[:, i]
             # Handle NaN values
             finite_mask = np.isfinite(col)
             if finite_mask.sum() > 0:
                 finite_col = col[finite_mask]
-                self.lower_bounds_[i] = np.percentile(finite_col, self.lower_percentile * 100)
-                self.upper_bounds_[i] = np.percentile(finite_col, self.upper_percentile * 100)
+                lower_bound = np.percentile(finite_col, self.lower_percentile * 100)
+                upper_bound = np.percentile(finite_col, self.upper_percentile * 100)
+                self.lower_bounds_[i] = lower_bound
+                self.upper_bounds_[i] = upper_bound
+                self.limits_.append((lower_bound, upper_bound))
             else:
                 # If all NaN, set bounds to 0
                 self.lower_bounds_[i] = 0
                 self.upper_bounds_[i] = 0
+                self.limits_.append((0, 0))
                 
         return self
         

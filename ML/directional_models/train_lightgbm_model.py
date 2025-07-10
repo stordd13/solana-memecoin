@@ -16,12 +16,17 @@ IMPORTANT NOTES ON DATA LEAKAGE AND RESULTS:
 
 import polars as pl
 import lightgbm as lgb
+import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from pathlib import Path
 from typing import Dict, List, Tuple
 import plotly.graph_objects as go
 from tqdm import tqdm
 import joblib
+import optuna
+from optuna.samplers import TPESampler
+import warnings
+warnings.filterwarnings('ignore', category=optuna.exceptions.ExperimentalWarning)
 import json
 import sys
 
@@ -36,8 +41,8 @@ from ML.utils.metrics_helpers import financial_classification_metrics
 
 # --- Configuration ---
 CONFIG = {
-    'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
-    'features_dir': Path("data/features"),  # Pre-engineered features directory
+    'base_dir': Path("data/features_with_targets"),  # CHANGED: Read from features_with_targets dir
+    'features_dir': Path("data/features_with_targets"),  # Pre-engineered features with targets directory
     'results_dir': Path("ML/results/lightgbm_short_term"),
     'categories': [
         "normal_behavior_tokens",      # Highest quality for training
@@ -46,7 +51,7 @@ CONFIG = {
         # "tokens_with_gaps",          # EXCLUDED: Data quality issues
     ],
     'min_lookback': 3,   # Start predicting at minute 3
-    'horizons': [15, 30, 60],  # 15min, 30min, 1h - short-term trading
+    'horizons': [15, 30, 60, 120],  # 15min, 30min, 1h, 2h - short-term trading
     'n_estimators': 500,
     'random_state': 42,
     'test_size': 0.2,
@@ -178,19 +183,7 @@ def validate_features_safety(features_df: pl.DataFrame, token_name: str) -> bool
     return True
 
 
-def create_labels_for_horizons(df: pl.DataFrame, horizons: List[int]) -> pl.DataFrame:
-    """Create directional labels and returns for multiple horizons"""
-    if 'price' not in df.columns:
-        return df
-        
-    # Add labels and returns for each horizon
-    for h in horizons:
-        df = df.with_columns([
-            (pl.col('price').shift(-h) > pl.col('price')).alias(f'label_{h}m'),
-            ((pl.col('price').shift(-h) - pl.col('price')) / pl.col('price')).alias(f'return_{h}m')
-        ])
-    
-    return df
+# Labels are now created in pipeline - this function is no longer needed
 
 
 # --- Data Preparation ---
@@ -225,8 +218,7 @@ def prepare_data_fixed(data_paths: List[Path], horizons: List[int], split_type: 
                 print(f"⚠️  SKIPPING {token_name} due to unsafe features")
                 continue
             
-            # Create directional labels
-            features_df = create_labels_for_horizons(features_df, horizons)
+            # Labels are already created in pipeline - no need to create them again
             
             # CRITICAL FIX: Use EXPANDING WINDOW splits to preserve historical context
             # Handle both DataFrame and LazyFrame
@@ -335,23 +327,46 @@ def train_and_evaluate(train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl
     # Convert to pandas/numpy for scikit-learn API
     print("📊 Preparing data...")
     X_train = train_df[feature_cols].to_pandas()
-    y_train = train_df[label_col].to_pandas()
+    y_train_raw = train_df[label_col].to_pandas()
     
     # For validation: use all data for training, but only evaluate on validation period
     X_val_full = val_df[feature_cols].to_pandas()
-    y_val_full = val_df[label_col].to_pandas()
+    y_val_full_raw = val_df[label_col].to_pandas()
     
     # For test: use all data for training, but only evaluate on test period  
     X_test_full = test_df[feature_cols].to_pandas()
-    y_test_full = test_df[label_col].to_pandas()
+    y_test_full_raw = test_df[label_col].to_pandas()
     
-    # Extract returns data for financial metrics
-    returns_val_full = val_df[return_col].to_pandas()
-    returns_test_full = test_df[return_col].to_pandas()
+    # Handle NaN values BEFORE converting to int
+    train_valid_mask = ~y_train_raw.isna()
+    val_valid_mask = ~y_val_full_raw.isna()
+    test_valid_mask = ~y_test_full_raw.isna()
+    
+    if train_valid_mask.sum() == 0:
+        print(f"⚠️  ERROR: No valid labels for {horizon}m horizon in training data")
+        dummy_metrics = {
+            'validation': {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'roc_auc': 0.5},
+            'test': {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'roc_auc': 0.5}
+        }
+        return None, dummy_metrics
+    
+    # Now safely convert to int after filtering NaN values
+    y_train = y_train_raw[train_valid_mask].astype(int)
+    y_val_full = y_val_full_raw[val_valid_mask].astype(int)
+    y_test_full = y_test_full_raw[test_valid_mask].astype(int)
+    
+    # Also filter corresponding features
+    X_train = X_train[train_valid_mask]
+    X_val_full = X_val_full[val_valid_mask]
+    X_test_full = X_test_full[test_valid_mask]
+    
+    # Extract returns data for financial metrics (also filter for valid labels)
+    returns_val_full = val_df[return_col].to_pandas()[val_valid_mask]
+    returns_test_full = test_df[return_col].to_pandas()[test_valid_mask]
     
     # Extract evaluation masks for val/test
     if 'eval_sample' in val_df.columns:
-        val_eval_mask = val_df['eval_sample'].to_pandas().values
+        val_eval_mask = val_df['eval_sample'].to_pandas().values[val_valid_mask]
         X_val = X_val_full[val_eval_mask]
         y_val = y_val_full[val_eval_mask]
         returns_val = returns_val_full[val_eval_mask]
@@ -361,7 +376,7 @@ def train_and_evaluate(train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl
         returns_val = returns_val_full
         
     if 'eval_sample' in test_df.columns:
-        test_eval_mask = test_df['eval_sample'].to_pandas().values
+        test_eval_mask = test_df['eval_sample'].to_pandas().values[test_valid_mask]
         X_test = X_test_full[test_eval_mask]
         y_test = y_test_full[test_eval_mask]
         returns_test = returns_test_full[test_eval_mask]
@@ -402,10 +417,29 @@ def train_and_evaluate(train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl
     else:
         print(f"   Test:  No samples!")
 
-    # Check if we have enough data to train
+    # Check if we have enough data to train after removing NaN values
     if len(X_train) < 10 or len(X_val) < 10 or len(X_test) < 10:
-        print(f"⚠️  ERROR: Insufficient samples for {horizon}m horizon")
+        print(f"⚠️  ERROR: Insufficient samples for {horizon}m horizon after NaN removal")
         print(f"   Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+        print(f"   Skipping this horizon...")
+        
+        # Return dummy metrics
+        dummy_metrics = {
+            'validation': {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'roc_auc': 0.5,
+                          'confusion_matrix': {'true_negative': 0, 'false_positive': 0, 
+                                             'false_negative': 0, 'true_positive': 0}},
+            'test': {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'roc_auc': 0.5,
+                    'confusion_matrix': {'true_negative': 0, 'false_positive': 0,
+                                       'false_negative': 0, 'true_positive': 0}}
+        }
+        return None, dummy_metrics
+        
+    # Check that we have binary labels
+    if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2 or len(np.unique(y_test)) < 2:
+        print(f"⚠️  ERROR: Labels not binary for {horizon}m horizon")
+        print(f"   Train unique labels: {np.unique(y_train)}")
+        print(f"   Val unique labels: {np.unique(y_val)}")
+        print(f"   Test unique labels: {np.unique(y_test)}")
         print(f"   Skipping this horizon...")
         
         # Return dummy metrics
@@ -424,7 +458,7 @@ def train_and_evaluate(train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl
     print(f"📊 Validation set: {len(X_val):,} evaluation samples (with full historical context)")
     print(f"📊 Test set: {len(X_test):,} evaluation samples (with full historical context)")
     
-    model = lgb.LGBMClassifier(**params, verbose=-1)  # Suppress verbose output
+    model = lgb.LGBMClassifier(**params)
     model.fit(X_train, y_train,
               eval_set=[(X_val, y_val)],  # Use only evaluation samples for early stopping
               eval_metric='logloss',
@@ -612,97 +646,268 @@ def plot_confusion_matrices(metrics: Dict):
 
 # --- Main Pipeline ---
 def main():
-    """Main training pipeline for the short-term LightGBM model."""
-    print("="*50)
-    print("🛡️  Training Short-Term LightGBM Directional Model")
-    print("USING SAFE PRE-ENGINEERED FEATURES (NO DATA LEAKAGE)")
-    print("Horizons: 15min, 30min, 1h")
-    print("="*50)
+    """Main training pipeline for LightGBM directional model with walk-forward validation"""
     
-    # Check if feature engineering has been run
-    if not CONFIG['features_dir'].exists():
-        print(f"\n❌ ERROR: Features directory not found: {CONFIG['features_dir']}")
-        print("\n🔧 REQUIRED STEP: Run feature engineering first!")
-        print("   python feature_engineering/advanced_feature_engineering.py")
-        print("\nThis will create the pre-engineered features needed for training.")
-        return
+    print("="*60)
+    print("🔬 LightGBM Directional Prediction Training")
+    print("Multi-horizon: 15min, 30min, 1h, 2h, 4h, 6h, 12h")
+    print("WITH WALK-FORWARD VALIDATION")
+    print("="*60)
     
     # Create results directory
-    CONFIG['results_dir'].mkdir(parents=True, exist_ok=True)
-    print(f"Results will be saved to: {CONFIG['results_dir']}")
+    results_dir = Path("ML/results/lightgbm")
+    results_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load paths using the same stratified split logic
+    # Load data paths
+    base_dir = Path("data/features_with_targets")
+    categories = [
+        "normal_behavior_tokens",
+        "tokens_with_extremes", 
+        "dead_tokens",
+    ]
+    
     all_paths = []
-    for category in CONFIG['categories']:
-        cat_dir = CONFIG['base_dir'] / category
+    for category in categories:
+        cat_dir = base_dir / category
         if cat_dir.exists():
-            all_paths.extend(list(cat_dir.glob("*.parquet")))
+            paths = list(cat_dir.glob("*.parquet"))
+            all_paths.extend(paths)
+            print(f"Found {len(paths)} files in {category}")
     
     if not all_paths:
-        print(f"ERROR: No files found in {CONFIG['base_dir']}. Exiting.")
+        print("ERROR: No feature files found!")
         return
-
-    # Note: Token deduplication is now handled upstream in data_analysis
-    # Each token should appear in exactly one category folder
-
-    # FIXED: Use temporal splitting within tokens instead of random token splits
-    print("\n🔧 LOADING PRE-ENGINEERED FEATURES with temporal splitting")
     
-    # Use all paths for temporal splitting within each token
-    train_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'train')
-    val_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'val')
-    test_df = prepare_data_fixed(all_paths, CONFIG['horizons'], 'test')
-
-    if train_df.is_empty() or val_df.is_empty() or test_df.is_empty():
-        print("ERROR: One or more data splits are empty. Check feature engineering output.")
-        return
-
-    # Train a model for each horizon
-    all_metrics = {}
-    models = {}
+    print(f"\nTotal files: {len(all_paths)}")
     
-    print(f"\n🚀 Training {len(CONFIG['horizons'])} LightGBM models: {CONFIG['horizons']}")
+    # Import walk-forward splitter
+    from ML.utils.walk_forward_splitter import WalkForwardSplitter
     
-    for i, h in enumerate(CONFIG['horizons'], 1):
-        print(f"\n--- Training for {h}m horizon ({i}/{len(CONFIG['horizons'])}) ---")
-        model, metrics = train_and_evaluate(train_df, val_df, test_df, h, CONFIG['lgb_params'])
-        
-        if model is not None:
-            all_metrics[f'{h}m'] = metrics
-            models[f'{h}m'] = model
+    print("\n🔄 Using Walk-Forward Validation for LightGBM")
+    
+    # Load all data first to prepare for walk-forward splitting
+    print("\n📊 Loading all feature data for walk-forward validation...")
+    
+    all_data_frames = []
+    for path in tqdm(all_paths, desc="Loading feature files"):
+        try:
+            df = pl.read_parquet(path)
+            if len(df) < 400:  # Minimum token length
+                continue
             
-            # Print summary for both validation and test
-            val_metrics = metrics['validation']
+            # Add token identifier
+            df = df.with_columns(pl.lit(path.stem).alias('token_id'))
+            all_data_frames.append(df)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
+    
+    if not all_data_frames:
+        print("ERROR: No valid feature files found!")
+        return
+    
+    # Combine all data
+    combined_data = pl.concat(all_data_frames)
+    print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
+    
+    # Setup smart memecoin-aware walk-forward splitter
+    splitter = WalkForwardSplitter()  # Auto-adapts to data length
+    
+    # For LightGBM, use smart splits that adapt to memecoin data characteristics
+    print("\n🔀 Creating smart memecoin-aware global walk-forward splits...")
+    global_splits, feasible_horizons = splitter.smart_split_for_memecoins(
+        combined_data, 
+        horizons=[15, 30, 60, 120],
+        time_column='datetime'
+    )
+    
+    print(f"Created {len(global_splits)} walk-forward folds")
+    print(f"Original horizons: [15, 30, 60, 120]")
+    print(f"Feasible horizons: {feasible_horizons}")
+    
+    if len(feasible_horizons) < 7:
+        skipped = [h for h in [15, 30, 60, 120] if h not in feasible_horizons]
+        print(f"⚠️  Skipped horizons (too long for data): {skipped}")
+    
+    if not global_splits or not feasible_horizons:
+        print("❌ No valid folds or feasible horizons!")
+        return
+    
+    # Process each fold and collect metrics (only for feasible horizons)
+    all_fold_metrics = {h: [] for h in feasible_horizons}
+    
+    for fold_idx, (train_df, test_df) in enumerate(global_splits):
+        print(f"\n📈 Processing fold {fold_idx + 1}/{len(global_splits)}")
+        print(f"  Train: {len(train_df):,} samples, {train_df['token_id'].n_unique()} tokens")
+        print(f"  Test: {len(test_df):,} samples, {test_df['token_id'].n_unique()} tokens")
+        
+        # Prepare data for this fold
+        try:
+            # Labels are already created in pipeline - no need to create them again
+            
+            # Split into 80% train, 20% validation from train_df
+            train_tokens = train_df['token_id'].unique().to_list()
+            np.random.shuffle(train_tokens)
+            
+            n_train_tokens = int(len(train_tokens) * 0.8)
+            fold_train_tokens = train_tokens[:n_train_tokens]
+            fold_val_tokens = train_tokens[n_train_tokens:]
+            
+            fold_train_df = train_df.filter(pl.col('token_id').is_in(fold_train_tokens))
+            fold_val_df = train_df.filter(pl.col('token_id').is_in(fold_val_tokens))
+            
+            print(f"  Fold train: {len(fold_train_df):,} samples")
+            print(f"  Fold val: {len(fold_val_df):,} samples")
+            
+            # Train and evaluate for each feasible horizon
+            fold_metrics = {}
+            for horizon in feasible_horizons:
+                print(f"\n  Training horizon {horizon}min...")
+                
+                try:
+                    params = {
+                        'objective': 'binary',
+                        'metric': 'binary_logloss',
+                        'boosting_type': 'gbdt',
+                        'num_leaves': 64,
+                        'learning_rate': 0.05,
+                        'feature_fraction': 0.8,
+                        'bagging_fraction': 0.8,
+                        'bagging_freq': 5,
+                        'min_child_samples': 20,
+                        'random_state': 42,
+                        'verbose': -1
+                    }
+                    
+                    model, metrics = train_and_evaluate(fold_train_df, fold_val_df, test_df, horizon, params)
+                    fold_metrics[f"{horizon}min"] = metrics
+                    all_fold_metrics[horizon].append(metrics)
+                    
+                    if metrics and 'test' in metrics:
+                        print(f"    Accuracy: {metrics['test'].get('accuracy', 0):.2%}")
+                        print(f"    AUC: {metrics['test'].get('roc_auc', 0):.2%}")
+                    else:
+                        print(f"    No valid metrics for horizon {horizon}min")
+                    
+                except Exception as e:
+                    print(f"    Error training horizon {horizon}: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"  Error processing fold {fold_idx}: {e}")
+            continue
+    
+    # Aggregate metrics across all folds
+    print("\n📊 Aggregating metrics across walk-forward folds...")
+    
+    final_metrics = {}
+    for horizon in feasible_horizons:
+        horizon_name = f"{horizon}min"
+        fold_metrics_list = all_fold_metrics[horizon]
+        
+        if not fold_metrics_list:
+            print(f"No valid metrics for horizon {horizon_name}")
+            continue
+            
+        # Average metrics across folds (handle nested structure)
+        aggregated = {}
+        
+        # Initialize structure for validation and test metrics
+        for split_type in ['validation', 'test']:
+            if split_type in fold_metrics_list[0]:
+                split_metrics = {}
+                first_split = fold_metrics_list[0][split_type]
+                
+                for metric_name in first_split.keys():
+                    values = [m[split_type].get(metric_name, 0) for m in fold_metrics_list 
+                             if split_type in m and metric_name in m[split_type]]
+                    
+                    if not values:
+                        continue
+                    
+                    # Handle scalar metrics vs dictionary metrics
+                    if metric_name == 'confusion_matrix':
+                        # For confusion matrices, aggregate each component
+                        if isinstance(values[0], dict):
+                            avg_cm = {}
+                            for key in values[0].keys():
+                                cm_values = [v.get(key, 0) for v in values if isinstance(v, dict)]
+                                if cm_values:
+                                    avg_cm[key] = np.mean(cm_values)
+                                    avg_cm[f"{key}_std"] = np.std(cm_values)
+                            split_metrics[metric_name] = avg_cm
+                        else:
+                            split_metrics[metric_name] = values[0] if len(values) == 1 else 0
+                    else:
+                        # For scalar metrics, compute mean and std
+                        try:
+                            # Filter out non-numeric values
+                            numeric_values = []
+                            for v in values:
+                                if isinstance(v, (int, float, np.number)) and not np.isnan(float(v)):
+                                    numeric_values.append(float(v))
+                            
+                            if numeric_values:
+                                split_metrics[metric_name] = np.mean(numeric_values)
+                                split_metrics[f"{metric_name}_std"] = np.std(numeric_values)
+                            else:
+                                split_metrics[metric_name] = 0.0
+                                split_metrics[f"{metric_name}_std"] = 0.0
+                        except (TypeError, ValueError) as e:
+                            print(f"Warning: Could not aggregate metric {metric_name}: {e}")
+                            split_metrics[metric_name] = 0.0
+                            split_metrics[f"{metric_name}_std"] = 0.0
+                
+                aggregated[split_type] = split_metrics
+        
+        aggregated['num_folds'] = len(fold_metrics_list)
+        final_metrics[horizon_name] = aggregated
+    
+    # Print final results
+    print("\n" + "="*60)
+    print("WALK-FORWARD VALIDATION RESULTS")
+    print("="*60)
+    
+    for horizon, metrics in final_metrics.items():
+        print(f"\nHorizon {horizon} (across {metrics.get('num_folds', 0)} folds):")
+        
+        if 'test' in metrics:
             test_metrics = metrics['test']
-            print(f"  🎯 Validation - Accuracy: {val_metrics['accuracy']:.2%}, ROC AUC: {val_metrics['roc_auc']:.2%}")
-            print(f"  🎯 Test      - Accuracy: {test_metrics['accuracy']:.2%}, ROC AUC: {test_metrics['roc_auc']:.2%}")
-            print(f"✅ Horizon {h}m completed!")
-        else:
-            print(f"❌ Horizon {h}m failed - insufficient data")
-
-    # Save models
-    for horizon, model in models.items():
-        model_path = CONFIG['results_dir'] / f'lightgbm_model_{horizon}.joblib'
-        joblib.dump(model, model_path)
-    print(f"\nModels saved to: {CONFIG['results_dir']}/lightgbm_model_*.joblib")
+            print(f"  Test Accuracy: {test_metrics.get('accuracy', 0):.2%} ± {test_metrics.get('accuracy_std', 0):.2%}")
+            print(f"  Test Precision: {test_metrics.get('precision', 0):.2%} ± {test_metrics.get('precision_std', 0):.2%}")
+            print(f"  Test Recall: {test_metrics.get('recall', 0):.2%} ± {test_metrics.get('recall_std', 0):.2%}")
+            print(f"  Test F1 Score: {test_metrics.get('f1_score', 0):.2%} ± {test_metrics.get('f1_std', 0):.2%}")
+            print(f"  Test ROC AUC: {test_metrics.get('roc_auc', 0):.2%} ± {test_metrics.get('roc_auc_std', 0):.2%}")
+        
+        if 'validation' in metrics:
+            val_metrics = metrics['validation']
+            print(f"  Val Accuracy: {val_metrics.get('accuracy', 0):.2%} ± {val_metrics.get('accuracy_std', 0):.2%}")
+            print(f"  Val ROC AUC: {val_metrics.get('roc_auc', 0):.2%} ± {val_metrics.get('roc_auc_std', 0):.2%}")
     
-    # Save metrics
-    metrics_path = CONFIG['results_dir'] / 'lightgbm_metrics.json'
+    # Save results
+    print(f"\n💾 Saving results to {results_dir}")
+    
+    # Save metrics JSON
+    metrics_path = results_dir / 'metrics_walkforward.json'
     with open(metrics_path, 'w') as f:
-        json.dump(all_metrics, f, indent=4)
-    print(f"Metrics saved to: {metrics_path}")
-
-    # Create and save plots
-    fig = plot_metrics(all_metrics)
-    plot_path = CONFIG['results_dir'] / 'lightgbm_short_term_metrics.html'
-    fig.write_html(plot_path)
-    print(f"Metrics plot saved to: {plot_path}")
+        json.dump(final_metrics, f, indent=2)
     
-    # Create and save confusion matrix plot
-    cm_fig = plot_confusion_matrices(all_metrics)
-    cm_plot_path = CONFIG['results_dir'] / 'lightgbm_confusion_matrices.html'
-    cm_fig.write_html(cm_plot_path)
-    print(f"Confusion matrices saved to: {cm_plot_path}")
+    # Create and save plots
+    if final_metrics:
+        # Performance plot
+        metrics_fig = plot_metrics(final_metrics)
+        metrics_fig.update_layout(title="LightGBM Performance (Walk-Forward Validation)")
+        metrics_plot_path = results_dir / 'performance_metrics_walkforward.html'
+        metrics_fig.write_html(metrics_plot_path)
+        
+        print(f"  📊 Performance plot: {metrics_plot_path}")
+        print(f"  📋 Metrics JSON: {metrics_path}")
+    
+    print("\n✅ LightGBM walk-forward validation training complete!")
+    print(f"   More realistic metrics due to temporal validation")
+    print(f"   Results averaged across {len(global_splits)} walk-forward folds")
+    
+    return final_metrics
 
 
 if __name__ == "__main__":

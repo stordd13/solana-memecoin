@@ -1,7 +1,7 @@
 """
 Standalone Data Analysis Runner for Memecoin Data
-Runs comprehensive data analysis including quality analysis, price analysis, and pattern detection
-without needing the Streamlit app
+Runs comprehensive data analysis including quality analysis, price analysis, pattern detection,
+and category export to processed/ folders without needing the Streamlit app
 """
 
 import sys
@@ -26,6 +26,7 @@ from data_analysis.data_loader import DataLoader
 from data_analysis.data_quality import DataQualityAnalyzer
 from data_analysis.price_analysis import PriceAnalyzer
 from data_analysis.analyze_tokens import TokenAnalyzer
+from data_analysis.export_utils import export_parquet_files
 
 
 def run_data_quality_analysis(limit: int = None):
@@ -296,6 +297,144 @@ def print_price_summary(price_metrics):
         print(f"  {pattern.replace('_', ' ').title()}: {count} tokens ({pct:.1f}%)")
 
 
+def export_mutually_exclusive_categories(quality_reports):
+    """
+    Export all categories with strict mutual exclusivity enforcement.
+    Each token appears in EXACTLY ONE category based on hierarchy: gaps > normal > extremes > dead
+    
+    Args:
+        quality_reports: Dictionary of quality reports
+        
+    Returns:
+        Dictionary with category names as keys and token lists as values
+    """
+    print("\n" + "="*60)
+    print("STEP 4: CATEGORY EXPORT (MUTUALLY EXCLUSIVE)")
+    print("="*60)
+    print("🔄 Exporting categories with strict hierarchy: gaps > normal > extremes > dead")
+    
+    # Step 1: Categorize all tokens with strict hierarchy
+    categorized_tokens = {
+        'normal_behavior_tokens': [],
+        'tokens_with_extremes': [],
+        'dead_tokens': [],
+        'tokens_with_gaps': []
+    }
+    
+    overlap_stats = {
+        'normal_also_extreme': 0,
+        'normal_also_dead': 0,
+        'normal_also_gaps': 0,
+        'extreme_also_dead': 0,
+        'extreme_also_gaps': 0,
+        'dead_also_gaps': 0,
+        'total_overlaps_resolved': 0
+    }
+    
+    for token, report in quality_reports.items():
+        # Check all characteristics
+        is_extreme = report.get('is_extreme_token', False)
+        is_dead = report.get('is_dead', False)
+        
+        # Check for significant gaps (many gaps OR large gaps)
+        total_gaps = report.get('gaps', {}).get('total_gaps', 0)
+        max_gap = report.get('gaps', {}).get('max_gap', 0)
+        has_many_gaps = total_gaps > 5  # More than 5 gaps
+        has_large_gap = max_gap > 30    # Any gap larger than 30 minutes
+        has_significant_gaps = has_many_gaps or has_large_gap
+        
+        # Check if token qualifies as normal behavior
+        is_normal_behavior = not (is_extreme or is_dead or has_significant_gaps)
+        
+        # Track overlaps for statistics
+        if is_normal_behavior and is_extreme:
+            overlap_stats['normal_also_extreme'] += 1
+        if is_normal_behavior and is_dead:
+            overlap_stats['normal_also_dead'] += 1
+        if is_normal_behavior and has_significant_gaps:
+            overlap_stats['normal_also_gaps'] += 1
+        if is_extreme and is_dead:
+            overlap_stats['extreme_also_dead'] += 1
+        if is_extreme and has_significant_gaps:
+            overlap_stats['extreme_also_gaps'] += 1
+        if is_dead and has_significant_gaps:
+            overlap_stats['dead_also_gaps'] += 1
+        
+        # STRICT HIERARCHICAL ASSIGNMENT (each token goes to EXACTLY ONE category)
+        # Priority: gaps > normal > extremes > dead
+        if has_significant_gaps:
+            categorized_tokens['tokens_with_gaps'].append(token)
+            if is_normal_behavior or is_extreme or is_dead:
+                overlap_stats['total_overlaps_resolved'] += 1
+        elif is_normal_behavior:
+            categorized_tokens['normal_behavior_tokens'].append(token)
+            if is_extreme or is_dead:
+                overlap_stats['total_overlaps_resolved'] += 1
+        elif is_extreme:
+            categorized_tokens['tokens_with_extremes'].append(token)
+            if is_dead:
+                overlap_stats['total_overlaps_resolved'] += 1
+        elif is_dead:
+            categorized_tokens['dead_tokens'].append(token)
+    
+    # Step 2: Display categorization summary
+    print(f"\n📈 CATEGORIZATION RESULTS:")
+    total_tokens = len(quality_reports)
+    for category, tokens in categorized_tokens.items():
+        pct = (len(tokens) / total_tokens) * 100 if total_tokens > 0 else 0
+        print(f"  {category:25}: {len(tokens):,} tokens ({pct:.1f}%)")
+    
+    print(f"\n🔍 OVERLAP RESOLUTION:")
+    print(f"  Normal tokens that were also extreme:   {overlap_stats['normal_also_extreme']:,}")
+    print(f"  Normal tokens that were also dead:      {overlap_stats['normal_also_dead']:,}")
+    print(f"  Normal tokens that also had gaps:       {overlap_stats['normal_also_gaps']:,}")
+    print(f"  Extreme tokens that were also dead:     {overlap_stats['extreme_also_dead']:,}")
+    print(f"  Extreme tokens that also had gaps:      {overlap_stats['extreme_also_gaps']:,}")
+    print(f"  Dead tokens that also had gaps:         {overlap_stats['dead_also_gaps']:,}")
+    print(f"  Total overlaps resolved:                {overlap_stats['total_overlaps_resolved']:,}")
+    
+    # Step 3: Export each category
+    exported_results = {}
+    
+    for category, tokens in categorized_tokens.items():
+        if tokens:
+            try:
+                # Map category names to export group names
+                group_name_map = {
+                    'normal_behavior_tokens': 'Normal Behavior Tokens',
+                    'tokens_with_extremes': 'Tokens with Extremes',
+                    'dead_tokens': 'Dead Tokens',
+                    'tokens_with_gaps': 'Tokens with Gaps'
+                }
+                
+                group_name = group_name_map[category]
+                exported = export_parquet_files(tokens, group_name)
+                exported_results[category] = exported
+                
+                print(f"✅ Exported {len(exported):,} tokens to data/processed/{category}/")
+                
+            except Exception as e:
+                print(f"❌ Error exporting {category}: {e}")
+                logger.error(f"Error exporting {category}: {e}")
+                exported_results[category] = []
+        else:
+            print(f"⚠️  No tokens found for {category}")
+            exported_results[category] = []
+    
+    print(f"\n✅ EXPORT COMPLETE - All categories are now mutually exclusive!")
+    print(f"   Total tokens processed: {total_tokens:,}")
+    total_exported = sum(len(tokens) for tokens in exported_results.values())
+    print(f"   Total tokens exported: {total_exported:,}")
+    
+    # Display file paths for each category
+    print(f"\n📁 EXPORTED TO:")
+    for category, exported_tokens in exported_results.items():
+        if exported_tokens:
+            print(f"  data/processed/{category}/: {len(exported_tokens):,} tokens")
+    
+    return exported_results
+
+
 def run_token_analysis(limit: int = None):
     """Run detailed token analysis"""
     print("\n" + "="*60)
@@ -421,6 +560,7 @@ def main():
     quality_reports = {}
     price_metrics = {}
     token_results = {}
+    export_results = {}
     
     try:
         # Step 1: Data Quality Analysis
@@ -433,13 +573,21 @@ def main():
         # Step 3: Detailed Token Analysis
         token_results = run_token_analysis(limit=LIMIT_TOKEN)
         
-        # Step 4: Save all results (with user confirmation)
+        # Step 4: Export Categories to processed/ folders
+        if quality_reports:
+            export_choice = input("\n🗂️  Export categories to processed/ folders? (y/n): ").lower().strip()
+            if export_choice in ['y', 'yes']:
+                export_results = export_mutually_exclusive_categories(quality_reports)
+            else:
+                print("📝 Category export skipped (skipped by user choice)")
+        
+        # Step 5: Save all results (with user confirmation)
         if quality_reports or price_metrics or token_results:
-            save_choice = input("\n💾 Save results to files? (y/n): ").lower().strip()
+            save_choice = input("\n💾 Save analysis results to files? (y/n): ").lower().strip()
             if save_choice in ['y', 'yes']:
                 save_results_to_files(quality_reports, price_metrics, token_results)
             else:
-                print("📝 Results not saved (skipped by user choice)")
+                print("📝 Analysis results not saved (skipped by user choice)")
         
     except KeyboardInterrupt:
         print("\n\n⚠️ Analysis interrupted by user")
@@ -459,6 +607,14 @@ def main():
     print(f"Price metrics: {len(price_metrics)} tokens")
     print(f"Token analysis: {len(token_results)} tokens")
     
+    # Summary of exported categories
+    if export_results:
+        total_exported = sum(len(tokens) for tokens in export_results.values())
+        print(f"Categories exported: {total_exported} tokens")
+        for category, tokens in export_results.items():
+            if tokens:
+                print(f"  {category}: {len(tokens)} tokens")
+    
     if quality_reports or price_metrics or token_results:
         print("\n✅ Analysis completed successfully!")
         print("\n📁 Output files:")
@@ -468,11 +624,25 @@ def main():
         print("  - analysis_results/token_summary.csv")
         print("  - analysis_results/*.png (plots)")
         
+        # Show processed categories if exported
+        if export_results:
+            print("\n📁 Processed categories:")
+            for category, tokens in export_results.items():
+                if tokens:
+                    print(f"  - data/processed/{category}/: {len(tokens)} tokens")
+        
         print("\n🚀 Next steps:")
         print("  1. Review the analysis results")
-        print("  2. Run data cleaning on identified categories")
-        print("  3. Proceed with feature engineering")
-        print("  4. Train ML models on clean data")
+        if export_results:
+            print("  2. Categories ready for ML training in data/processed/")
+            print("  3. Run data cleaning on exported categories")
+            print("  4. Proceed with feature engineering")
+            print("  5. Train ML models on clean data")
+        else:
+            print("  2. Export categories to processed/ folders")
+            print("  3. Run data cleaning on identified categories")
+            print("  4. Proceed with feature engineering")
+            print("  5. Train ML models on clean data")
     else:
         print("\n⚠️ No results generated. Please check the data path and try again.")
 

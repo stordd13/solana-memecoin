@@ -3,7 +3,6 @@ LSTM Training Script for Memecoin Price Prediction
 Designed for category-aware cleaned data using Polars
 """
 
-import os
 import numpy as np
 import polars as pl
 import torch
@@ -12,8 +11,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 import plotly.graph_objects as go
 import plotly.subplots as sp
 from tqdm import tqdm
@@ -25,7 +23,6 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 try:
     from ML.utils.winsorizer import Winsorizer
-    from ML.utils.training_plots import plot_training_curves, create_learning_summary
     WINSORIZER_AVAILABLE = True
 except ImportError:
     WINSORIZER_AVAILABLE = False
@@ -174,9 +171,9 @@ class LSTMPredictor(nn.Module):
     
     def __init__(self, 
                  input_size: int = 1,
-                 hidden_size: int = 128,
+                 hidden_size: int = 16,
                  num_layers: int = 2,
-                 dropout: float = 0.3,
+                 dropout: float = 0.2,
                  forecast_horizon: int = 15):
         super().__init__()
         
@@ -193,9 +190,13 @@ class LSTMPredictor(nn.Module):
             batch_first=True
         )
         
-        # Output layers
+        # Add batch normalization after LSTM
+        self.lstm_bn = nn.BatchNorm1d(hidden_size)
+        
+        # Output layers with batch normalization
         self.fc = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
+            nn.BatchNorm1d(hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size // 2, forecast_horizon)
@@ -209,68 +210,14 @@ class LSTMPredictor(nn.Module):
         # LSTM
         lstm_out, _ = self.lstm(x)
         
-        # Use last hidden state
+        # Use last hidden state and apply batch norm
         last_hidden = lstm_out[:, -1, :]
+        last_hidden = self.lstm_bn(last_hidden)
         
         # Generate predictions
         predictions = self.fc(last_hidden)
         
         return predictions
-
-
-# ================== DATA SPLITTING ==================
-def smart_data_split(all_paths: List[Path]) -> Tuple[List[Path], List[Path], List[Path]]:
-    """
-    Split data intelligently - since most tokens are from 2025,
-    use random split with stratification by category
-    """
-    
-    print("\nAnalyzing data distribution...")
-    
-    # Group paths by category
-    category_paths = {}
-    for path in all_paths:
-        category = path.parent.name
-        if category not in category_paths:
-            category_paths[category] = []
-        category_paths[category].append(path)
-    
-    # Display distribution
-    print("\nFiles per category:")
-    for cat, paths in category_paths.items():
-        print(f"  {cat}: {len(paths)} files")
-    
-    # Stratified split by category
-    train_paths, val_paths, test_paths = [], [], []
-    
-    for category, paths in category_paths.items():
-        # Shuffle paths
-        np.random.shuffle(paths)
-        
-        # Calculate splits
-        n = len(paths)
-        n_train = int(n * 0.7)
-        n_val = int(n * 0.15)
-        
-        # Assign to splits
-        train_paths.extend(paths[:n_train])
-        val_paths.extend(paths[n_train:n_train + n_val])
-        test_paths.extend(paths[n_train + n_val:])
-        
-        print(f"\n{category}:")
-        print(f"  Train: {n_train}, Val: {n_val}, Test: {n - n_train - n_val}")
-    
-    # Shuffle final lists
-    np.random.shuffle(train_paths)
-    np.random.shuffle(val_paths)
-    np.random.shuffle(test_paths)
-    
-    print(f"\nTotal split:")
-    print(f"  Train: {len(train_paths)} files")
-    print(f"  Val: {len(val_paths)} files")
-    print(f"  Test: {len(test_paths)} files")
-    
-    return train_paths, val_paths, test_paths
 
 
 # ================== DEVICE SELECTION ==================
@@ -374,9 +321,9 @@ def train_model(model: nn.Module,
 # ================== EVALUATION METRICS ==================
 def evaluate_model(model: nn.Module, 
                    test_loader: DataLoader,
-                   scaler: StandardScaler,
+                   scaler,  # Can be StandardScaler or Winsorizer
                    device: str = None):
-    """Calculate trading-specific metrics"""
+    """Calculate trading-specific metrics including directional accuracy and financial metrics"""
     
     if device is None:
         device = get_device()
@@ -402,39 +349,70 @@ def evaluate_model(model: nn.Module,
     pred_prices = scaler.inverse_transform(predictions.reshape(-1, 1)).reshape(predictions.shape)
     target_prices = scaler.inverse_transform(targets.reshape(-1, 1)).reshape(targets.shape)
     
-    # Calculate metrics
+    # Calculate basic regression metrics
     metrics = {}
-    
-    # Basic metrics
     metrics['mse'] = np.mean((pred_prices - target_prices) ** 2)
     metrics['mae'] = np.mean(np.abs(pred_prices - target_prices))
+    metrics['rmse'] = np.sqrt(metrics['mse'])
     
-    # Direction accuracy
-    pred_direction = np.sign(predictions[:, -1] - predictions[:, 0])
-    true_direction = np.sign(targets[:, -1] - targets[:, 0])
+    # Calculate R² for final horizon (most important)
+    from sklearn.metrics import r2_score
+    metrics['r2_final_horizon'] = r2_score(target_prices[:, -1], pred_prices[:, -1])
+    
+    # Financial and directional metrics
+    entry_prices = target_prices[:, 0]  # Current prices at prediction time
+    final_pred_prices = pred_prices[:, -1]  # Predicted final prices
+    final_true_prices = target_prices[:, -1]  # True final prices
+    
+    # Directional accuracy (key trading metric)
+    pred_direction = np.sign(final_pred_prices - entry_prices)
+    true_direction = np.sign(final_true_prices - entry_prices)
     metrics['direction_accuracy'] = np.mean(pred_direction == true_direction)
     
+    # Calculate returns
+    pred_returns = (final_pred_prices - entry_prices) / entry_prices
+    true_returns = (final_true_prices - entry_prices) / entry_prices
+    
+    # Financial metrics
+    metrics['mean_pred_return'] = np.mean(pred_returns)
+    metrics['mean_true_return'] = np.mean(true_returns)
+    metrics['return_correlation'] = np.corrcoef(pred_returns, true_returns)[0, 1]
+    
+    # Trading simulation metrics
+    # Simple strategy: Buy if predicted return > 0
+    buy_signals = pred_returns > 0
+    if np.sum(buy_signals) > 0:
+        strategy_returns = true_returns[buy_signals]
+        metrics['strategy_win_rate'] = np.mean(strategy_returns > 0)
+        metrics['strategy_avg_return'] = np.mean(strategy_returns)
+        metrics['strategy_sharpe'] = np.mean(strategy_returns) / np.std(strategy_returns) if np.std(strategy_returns) > 0 else 0
+    else:
+        metrics['strategy_win_rate'] = 0.0
+        metrics['strategy_avg_return'] = 0.0
+        metrics['strategy_sharpe'] = 0.0
+    
     # Pump detection (2x = 100% gain)
-    entry_prices = scaler.inverse_transform(predictions[:, 0].reshape(-1, 1)).flatten()
-    pred_returns = (pred_prices[:, -1] - entry_prices) / entry_prices
-    true_returns = (target_prices[:, -1] - entry_prices) / entry_prices
+    pred_pumps = pred_returns > 1.0  # Predicted 2x
+    true_pumps = true_returns > 1.0  # Actual 2x
     
-    # Multiple pump thresholds
-    for threshold, name in [(0.5, '50%'), (1.0, '2x'), (4.0, '5x')]:
-        pred_pumps = pred_returns > threshold
-        true_pumps = true_returns > threshold
+    if np.sum(true_pumps) > 0:
+        metrics['pump_detection_recall'] = np.sum(pred_pumps & true_pumps) / np.sum(true_pumps)
+    else:
+        metrics['pump_detection_recall'] = 0.0
         
-        if np.sum(pred_pumps) > 0:
-            metrics[f'pump_{name}_precision'] = np.sum(pred_pumps & true_pumps) / np.sum(pred_pumps)
-        else:
-            metrics[f'pump_{name}_precision'] = 0
-            
-        if np.sum(true_pumps) > 0:
-            metrics[f'pump_{name}_recall'] = np.sum(pred_pumps & true_pumps) / np.sum(true_pumps)
-        else:
-            metrics[f'pump_{name}_recall'] = 0
+    if np.sum(pred_pumps) > 0:
+        metrics['pump_detection_precision'] = np.sum(pred_pumps & true_pumps) / np.sum(pred_pumps)
+    else:
+        metrics['pump_detection_precision'] = 0.0
     
-    return metrics, predictions, targets
+    # Price error as percentage
+    metrics['mean_price_error_pct'] = np.mean(np.abs(pred_prices - target_prices) / target_prices) * 100
+    
+    # Volatility metrics
+    metrics['price_volatility'] = np.std(target_prices[:, -1] / target_prices[:, 0])
+    metrics['prediction_volatility'] = np.std(pred_prices[:, -1] / target_prices[:, 0])
+    
+    return metrics
 
 
 # ================== PLOTTING FUNCTIONS ==================
@@ -471,246 +449,398 @@ def plot_training_history(train_losses: List[float], val_losses: List[float]) ->
 
 
 def plot_evaluation_metrics(metrics: Dict) -> go.Figure:
-    """Plot evaluation metrics as grouped bar chart"""
+    """Plot evaluation metrics with proper scale handling for regression and classification metrics"""
     
-    # Create subplots
+    # Create comprehensive subplots for different metric types
     fig = sp.make_subplots(
-        rows=1, cols=2,
-        subplot_titles=('Detection Performance', 'Pump Detection by Threshold'),
-        column_widths=[0.4, 0.6]
+        rows=2, cols=2,
+        subplot_titles=('Regression Metrics', 'Performance Metrics (R²)', 'Trading Performance', 'Financial Strategy'),
+        specs=[[{"secondary_y": False}, {"secondary_y": False}],
+               [{"secondary_y": False}, {"secondary_y": False}]]
     )
     
-    # Basic metrics
-    basic_metrics = ['direction_accuracy']
-    basic_values = [metrics.get(m, 0) for m in basic_metrics]
+    # 1. Regression metrics (MAE, MSE, RMSE) with log scale
+    regression_metrics = {}
+    if 'mae' in metrics:
+        regression_metrics['MAE'] = metrics['mae']
+    if 'mse' in metrics:
+        regression_metrics['MSE'] = metrics['mse']
+    if 'rmse' in metrics:
+        regression_metrics['RMSE'] = metrics['rmse']
     
-    fig.add_trace(
-        go.Bar(
-            x=['Direction\nAccuracy'],
-            y=basic_values,
-            text=[f'{v:.1%}' for v in basic_values],
-            textposition='auto',
-            marker_color='green' if basic_values[0] > 0.5 else 'orange'
-        ),
-        row=1, col=1
-    )
+    if regression_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(regression_metrics.keys()),
+                y=list(regression_metrics.values()),
+                text=[f'{v:.4f}' for v in regression_metrics.values()],
+                textposition='auto',
+                marker_color='lightblue',
+                name='Regression'
+            ),
+            row=1, col=1
+        )
+        fig.update_yaxes(type="log", row=1, col=1, title_text="Value (log scale)")
     
-    # Pump detection metrics
-    thresholds = ['50%', '2x', '5x']
-    precisions = [metrics.get(f'pump_{t}_precision', 0) for t in thresholds]
-    recalls = [metrics.get(f'pump_{t}_recall', 0) for t in thresholds]
+    # 2. Performance metrics (R²)
+    performance_metrics = {}
+    if 'r2_final_horizon' in metrics:
+        performance_metrics['R²'] = metrics['r2_final_horizon']
     
-    fig.add_trace(
-        go.Bar(
-            name='Precision',
-            x=thresholds,
-            y=precisions,
-            text=[f'{v:.1%}' for v in precisions],
-            textposition='auto',
-            marker_color='blue'
-        ),
-        row=1, col=2
-    )
+    if performance_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(performance_metrics.keys()),
+                y=list(performance_metrics.values()),
+                text=[f'{v:.3f}' for v in performance_metrics.values()],
+                textposition='auto',
+                marker_color='green' if performance_metrics.get('R²', 0) > 0 else 'orange',
+                name='Performance'
+            ),
+            row=1, col=2
+        )
+        fig.update_yaxes(row=1, col=2, title_text="R² Score")
     
-    fig.add_trace(
-        go.Bar(
-            name='Recall',
-            x=thresholds,
-            y=recalls,
-            text=[f'{v:.1%}' for v in recalls],
-            textposition='auto',
-            marker_color='red'
-        ),
-        row=1, col=2
-    )
+    # 3. Trading performance metrics
+    trading_metrics = {}
+    if 'direction_accuracy' in metrics:
+        trading_metrics['Direction Accuracy'] = metrics['direction_accuracy']
+    if 'strategy_win_rate' in metrics:
+        trading_metrics['Strategy Win Rate'] = metrics['strategy_win_rate']
+    
+    if trading_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(trading_metrics.keys()),
+                y=list(trading_metrics.values()),
+                text=[f'{v:.1%}' for v in trading_metrics.values()],
+                textposition='auto',
+                marker_color='darkgreen',
+                name='Trading'
+            ),
+            row=2, col=1
+        )
+        fig.update_yaxes(range=[0, 1], row=2, col=1, title_text="Accuracy/Rate")
+    
+    # 4. Financial strategy metrics
+    financial_metrics = {}
+    if 'strategy_avg_return' in metrics:
+        financial_metrics['Avg Strategy Return'] = metrics['strategy_avg_return']
+    if 'strategy_sharpe' in metrics:
+        financial_metrics['Strategy Sharpe'] = metrics['strategy_sharpe']
+    if 'mean_pred_return' in metrics:
+        financial_metrics['Mean Pred Return'] = metrics['mean_pred_return']
+    
+    if financial_metrics:
+        fig.add_trace(
+            go.Bar(
+                x=list(financial_metrics.keys()),
+                y=list(financial_metrics.values()),
+                text=[f'{v:.3f}' for v in financial_metrics.values()],
+                textposition='auto',
+                marker_color='purple',
+                name='Financial'
+            ),
+            row=2, col=2
+        )
+        fig.update_yaxes(row=2, col=2, title_text="Return/Ratio")
     
     fig.update_layout(
-        title='Model Performance Metrics',
-        showlegend=True,
+        title='LSTM Forecasting Model Performance',
+        showlegend=False,
         template='plotly_white',
-        barmode='group'
+        height=600
     )
-    
-    fig.update_yaxes(range=[0, 1], row=1, col=1)
-    fig.update_yaxes(range=[0, 1], row=1, col=2)
     
     return fig
 
 
 # ================== MAIN TRAINING PIPELINE ==================
 def main():
-    """Main training pipeline"""
+    """Main training pipeline for LSTM forecasting model with walk-forward validation"""
     
-    # Configuration
-    CONFIG = {
-        'base_dir': Path("data/features"),  # CHANGED: Read from features dir instead of cleaned
-        'results_dir': Path("ML/results/lstm"),
-        'categories': [
-            "normal_behavior_tokens",      # Best quality
-            "tokens_with_gaps",           # Gaps filled during cleaning
-            "tokens_with_extremes",       # Extremes preserved!
-            # "dead_tokens",              # See smart sampling below
-        ],
-        'include_smart_dead_tokens': True,  # Smart sampling of dead tokens
-        'scaler_type': 'robust',  # 'standard', 'robust', 'log', 'percentile'
-        'lookback': 60,
-        'forecast_horizon': 15,
-        'batch_size': 32,
-        'num_epochs': 50,
-        'learning_rate': 0.001,
-        'hidden_size': 128,
-        'num_layers': 2,
-        'dropout': 0.3
-    }
+    print("="*60)
+    print("🔮 LSTM Price Forecasting Training")  
+    print("Features: Price prediction, Enhanced plotting, Financial metrics")
+    print("WITH WALK-FORWARD VALIDATION")
+    print("="*60)
     
-    print("="*50)
-    print("LSTM Training for Memecoin Price Prediction")
-    print("Using Category-Aware Cleaned Data")
-    print("="*50)
+    # Device setup
+    device = get_device()
+    print(f"Using device: {device}")
     
-    # Create results directory
-    CONFIG['results_dir'].mkdir(parents=True, exist_ok=True)
-    print(f"Results will be saved to: {CONFIG['results_dir']}")
+    # Data loading
+    data_base = Path("data/features")
+    categories = [
+        "normal_behavior_tokens",
+        "tokens_with_extremes", 
+        "dead_tokens",
+    ]
     
-    # 1. Load data paths
     all_paths = []
-    for category in CONFIG['categories']:
-        cat_dir = CONFIG['base_dir'] / category
+    for category in categories:
+        cat_dir = data_base / category
         if cat_dir.exists():
             paths = list(cat_dir.glob("*.parquet"))
             all_paths.extend(paths)
             print(f"Found {len(paths)} files in {category}")
-        else:
-            print(f"Warning: Directory not found: {cat_dir}")
     
-    if len(all_paths) == 0:
-        print("\nERROR: No files found!")
-        print(f"Please check that cleaned data exists in: {CONFIG['base_dir']}")
-        return None, None, None
+    if not all_paths:
+        print("ERROR: No feature files found!")
+        return
     
     print(f"\nTotal files: {len(all_paths)}")
     
-    # 2. Split data
-    train_paths, val_paths, test_paths = smart_data_split(all_paths)
+    # Import walk-forward splitter
+    from ML.utils.walk_forward_splitter import WalkForwardSplitter
     
-    # 3. Create datasets
-    print("\nCreating datasets...")
-    print(f"Using scaler type: {CONFIG['scaler_type']}")
+    print("\n🔄 Using Walk-Forward Validation for LSTM Forecasting")
     
-    # IMPORTANT: Create train dataset first to fit the scaler
-    train_dataset = MemecoinDataset(
-        train_paths, 
-        CONFIG['lookback'], 
-        CONFIG['forecast_horizon']
+    # Load all data first to prepare for walk-forward splitting
+    print("\n📊 Loading all feature data for walk-forward validation...")
+    
+    all_data_frames = []
+    for path in tqdm(all_paths, desc="Loading feature files"):
+        try:
+            df = pl.read_parquet(path)
+            if len(df) < 400:  # Minimum token length
+                continue
+            
+            # Add token identifier
+            df = df.with_columns(pl.lit(path.stem).alias('token_id'))
+            all_data_frames.append(df)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
+    
+    if not all_data_frames:
+        print("ERROR: No valid feature files found!")
+        return
+    
+    # Combine all data
+    combined_data = pl.concat(all_data_frames)
+    print(f"Loaded {len(combined_data):,} rows from {len(all_data_frames)} tokens")
+    
+    # Setup smart memecoin-aware walk-forward splitter
+    splitter = WalkForwardSplitter()  # Auto-adapts to data length
+    
+    # Use smart splits that adapt to memecoin data characteristics
+    print("\n🔀 Creating smart memecoin-aware walk-forward splits...")
+    global_splits, feasible_horizons = splitter.smart_split_for_memecoins(
+        combined_data, 
+        horizons=[15],  # 15-minute forecasting horizon
+        time_column='datetime'
     )
     
-    # Check if train dataset is valid
-    if len(train_dataset) == 0:
-        print("\nERROR: Train dataset is empty!")
-        print("Possible causes:")
-        print("1. Files don't have enough data points (need at least 75 minutes)")
-        print("2. Files are missing 'price' column")
-        print("3. Data loading errors")
-        return None, None, None
+    print(f"Created {len(global_splits)} walk-forward folds")
+    print(f"Feasible forecast horizon: {feasible_horizons}")
     
-    # Now create val and test datasets with the fitted scaler
-    val_dataset = MemecoinDataset(val_paths, CONFIG['lookback'], CONFIG['forecast_horizon'], 
-                                  scaler=train_dataset.scaler)
-    test_dataset = MemecoinDataset(test_paths, CONFIG['lookback'], CONFIG['forecast_horizon'], 
-                                   scaler=train_dataset.scaler)
+    if not global_splits or not feasible_horizons:
+        print("❌ No valid folds or feasible horizons!")
+        return
     
-    # 4. Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], shuffle=False)
+    # Collect all folds for training
+    all_train_data = []
+    all_val_data = []  
+    all_test_data = []
     
-    print(f"\nDataset sizes:")
+    # Use first N-1 folds for training/validation, last fold for testing
+    if len(global_splits) < 2:
+        print("❌ Need at least 2 global folds for training!")
+        return
+        
+    # Use last fold as test, split remaining into train/val
+    *train_val_folds, test_fold = global_splits
+    _, test_test_df = test_fold
+    all_test_data.append(test_test_df)
+    
+    # Split train_val_folds into train and validation (80/20)
+    n_train_folds = max(1, int(len(train_val_folds) * 0.8))
+    
+    for i, (_, fold_test_df) in enumerate(train_val_folds):
+        if i < n_train_folds:
+            all_train_data.append(fold_test_df)  # Use 'test' part of fold for training
+        else:
+            all_val_data.append(fold_test_df)    # Use for validation
+    
+    print(f"\n📈 Walk-forward data split:")
+    print(f"  Train folds: {len(all_train_data)} DataFrames")
+    print(f"  Val folds: {len(all_val_data)} DataFrames")  
+    print(f"  Test folds: {len(all_test_data)} DataFrames")
+    
+    # Create datasets from walk-forward splits
+    print("\nCreating datasets with walk-forward splits...")
+    
+    # Convert DataFrames back to paths for compatibility with existing dataset code
+    # Save temporary files for each split
+    temp_dir = Path("ML/results/lstm_forecasting/temp_splits")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    train_paths = []
+    val_paths = []
+    test_paths = []
+    
+    # Save train splits
+    for i, df in enumerate(all_train_data):
+        temp_path = temp_dir / f'train_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        train_paths.append(temp_path)
+    
+    # Save val splits
+    for i, df in enumerate(all_val_data):
+        temp_path = temp_dir / f'val_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        val_paths.append(temp_path)
+        
+    # Save test splits
+    for i, df in enumerate(all_test_data):
+        temp_path = temp_dir / f'test_fold_{i}.parquet'
+        df.write_parquet(temp_path)
+        test_paths.append(temp_path)
+
+    # Walk-forward validation is now used
+    # train_paths, val_paths, test_paths = smart_data_split(all_paths)
+    
+    # Create datasets with walk-forward splits
+    # Temporary file-based approach for compatibility
+    
+    # Create datasets
+    print("\nCreating LSTM forecasting datasets...")
+    
+    # First create train dataset with Winsorizer (or StandardScaler if not available)
+    train_dataset = MemecoinDataset(
+        train_paths, 
+        lookback=60, 
+        forecast_horizon=15,
+        scaler=None,  # Let dataset choose Winsorizer or StandardScaler
+        use_winsorizer=True
+    )
+    
+    # Get the fitted scaler from train dataset for consistency across val/test
+    fitted_scaler = train_dataset.scaler
+    
+    val_dataset = MemecoinDataset(
+        val_paths, 
+        lookback=60, 
+        forecast_horizon=15,
+        scaler=fitted_scaler,  # Use same scaler as training
+        use_winsorizer=True
+    )
+    
+    test_dataset = MemecoinDataset(
+        test_paths, 
+        lookback=60, 
+        forecast_horizon=15,
+        scaler=fitted_scaler,  # Use same scaler as training
+        use_winsorizer=True
+    )
+    
+    print(f"\nDataset sizes (walk-forward):")
     print(f"  Train: {len(train_dataset)} sequences")
     print(f"  Val: {len(val_dataset)} sequences")
     print(f"  Test: {len(test_dataset)} sequences")
     
-    # 5. Initialize model
+    if len(train_dataset) == 0:
+        print("ERROR: No training sequences created!")
+        return
+    
+    # Create data loaders
+    batch_size = 32
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Create model
     model = LSTMPredictor(
-        hidden_size=CONFIG['hidden_size'],
-        num_layers=CONFIG['num_layers'],
-        dropout=CONFIG['dropout'],
-        forecast_horizon=CONFIG['forecast_horizon']
-    )
+        input_size=1,
+        hidden_size=16,
+        num_layers=1,
+        dropout=0.2,
+        forecast_horizon=15
+    ).to(device)
     
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # 6. Train model
-    model, training_history = train_model(
+    # Training
+    print("\nTraining LSTM forecasting model with walk-forward validation...")
+    train_losses, val_losses = train_model(
         model, train_loader, val_loader, 
-        num_epochs=CONFIG['num_epochs'],
-        learning_rate=CONFIG['learning_rate']
+        num_epochs=100, learning_rate=0.001, device=device
     )
     
-    # 7. Evaluate on test set
-    print("\nEvaluating on test set...")
-    metrics, predictions, targets = evaluate_model(
-        model, test_loader, train_dataset.scaler,
-        device=get_device()
-    )
+    # Evaluation
+    print("\nEvaluating on test set (walk-forward)...")
+    metrics = evaluate_model(model, test_loader, fitted_scaler, device)
     
-    print("\nTest Set Metrics:")
-    print(f"  MSE: {metrics['mse']:.4f}")
-    print(f"  MAE: {metrics['mae']:.4f}")
-    print(f"  Direction Accuracy: {metrics['direction_accuracy']:.2%}")
-    print(f"  50% Pump Detection - Precision: {metrics['pump_50%_precision']:.2%}, Recall: {metrics['pump_50%_recall']:.2%}")
-    print(f"  2x Pump Detection - Precision: {metrics['pump_2x_precision']:.2%}, Recall: {metrics['pump_2x_recall']:.2%}")
-    print(f"  5x Pump Detection - Precision: {metrics['pump_5x_precision']:.2%}, Recall: {metrics['pump_5x_recall']:.2%}")
+    # Print results
+    print("\n" + "="*60)
+    print("FORECASTING RESULTS (Walk-Forward Validation)")
+    print("="*60)
     
-    # 8. Save model
-    model_path = CONFIG['results_dir'] / 'lstm_model.pth'
+    print(f"\nTest Set Performance:")
+    print(f"  RMSE: {metrics['rmse']:.6f}")
+    print(f"  MAE: {metrics['mae']:.6f}")
+    print(f"  MAPE: {metrics['mape']:.2f}%")
+    print(f"  R²: {metrics['r2']:.4f}")
+    
+    if 'financial_metrics' in metrics:
+        fin_metrics = metrics['financial_metrics']
+        print(f"\nFinancial Performance:")
+        print(f"  Directional Accuracy: {fin_metrics.get('directional_accuracy', 0):.2%}")
+        print(f"  Strategy Return: {fin_metrics.get('strategy_return', 0):.2%}")
+        print(f"  Win Rate: {fin_metrics.get('win_rate', 0):.2%}")
+        print(f"  Sharpe Ratio: {fin_metrics.get('sharpe_ratio', 0):.2f}")
+    
+    # Save model and results
+    results_dir = Path("ML/results/lstm_forecasting")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    model_path = results_dir / 'lstm_model_walkforward.pth'
     torch.save({
         'model_state_dict': model.state_dict(),
-        'config': CONFIG,
-        'scaler': train_dataset.scaler,
+        'scaler': fitted_scaler,
+        'model_config': {
+            'input_size': 1,
+            'hidden_size': 128,
+            'num_layers': 3,
+            'dropout': 0.2,
+            'forecast_horizon': 15
+        },
         'metrics': metrics,
-        'training_history': training_history
+        'validation_method': 'walk_forward'
     }, model_path)
     
     print(f"\nModel saved to: {model_path}")
     
-    # 9. Create plots
-    # Original plot
-    fig1 = plot_training_history(training_history['train_losses'], training_history['val_losses'])
-    training_plot_path = CONFIG['results_dir'] / 'training_history.html'
-    fig1.write_html(training_plot_path)
+    # Create visualizations
+    # 1. Training curves
+    training_fig = plot_training_history(train_losses, val_losses)
+    training_fig.update_layout(title="LSTM Forecasting Training Progress (Walk-Forward)")
+    training_path = results_dir / 'training_curves_walkforward.html'
+    training_fig.write_html(training_path)
     
-    # Enhanced learning curves if available
-    if WINSORIZER_AVAILABLE:
-        enhanced_fig = plot_training_curves(
-            training_history['train_losses'],
-            training_history['val_losses'],
-            title="LSTM Forecasting Model Training Progress"
-        )
-        enhanced_plot_path = CONFIG['results_dir'] / 'enhanced_training_curves.html'
-        enhanced_fig.write_html(enhanced_plot_path)
-        print(f"  - Enhanced training curves: {enhanced_plot_path}")
+    # 2. Evaluation metrics
+    eval_fig = plot_evaluation_metrics(metrics)
+    eval_fig.update_layout(title="LSTM Forecasting Performance (Walk-Forward)")
+    eval_path = results_dir / 'evaluation_metrics_walkforward.html'
+    eval_fig.write_html(eval_path)
     
-    fig2 = plot_evaluation_metrics(metrics)
-    metrics_plot_path = CONFIG['results_dir'] / 'evaluation_metrics.html'
-    fig2.write_html(metrics_plot_path)
-    
-    # Save metrics as JSON
-    metrics_json_path = CONFIG['results_dir'] / 'metrics.json'
+    # 3. Save metrics JSON
+    metrics_json_path = results_dir / 'metrics_walkforward.json'
     with open(metrics_json_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     
-    print(f"\nResults saved:")
-    print(f"  - Model: {model_path}")
-    print(f"  - Training history: {training_plot_path}")
-    print(f"  - Evaluation metrics: {metrics_plot_path}")
-    print(f"  - Metrics JSON: {metrics_json_path}")
+    # Clean up temporary files
+    import shutil
+    shutil.rmtree(temp_dir)
+    print("Cleaned up temporary split files")
     
-    # Clean up checkpoint
-    if os.path.exists('best_model_checkpoint.pth'):
-        os.remove('best_model_checkpoint.pth')
+    print(f"\nResults saved to: {results_dir}")
+    print("\n✅ LSTM forecasting training complete with walk-forward validation!")
+    print(f"   More realistic forecasting metrics due to temporal validation")
     
-    return model, train_dataset.scaler, metrics
+    return model, metrics
 
 
 if __name__ == "__main__":
-    model, scaler, metrics = main()
+    model, metrics = main()

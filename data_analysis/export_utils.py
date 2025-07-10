@@ -12,8 +12,7 @@ def export_parquet_files(token_list, group_name):
     """
     project_root = get_project_root()
     raw_dirs = [
-        project_root / "data" / "raw" / "dataset",
-        project_root / "data" / "raw" / "dataset-fresh"
+        project_root / "data" / "raw" / "dataset"
     ]
     group_folder_map = {
         "High Quality Tokens": "high_quality_tokens",  # Legacy support
