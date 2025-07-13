@@ -22,7 +22,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Import utilities from archetype_utils
-from .archetype_utils import (
+from time_series.archetype_utils import (
     detect_token_death, calculate_death_features, extract_lifecycle_features,
     extract_early_features, prepare_token_data, extract_essential_features,
     generate_archetype_docs, categorize_by_lifespan
@@ -229,7 +229,7 @@ class BehavioralArchetypeAnalyzer:
             Dictionary with clustering results
         """
         # Use centralized clustering from autocorrelation_clustering
-        from .autocorrelation_clustering import AutocorrelationClusteringAnalyzer
+        from time_series.autocorrelation_clustering import AutocorrelationClusteringAnalyzer
         analyzer = AutocorrelationClusteringAnalyzer()
         
         # Prepare features
@@ -380,7 +380,7 @@ class BehavioralArchetypeAnalyzer:
         Returns:
             Dictionary with stability results
         """
-        from .autocorrelation_clustering import AutocorrelationClusteringAnalyzer
+        from time_series.autocorrelation_clustering import AutocorrelationClusteringAnalyzer
         analyzer = AutocorrelationClusteringAnalyzer()
         
         # Prepare features

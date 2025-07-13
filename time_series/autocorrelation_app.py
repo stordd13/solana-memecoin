@@ -660,66 +660,87 @@ def main():
                 
                 if not use_cached:
                     # Run unified analysis - eliminates redundancy and streamlines all analysis types
-                    from .unified_analysis import UnifiedAnalysisEngine
-                    unified_engine = UnifiedAnalysisEngine()
+                    try:
+                        from time_series.unified_analysis import UnifiedAnalysisEngine
+                        unified_engine = UnifiedAnalysisEngine()
+                    except ImportError as e:
+                        st.error(f"🚨 **Import Error**: Failed to load unified analysis engine: {e}")
+                        st.error("🔧 **Solution**: Check that all time_series modules are properly installed and accessible.")
+                        return
+                    except Exception as e:
+                        st.error(f"🚨 **Initialization Error**: {e}")
+                        return
                 
                     # Map analysis types to unified engine parameters
-                    if analysis_type == "Price-only":
-                        st.info(f"🔄 Running unified price-only analysis with method: {price_method}")
+                    try:
+                        if analysis_type == "Price-only":
+                            st.info(f"🔄 Running unified price-only analysis with method: {price_method}")
+                            
+                            results = unified_engine.run_unified_analysis(
+                                data_path=data_path,
+                                analysis_type="price_only",
+                                time_series_method=price_method,
+                                max_tokens=max_tokens,
+                                clustering_method=clustering_method,
+                                find_optimal_k=find_optimal_k,
+                                n_clusters=n_clusters
+                            )
                         
-                        results = unified_engine.run_unified_analysis(
-                            data_path=data_path,
-                            analysis_type="price_only",
-                            time_series_method=price_method,
-                            max_tokens=max_tokens,
-                            clustering_method=clustering_method,
-                            find_optimal_k=find_optimal_k,
-                            n_clusters=n_clusters
-                        )
-                        
-                    elif analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
-                        st.info(f"🔄 Running unified lifespan analysis with method: {multi_method}")
-                        
-                        # Use processed data directory
-                        processed_data_path = data_path.parent / "processed"
-                        if not processed_data_path.exists():
-                            st.error(f"Processed data directory not found: {processed_data_path.absolute()}")
-                            st.error("Please run data analysis first to generate processed categories.")
+                        elif analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
+                            st.info(f"🔄 Running unified lifespan analysis with method: {multi_method}")
+                            
+                            # Use processed data directory
+                            processed_data_path = data_path.parent / "processed"
+                            if not processed_data_path.exists():
+                                st.error(f"📁 **Processed data directory not found**: {processed_data_path.absolute()}")
+                                st.error("🔧 **Next steps**: Please run the main data analysis first to generate processed categories.")
+                                st.info("💡 **How to fix**: Go to the main dashboard (`streamlit run data_analysis/app.py`) and run the full pipeline to create processed data.")
+                                return
+                            
+                            results = unified_engine.run_unified_analysis(
+                                data_path=processed_data_path,
+                                analysis_type="lifespan", 
+                                time_series_method=multi_method,
+                                max_tokens_per_category=max_tokens_per_category,
+                                sample_ratio=sample_ratio,
+                                clustering_method=clustering_method,
+                                find_optimal_k=find_optimal_k,
+                                n_clusters=n_clusters
+                            )
+                            
+                        elif analysis_type == "🎭 Behavioral Archetypes (15-Feature)":
+                            st.info(f"🔄 Running unified behavioral archetype analysis with method: {use_log_returns}")
+                            
+                            # Use processed data directory
+                            processed_data_path = data_path.parent / "processed"
+                            if not processed_data_path.exists():
+                                st.error(f"📁 **Processed data directory not found**: {processed_data_path.absolute()}")
+                                st.error("🔧 **Next steps**: Please run the main data analysis first to generate processed categories.")
+                                st.info("💡 **How to fix**: Go to the main dashboard (`streamlit run data_analysis/app.py`) and run the full pipeline to create processed data.")
+                                return
+                            
+                            results = unified_engine.run_unified_analysis(
+                                data_path=processed_data_path,
+                                analysis_type="behavioral",
+                                time_series_method=use_log_returns,  # This is already a string like "log_returns"
+                                max_tokens=max_tokens,
+                                clustering_method=clustering_method,
+                                find_optimal_k=find_optimal_k,
+                                n_clusters=n_clusters
+                            )
+                            
+                        else:
+                            st.error(f"🚨 **Unknown analysis type**: {analysis_type}")
+                            st.error("🔧 **Available types**: Price-only, Lifespan Analysis, Behavioral Archetypes")
                             return
-                        
-                        results = unified_engine.run_unified_analysis(
-                            data_path=processed_data_path,
-                            analysis_type="lifespan", 
-                            time_series_method=multi_method,
-                            max_tokens_per_category=max_tokens_per_category,
-                            sample_ratio=sample_ratio,
-                            clustering_method=clustering_method,
-                            find_optimal_k=find_optimal_k,
-                            n_clusters=n_clusters
-                        )
-                        
-                    elif analysis_type == "🎭 Behavioral Archetypes (15-Feature)":
-                        st.info(f"🔄 Running unified behavioral archetype analysis with method: {use_log_returns}")
-                        
-                        # Use processed data directory
-                        processed_data_path = data_path.parent / "processed"
-                        if not processed_data_path.exists():
-                            st.error(f"Processed data directory not found: {processed_data_path.absolute()}")
-                            st.error("Please run data analysis first to generate processed categories.")
-                            return
-                        
-                        results = unified_engine.run_unified_analysis(
-                            data_path=processed_data_path,
-                            analysis_type="behavioral",
-                            time_series_method=use_log_returns,
-                            max_tokens=max_tokens,
-                            clustering_method=clustering_method,
-                            find_optimal_k=find_optimal_k,
-                            n_clusters=n_clusters
-                        )
-                        
-                    else:
-                        st.error(f"Unknown analysis type: {analysis_type}")
+                            
+                    except Exception as e:
+                        st.error(f"🚨 **Analysis Failed**: {str(e)}")
+                        st.error("🔧 **Possible causes**: Data loading issues, feature extraction problems, or clustering failures")
+                        if "processed" in str(e).lower():
+                            st.info("💡 **Hint**: This might be a processed data issue. Try running the main data analysis pipeline first.")
+                        with st.expander("🔍 **Full Error Details**", expanded=False):
+                            st.code(str(e))
                         return
                     
                     # Cache the results for future use
@@ -831,7 +852,7 @@ def main():
             ])
         
         # Handle tab content based on analysis type
-        if 'categories' in results:  # Multi-Resolution analysis (includes baseline clustering)
+        if 'categories' in results:  # Lifespan analysis (Sprint/Standard/Marathon)
             with tab1:
                 display_multi_resolution_overview(results)
                 
@@ -872,7 +893,22 @@ def main():
                     
                 with tab6:
                     display_behavioral_archetypes(results)
-        else:  # Standard analysis
+                    
+        elif results.get('analysis_type') == 'behavioral':  # Behavioral archetype analysis
+            with tab1:
+                display_behavioral_archetypes(results)
+                
+            with tab2:
+                st.info("🔧 Additional behavioral analysis tabs coming soon...")
+                
+        elif results.get('analysis_type') == 'price_only':  # Price-only analysis
+            with tab1:
+                display_overview(results)
+                
+            with tab2:
+                st.info("🔧 Additional price-only analysis tabs coming soon...")
+                
+        else:  # Legacy analysis (backward compatibility)
             with tab1:
                 display_overview(results)
                 
@@ -899,53 +935,84 @@ def main():
 
 
 def display_overview(results: Dict):
-    """Display analysis overview"""
+    """Display analysis overview with defensive programming for different result structures"""
     st.header("📊 Analysis Overview")
     
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Tokens", len(results['token_names']))
+        # Defensive programming for token count
+        token_count = 'Unknown'
+        if 'token_names' in results:
+            token_count = len(results['token_names'])
+        elif 'total_tokens_analyzed' in results:
+            token_count = results['total_tokens_analyzed']
+        st.metric("Total Tokens", token_count)
         
     with col2:
-        st.metric("Number of Clusters", results['n_clusters'])
+        # Defensive programming for cluster count
+        n_clusters = 'Unknown'
+        if 'n_clusters' in results:
+            n_clusters = results['n_clusters']
+        elif 'clustering_results' in results:
+            n_clusters = results['clustering_results'].get('n_clusters', 'Unknown')
+        st.metric("Number of Clusters", n_clusters)
         
     with col3:
         analysis_method = results.get('analysis_method', 'feature_based')
         if analysis_method.startswith('price_only'):
             method_display = f"Price-only ({analysis_method.split('_')[-1]})"
+        elif analysis_method.startswith('behavioral'):
+            method_display = "Behavioral Archetype"
+        elif analysis_method.startswith('lifespan'):
+            method_display = "Lifespan Analysis"
         else:
             method_display = "Feature-based"
         st.metric("Analysis Type", method_display)
         
     with col4:
-        avg_length = np.mean([len(df) for df in results['token_data'].values()])
-        st.metric("Avg Token Length", f"{avg_length:.0f} minutes")
+        # Defensive programming for average length
+        if 'token_data' in results and results['token_data']:
+            try:
+                avg_length = np.mean([len(df) for df in results['token_data'].values()])
+                st.metric("Avg Token Length", f"{avg_length:.0f} minutes")
+            except Exception as e:
+                st.metric("Avg Token Length", "N/A")
+                print(f"DEBUG: Could not calculate average length: {e}")
+        else:
+            st.metric("Avg Token Length", "N/A")
     
-    # Cluster distribution
+    # Cluster distribution with defensive programming
     st.subheader("Cluster Distribution")
     
-    # Use polars for better performance
-    cluster_series = pl.Series('cluster', results['cluster_labels'])
-    cluster_counts = cluster_series.value_counts().sort('cluster')
-    
-    # Extract values for plotting
-    cluster_ids = cluster_counts['cluster'].to_list()
-    count_values = cluster_counts['count'].to_list()
-    
-    fig = go.Figure(data=[
-        go.Bar(x=[f"Cluster {i}" for i in cluster_ids],
-               y=count_values,
-               text=count_values,
-               textposition='auto')
-    ])
-    fig.update_layout(
-        title="Number of Tokens per Cluster",
-        xaxis_title="Cluster",
-        yaxis_title="Number of Tokens",
-        height=400
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    if 'cluster_labels' in results:
+        try:
+            # Use polars for better performance
+            cluster_series = pl.Series('cluster', results['cluster_labels'])
+            cluster_counts = cluster_series.value_counts().sort('cluster')
+            
+            # Extract values for plotting
+            cluster_ids = cluster_counts['cluster'].to_list()
+            count_values = cluster_counts['count'].to_list()
+            
+            fig = go.Figure(data=[
+                go.Bar(x=[f"Cluster {i}" for i in cluster_ids],
+                       y=count_values,
+                       text=count_values,
+                       textposition='auto')
+            ])
+            fig.update_layout(
+                title="Number of Tokens per Cluster",
+                xaxis_title="Cluster",
+                yaxis_title="Number of Tokens",
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.warning("⚠️ Could not display cluster distribution chart")
+            print(f"DEBUG: Cluster distribution error: {e}")
+    else:
+        st.info("📊 Cluster distribution data not available for this analysis type")
     
     # Cluster characteristics summary
     st.subheader("Cluster Characteristics")
@@ -2390,8 +2457,14 @@ def extract_tokens_from_baseline_results(baseline_results: Dict) -> Dict[str, pl
 
 
 def display_behavioral_archetypes(results: Dict):
-    """Display behavioral archetype analysis interface"""
+    """Display behavioral archetype analysis results or interface"""
     st.header("🎭 Behavioral Archetype Analysis")
+    
+    # Check if this is a unified analysis result
+    if results.get('analysis_type') == 'behavioral':
+        # Display unified behavioral archetype results
+        display_unified_behavioral_results(results)
+        return
     
     st.markdown("""
     This section analyzes memecoin tokens to identify behavioral archetypes including death patterns.
@@ -3089,6 +3162,106 @@ def display_baseline_stability_analysis(results: Dict):
                      annotation_text="Success Threshold (0.75)")
         
         st.plotly_chart(fig, use_container_width=True)
+
+
+def display_unified_behavioral_results(results: Dict):
+    """Display unified behavioral archetype analysis results"""
+    st.subheader("🎯 Unified Behavioral Archetype Results")
+    
+    # Display analysis summary
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Tokens Analyzed", results.get('total_tokens_analyzed', 'Unknown'))
+    with col2:
+        if 'clustering_results' in results:
+            st.metric("Clusters Found", results['clustering_results'].get('n_clusters', 'Unknown'))
+    with col3:
+        if 'quality_metrics' in results:
+            quality = results['quality_metrics']
+            st.metric("Silhouette Score", f"{quality.get('silhouette_score', 0):.3f}")
+    
+    # Display cluster imbalance warning if needed
+    if 'quality_metrics' in results:
+        quality = results['quality_metrics']
+        if quality.get('is_severely_imbalanced', False):
+            st.warning(f"⚠️ **Cluster Imbalance**: {quality.get('max_cluster_percentage', 0):.1f}% of tokens in one cluster")
+    
+    # Display archetype information
+    if 'archetypes' in results:
+        st.subheader("📊 Identified Behavioral Archetypes")
+        archetypes = results['archetypes']
+        
+        for cluster_id, archetype in archetypes.items():
+            with st.expander(f"Cluster {cluster_id}: {archetype['name']}", expanded=True):
+                stats = archetype['stats']
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Number of Tokens", stats['n_tokens'])
+                with col2:
+                    st.metric("% of Total", f"{stats['pct_of_total']:.1f}%")
+                with col3:
+                    if 'pct_dead' in stats:
+                        st.metric("% Dead Tokens", f"{stats['pct_dead']:.1f}%")
+    
+    # Display features dataframe if available
+    if 'features_df' in results:
+        st.subheader("🔍 Feature Analysis")
+        features_df = results['features_df']
+        
+        if features_df is not None and hasattr(features_df, 'height') and features_df.height > 0:
+            # Show cluster distribution
+            if 'cluster' in features_df.columns:
+                cluster_dist = features_df.group_by('cluster').count().sort('cluster')
+                st.write("**Cluster Distribution:**")
+                st.dataframe(cluster_dist)
+            
+            # Show feature summary
+            feature_cols = [col for col in features_df.columns 
+                           if col not in ['token', 'category', 'lifespan_category', 'cluster']]
+            if feature_cols:
+                st.write(f"**Features used**: {', '.join(feature_cols[:10])}")
+                if len(feature_cols) > 10:
+                    st.write(f"... and {len(feature_cols) - 10} more features")
+        else:
+            st.warning("No feature data available to display")
+    
+    # Display clustering quality metrics
+    if 'clustering_results' in results:
+        clustering_results = results['clustering_results']
+        quality_metrics = clustering_results.get('quality_metrics', {})
+        
+        if quality_metrics:
+            st.subheader("📈 Clustering Quality Metrics")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Silhouette Score", f"{quality_metrics.get('silhouette_score', 0):.4f}")
+                st.caption("Higher is better (closer to 1)")
+                
+            with col2:
+                db_score = quality_metrics.get('davies_bouldin_score', float('inf'))
+                if db_score != float('inf'):
+                    st.metric("Davies-Bouldin Score", f"{db_score:.4f}")
+                    st.caption("Lower is better (closer to 0)")
+                else:
+                    st.metric("Davies-Bouldin Score", "N/A")
+            
+            # Show imbalance analysis if available
+            if 'imbalance_analysis' in quality_metrics:
+                imbalance = quality_metrics['imbalance_analysis']
+                
+                if 'death_analysis' in imbalance and imbalance['death_analysis']:
+                    st.write("**Death Rate by Cluster:**")
+                    death_data = []
+                    for cluster_id, death_info in imbalance['death_analysis'].items():
+                        death_data.append({
+                            'Cluster': cluster_id,
+                            'Death Rate': f"{death_info.get('death_rate', 0)*100:.1f}%",
+                            'Size': death_info.get('size', 0)
+                        })
+                    if death_data:
+                        st.dataframe(death_data)
 
 
 if __name__ == "__main__":

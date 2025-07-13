@@ -18,11 +18,11 @@ from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.neighbors import NearestNeighbors
 
-from .archetype_utils import (
+from time_series.archetype_utils import (
     extract_essential_features, categorize_by_lifespan, 
     detect_token_death, prepare_token_data
 )
-from .behavioral_archetype_analysis import BehavioralArchetypeAnalyzer
+from time_series.behavioral_archetype_analysis import BehavioralArchetypeAnalyzer
 
 
 class UnifiedAnalysisEngine:
@@ -136,7 +136,7 @@ class UnifiedAnalysisEngine:
         print("DEBUG: Loading data for price-only analysis...")
         
         # For price-only, load from raw data directory
-        from .autocorrelation_clustering import AutocorrelationClusteringAnalyzer
+        from time_series.autocorrelation_clustering import AutocorrelationClusteringAnalyzer
         analyzer = AutocorrelationClusteringAnalyzer()
         return analyzer.load_raw_prices(data_path, limit=max_tokens)
     
@@ -145,16 +145,31 @@ class UnifiedAnalysisEngine:
         """Extract 15 essential features using unified approach."""
         print(f"DEBUG: Extracting unified features using method: {time_series_method}")
         
+        # Validate inputs
+        if not token_data:
+            raise ValueError("No token data provided for feature extraction")
+            
+        if time_series_method not in ["returns", "log_returns", "prices", "log_prices"]:
+            raise ValueError(f"Unknown time series method: {time_series_method}")
+        
         # Map time series method to use_log_returns parameter
         use_log_returns = time_series_method in ["log_returns", "log_prices"]
         
-        # Use the proven 15-feature extraction
-        features_df = extract_essential_features(token_data, use_log_returns=use_log_returns)
-        
-        print(f"DEBUG: Extracted features for {features_df.height} tokens")
-        print(f"DEBUG: Feature columns: {[col for col in features_df.columns if col not in ['token', 'category']]}")
-        
-        return features_df
+        try:
+            # Use the proven 15-feature extraction
+            features_df = extract_essential_features(token_data, use_log_returns=use_log_returns)
+            
+            if features_df is None or features_df.height == 0:
+                raise ValueError("Feature extraction returned empty result")
+                
+            print(f"DEBUG: Extracted features for {features_df.height} tokens")
+            print(f"DEBUG: Feature columns: {[col for col in features_df.columns if col not in ['token', 'category']]}")
+            
+            return features_df
+            
+        except Exception as e:
+            print(f"ERROR: Feature extraction failed: {e}")
+            raise RuntimeError(f"Feature extraction failed: {e}") from e
     
     def _perform_unified_clustering(self, features_df: pl.DataFrame, 
                                    clustering_method: str, find_optimal_k: bool, 
@@ -415,25 +430,57 @@ class UnifiedAnalysisEngine:
         # Group results by lifespan category
         features_with_clusters = features_df.with_columns(pl.Series('cluster', clustering_results['labels']))
         
+        # Validate that lifespan_category column exists
+        if 'lifespan_category' not in features_with_clusters.columns:
+            print("WARNING: 'lifespan_category' column missing from features. This indicates an issue in data loading.")
+            print(f"Available columns: {features_with_clusters.columns}")
+            # Return minimal results structure
+            return {
+                'analysis_type': 'lifespan',
+                'categories': {},
+                'clustering_results': clustering_results,
+                'total_tokens_analyzed': features_df.height,
+                'quality_metrics': clustering_results['quality_metrics'],
+                'error': 'Missing lifespan_category column'
+            }
+        
         category_results = {}
         for category in ['Sprint', 'Standard', 'Marathon']:
-            category_tokens = features_with_clusters.filter(
-                pl.col('lifespan_category') == category
-            ) if 'lifespan_category' in features_with_clusters.columns else pl.DataFrame()
-            
-            if category_tokens.height > 0:
-                category_results[category] = {
-                    'n_tokens': category_tokens.height,
-                    'cluster_distribution': category_tokens.group_by('cluster').count().to_dicts(),
-                    'features': category_tokens
-                }
+            try:
+                category_tokens = features_with_clusters.filter(
+                    pl.col('lifespan_category') == category
+                )
+                
+                if category_tokens.height > 0:
+                    category_results[category] = {
+                        'n_tokens': category_tokens.height,
+                        'cluster_distribution': category_tokens.group_by('cluster').count().to_dicts(),
+                        'features': category_tokens
+                    }
+                else:
+                    print(f"DEBUG: No tokens found for category: {category}")
+            except Exception as e:
+                print(f"ERROR: Failed to process category {category}: {e}")
+                continue
+        
+        # Extract backward compatibility data for lifespan analysis
+        token_names = features_df['token'].to_list() if 'token' in features_df.columns else []
+        cluster_labels = clustering_results['labels']
         
         return {
+            # New unified structure
             'analysis_type': 'lifespan',
             'categories': category_results,
             'clustering_results': clustering_results,
             'total_tokens_analyzed': features_df.height,
-            'quality_metrics': clustering_results['quality_metrics']
+            'quality_metrics': clustering_results['quality_metrics'],
+            
+            # Legacy compatibility keys for display functions
+            'token_names': token_names,
+            'cluster_labels': cluster_labels,
+            'n_clusters': clustering_results['n_clusters'],
+            'token_data': token_data,  # Original token DataFrames
+            'analysis_method': 'lifespan_analysis'
         }
     
     def _generate_behavioral_results(self, token_data: Dict, features_df: pl.DataFrame, 
@@ -445,24 +492,50 @@ class UnifiedAnalysisEngine:
         # Create archetype analysis
         archetypes = self._identify_behavioral_archetypes(features_with_clusters)
         
+        # Extract backward compatibility data
+        token_names = features_df['token'].to_list() if 'token' in features_df.columns else []
+        cluster_labels = clustering_results['labels']
+        
         return {
+            # New unified structure
             'analysis_type': 'behavioral',
             'features_df': features_with_clusters,
             'clustering_results': clustering_results,
             'archetypes': archetypes,
             'total_tokens_analyzed': features_df.height,
-            'quality_metrics': clustering_results['quality_metrics']
+            'quality_metrics': clustering_results['quality_metrics'],
+            
+            # Legacy compatibility keys for display functions
+            'token_names': token_names,
+            'cluster_labels': cluster_labels,
+            'n_clusters': clustering_results['n_clusters'],
+            'token_data': token_data,  # Original token DataFrames
+            'analysis_method': 'behavioral_analysis'
         }
     
     def _generate_price_only_results(self, token_data: Dict, features_df: pl.DataFrame, 
                                     clustering_results: Dict) -> Dict:
         """Generate results for price-only analysis."""
+        features_with_clusters = features_df.with_columns(pl.Series('cluster', clustering_results['labels']))
+        
+        # Extract backward compatibility data for price-only analysis
+        token_names = features_df['token'].to_list() if 'token' in features_df.columns else []
+        cluster_labels = clustering_results['labels']
+        
         return {
+            # New unified structure
             'analysis_type': 'price_only',
-            'features_df': features_df.with_columns(pl.Series('cluster', clustering_results['labels'])),
+            'features_df': features_with_clusters,
             'clustering_results': clustering_results,
             'total_tokens_analyzed': features_df.height,
-            'quality_metrics': clustering_results['quality_metrics']
+            'quality_metrics': clustering_results['quality_metrics'],
+            
+            # Legacy compatibility keys for display functions
+            'token_names': token_names,
+            'cluster_labels': cluster_labels,
+            'n_clusters': clustering_results['n_clusters'],
+            'token_data': token_data,  # Original token DataFrames
+            'analysis_method': 'price_only_analysis'
         }
     
     def _identify_behavioral_archetypes(self, features_with_clusters: pl.DataFrame) -> Dict:

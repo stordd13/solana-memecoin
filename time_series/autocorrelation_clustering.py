@@ -31,7 +31,7 @@ from statsmodels.tsa.stattools import adfuller
 from scipy.optimize import curve_fit
 from joblib import Parallel, delayed
 
-from .archetype_utils import safe_divide, winsorize_array, robust_feature_calculation, detect_token_death, categorize_by_lifespan
+from time_series.archetype_utils import safe_divide, winsorize_array, robust_feature_calculation, detect_token_death, categorize_by_lifespan
 
 
 class AutocorrelationClusteringAnalyzer:
