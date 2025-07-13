@@ -11,7 +11,7 @@ from statsmodels.tsa.stattools import acf
 import warnings
 warnings.filterwarnings('ignore')
 from pathlib import Path
-from scipy.stats import skew
+from scipy.stats import skew, mstats
 from joblib import Parallel, delayed
 
 
@@ -59,77 +59,88 @@ def robust_feature_calculation(data, feature_func, default_value=0.0):
         return default_value
 
 
-def detect_token_death(prices: np.ndarray, returns: np.ndarray, window: int = 30) -> Optional[int]:
+def detect_token_death(prices: np.ndarray, returns: np.ndarray, min_death_duration: int = 30) -> Optional[int]:
     """
-    Detect if and when a token "dies" (price becomes effectively constant).
+    Detect if and when a token "dies" by finding the last point of meaningful activity.
     
-    Uses multiple criteria to handle tokens with very small values correctly:
-    1. Price flatness: all prices in window are identical
-    2. Relative volatility: coefficient of variation of returns
-    3. Tick frequency: ratio of unique prices in window
+    Works backwards from the end to find when meaningful trading stopped, then verifies
+    that prices are constant from that point to the end for at least min_death_duration.
     
     Args:
         prices: Array of token prices
         returns: Array of token returns
-        window: Window size for death detection (default 30 minutes)
+        min_death_duration: Minimum duration of constant prices to consider death (default 30 minutes)
         
     Returns:
-        Index where token died, or None if token never died
+        Index where token died (start of death period), or None if token never died
     """
     # Pre-fill gaps with forward-fill, then backward for edges
     prices_series = pl.Series(prices)
     prices = prices_series.forward_fill().backward_fill().to_numpy()
     
-    if len(prices) < window or len(returns) < window:
+    if len(prices) < min_death_duration or len(returns) < min_death_duration:
         return None
     
-    for i in range(len(returns) - window + 1):  # Adjusted to +1 for exact window
-        window_returns = returns[i:i+window]
-        window_prices = prices[i:i+window]
+    # Define what constitutes "meaningful activity"
+    def is_meaningful_activity(price_window, return_window):
+        """Check if a window contains meaningful trading activity."""
+        if len(price_window) == 0 or len(return_window) == 0:
+            return False
         
-        # Skip if window contains NaN or inf (after fill, should be minimal)
-        if np.any(np.isnan(window_returns)) or np.any(np.isinf(window_returns)):
-            continue
-        if np.any(np.isnan(window_prices)) or np.any(np.isinf(window_prices)):
-            continue
+        # Remove NaN values
+        valid_prices = price_window[~np.isnan(price_window)]
+        valid_returns = return_window[~np.isnan(return_window)]
         
-        # NEW: Skip if >5% gaps remaining (severe data issues)
-        gap_pct = np.sum(np.isnan(window_prices)) / len(window_prices)
-        if gap_pct > 0.05:
-            continue
+        if len(valid_prices) == 0 or len(valid_returns) == 0:
+            return False
         
-        # Get valid prices/returns after any remaining NaN removal
-        valid_prices = window_prices[~np.isnan(window_prices)]
-        valid_returns = window_returns[~np.isnan(window_returns)]
-        
-        # Check 1: All prices identical (true flatline)
+        # Check 1: Price variety - more than one unique price
         unique_prices = np.unique(valid_prices)
-        if len(unique_prices) == 1:
-            return i
+        if len(unique_prices) <= 1:
+            return False
         
-        # Check 2: Relative volatility (handles small value tokens)
-        # Use median absolute deviation for robustness
-        mad_returns = np.median(np.abs(valid_returns - np.median(valid_returns)))
-        mean_abs_return = np.mean(np.abs(valid_returns))
+        # Check 2: Meaningful price movement (relative range > 0.1%)
+        price_range = np.max(valid_prices) - np.min(valid_prices)
+        mean_price = np.mean(valid_prices)
+        relative_range = safe_divide(price_range, mean_price)
+        if relative_range < 0.001:  # Less than 0.1% price movement
+            return False
         
-        if mean_abs_return > 0:
-            relative_volatility = safe_divide(mad_returns, mean_abs_return)
-            if relative_volatility < 0.01:  # Less than 1% relative volatility
-                # Additional check: ensure it's not just a single outlier
-                if np.percentile(np.abs(valid_returns), 90) < 0.001:
-                    return i
+        # Check 3: Some volatility in returns
+        if np.std(valid_returns) < 1e-6:  # Essentially zero volatility
+            return False
         
-        # Check 3: Tick frequency (for staircase death patterns)
-        unique_price_ratio = len(unique_prices) / len(valid_prices) if len(valid_prices) > 0 else 0
-        if unique_price_ratio < 0.1:  # Increased to 0.1 for staircase tolerance
-            # Verify it's not just rounding - check actual price range
-            price_range = np.max(valid_prices) - np.min(valid_prices)
-            mean_price = np.mean(valid_prices)
-            relative_range = safe_divide(price_range, mean_price)
-            if relative_range < 0.001:  # Less than 0.1% price range
-                return i
+        return True
     
-    return None
+    # Work backwards from the end to find last meaningful activity
+    total_length = len(prices)
+    window_size = 5  # Check activity in 5-minute windows
+    
+    last_activity_minute = None
+    
+    # Start from the end and work backwards
+    for end_idx in range(total_length, window_size - 1, -1):
+        start_idx = end_idx - window_size
+        
+        window_prices = prices[start_idx:end_idx]
+        window_returns = returns[start_idx:end_idx] if start_idx < len(returns) else returns[max(0, start_idx-1):end_idx-1]
+        
+        if is_meaningful_activity(window_prices, window_returns):
+            last_activity_minute = end_idx
+            break
+    
+    if last_activity_minute is None:
+        # No meaningful activity found in entire token lifecycle
+        return 0  # Consider dead from the start
+    
+    # Calculate the duration from last activity to end
+    death_duration = total_length - last_activity_minute
+    
+    # Token is dead if the period from last activity to end is >= min_death_duration
+    if death_duration >= min_death_duration:
+        return last_activity_minute
+    else:
+        return None  # Token is alive (has recent activity or death period too short)
 
 
 def calculate_death_features(prices: np.ndarray, returns: np.ndarray, 
@@ -1049,10 +1060,10 @@ def categorize_by_lifespan(token_data: Dict[str, pl.DataFrame], token_limits: Di
         prices, returns, death_minute = prepare_token_data(token_df)
         active_lifespan = death_minute if death_minute is not None else len(token_df)
         
-        # Determine category based on active_lifespan
-        if active_lifespan <= 400:
+        # Determine category based on active_lifespan (updated thresholds)
+        if active_lifespan <= 200:
             category = 'Sprint'
-        elif active_lifespan <= 1200:
+        elif active_lifespan <= 1000:
             category = 'Standard'
         else:
             category = 'Marathon'

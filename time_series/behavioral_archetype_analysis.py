@@ -107,7 +107,7 @@ class BehavioralArchetypeAnalyzer:
                 prices = df['price'].to_numpy()
                 returns = np.diff(prices) / np.maximum(prices[:-1], 1e-10)
                 
-                death_minute = detect_token_death(prices, returns, window=30)
+                death_minute = detect_token_death(prices, returns, min_death_duration=30)
                 
                 # Calculate active lifespan (before death or full length if alive)
                 active_lifespan = death_minute if death_minute is not None else len(df)
@@ -326,9 +326,28 @@ class BehavioralArchetypeAnalyzer:
         
         print(f"DEBUG:  K={best_k}: Silhouette={sil_score:.3f}, Davies-Bouldin={db_score:.3f}")
         
-        # DBSCAN for outlier detection
-        print("\nDEBUG: Performing DBSCAN clustering...")
-        dbscan = DBSCAN(eps=0.5, min_samples=5)
+        # DBSCAN for outlier detection with adaptive parameters
+        print("\nDEBUG: Performing DBSCAN clustering with adaptive parameters...")
+        
+        # Calculate appropriate eps using k-distance graph method
+        from sklearn.neighbors import NearestNeighbors
+        n_features = X_scaled.shape[1]
+        min_samples = max(n_features, 5)  # At least number of dimensions
+        
+        # Find k-nearest neighbors
+        nbrs = NearestNeighbors(n_neighbors=min_samples).fit(X_scaled)
+        distances, indices = nbrs.kneighbors(X_scaled)
+        
+        # Sort distances to k-th nearest neighbor
+        k_distances = distances[:, -1]
+        k_distances_sorted = np.sort(k_distances)
+        
+        # Find elbow point (use 90th percentile for robustness)
+        eps = np.percentile(k_distances_sorted, 90)
+        
+        print(f"DEBUG: DBSCAN parameters - eps={eps:.3f}, min_samples={min_samples}")
+        
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples)
         dbscan_labels = dbscan.fit_predict(X_scaled)
         n_clusters_dbscan = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
         n_outliers = (dbscan_labels == -1).sum()

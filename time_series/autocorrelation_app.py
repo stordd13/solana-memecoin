@@ -137,8 +137,20 @@ def run_baseline_clustering_analysis(processed_data_path, token_limits, k_range,
         
         st.info(f"Optimal K found: {optimal_k} for {category_name}")
         
-        # Test stability
-        stability_results = analyzer.test_clustering_stability(features_df, optimal_k, n_stability_runs)
+        # Test stability (if enabled)
+        if n_stability_runs > 0:
+            stability_results = analyzer.test_clustering_stability(features_df, optimal_k, n_stability_runs)
+        else:
+            # Skip stability testing - provide placeholder results
+            print("DEBUG: Skipping stability tests (user disabled)")
+            stability_results = {
+                'mean_ari': 1.0,  # Placeholder
+                'min_ari': 1.0,
+                'max_ari': 1.0,
+                'std_ari': 0.0,
+                'ari_scores': [1.0],
+                'n_runs': 0
+            }
         
         # Store results
         results['categories'][category_name] = {
@@ -154,17 +166,28 @@ def run_baseline_clustering_analysis(processed_data_path, token_limits, k_range,
     
     # Calculate overall stability summary
     all_ari_scores = []
+    stability_tests_run = False
+    
     for category_results in results['categories'].values():
         stability = category_results['stability_results']
-        if 'ari_scores' in stability:
+        if 'ari_scores' in stability and stability['n_runs'] > 0:
             all_ari_scores.extend(stability['ari_scores'])
+            stability_tests_run = True
     
-    if all_ari_scores:
+    if all_ari_scores and stability_tests_run:
         results['stability_summary'] = {
-            'average_ari': np.mean(all_ari_scores),
+            'mean_ari': np.mean(all_ari_scores),
             'min_ari': np.min(all_ari_scores),
             'max_ari': np.max(all_ari_scores),
             'n_runs': len(all_ari_scores)
+        }
+    else:
+        # No stability tests were run
+        results['stability_summary'] = {
+            'mean_ari': 0.0,  # Indicate tests were skipped
+            'min_ari': 0.0,
+            'max_ari': 0.0,
+            'n_runs': 0
         }
     
     # Export results if requested
@@ -262,13 +285,16 @@ def main():
     # Data directory selection
     # Try to find the correct data directory automatically
     possible_paths = [
+        "data/processed/",
+        "../data_processed",
         "data/raw/dataset",
         "../data/raw/dataset", 
         "../../data/raw/dataset",
-        Path(__file__).parent.parent / "data/raw/dataset"
+        Path(__file__).parent.parent / "data/processed"
     ]
+
     
-    default_path = "data/raw/dataset"
+    default_path = "data/processed"
     for path in possible_paths:
         if Path(path).exists():
             default_path = str(path)
@@ -286,8 +312,14 @@ def main():
     
     analysis_type = st.sidebar.radio(
         "Choose analysis approach:",
-        ["Feature-based (ACF + Statistics)", "Price-only", "Multi-Resolution ACF + Baseline Clustering"],
-        help="Feature-based uses 15 engineered features. Price-only clusters on price series. Multi-Resolution performs comprehensive analysis across Sprint/Standard/Marathon categories with 15-feature baseline clustering and stability testing."
+        ["📊 Lifespan Analysis (Sprint/Standard/Marathon)", "🎭 Behavioral Archetypes (15-Feature)", "Price-only"],
+        help="""
+        📊 **Lifespan Analysis**: Analyzes how Sprint/Standard/Marathon tokens behave differently (ACF patterns by lifespan)
+        🎭 **Behavioral Archetypes**: Finds distinct trading patterns regardless of lifespan (15 engineered features + clustering)
+        **Price-only**: Simple clustering on raw price returns
+        
+        Note: These serve different purposes and can provide complementary insights.
+        """
     )
     
     # Analysis-specific configuration
@@ -295,17 +327,32 @@ def main():
     st.sidebar.subheader("Configuration")
     
     # Initialize default variables (will be overridden by analysis-specific sections)
-    use_log_price = True
     max_tokens = None
     find_optimal_k = True
     n_clusters = None
     clustering_method = 'kmeans'
     
-    # Feature-based specific options
-    if analysis_type == "Feature-based (ACF + Statistics)":
-        with st.sidebar.expander("📊 Feature-based Settings", expanded=True):
-            use_log_price = st.checkbox("Use log prices", value=True,
-                                      help="Use log-transformed prices for feature engineering")
+    # Behavioral Archetypes specific options
+    if analysis_type == "🎭 Behavioral Archetypes (15-Feature)":
+        with st.sidebar.expander("🎭 Behavioral Archetypes Settings", expanded=True):
+            st.markdown("**⭐ PHASE 1B: Behavioral Archetype Analysis**")
+            
+            # Time series selection for behavioral analysis
+            use_log_returns = st.selectbox(
+                "Time series type:",
+                ["log_returns", "returns", "prices", "log_prices"],
+                help="Data transformation for behavioral pattern analysis"
+            )
+            
+            # Add guidance for extreme volatility
+            if use_log_returns == "returns":
+                st.info("💡 **Returns** work well for normal volatility. For extreme moves (>1000%), consider **log_returns**.")
+            elif use_log_returns == "log_returns":
+                st.info("💡 **Log Returns** handle extreme volatility better. Recommended for memecoin analysis.")
+            elif use_log_returns == "log_prices":
+                st.info("💡 **Log Prices** are best for extreme volatility (10M%+ pumps, 99.9% dumps). Most stable for memecoin analysis.")
+            else:
+                st.info("💡 **Raw Prices** can be unstable with extreme volatility. Consider log_returns for better results.")
             
             max_tokens = st.number_input("Max tokens to analyze:", 
                                        min_value=10, value=1000,
@@ -377,16 +424,28 @@ def main():
             - **dtw_features**: Statistical features from price series
             """)
     
-    # Multi-Resolution ACF + Baseline Clustering specific options
-    elif analysis_type == "Multi-Resolution ACF + Baseline Clustering":
+    # Lifespan Analysis specific options  
+    elif analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
         with st.sidebar.expander("🚀 Multi-Resolution Settings", expanded=True):
             st.markdown("**⭐ PHASE 1A: Multi-Resolution Analysis**")
             
             multi_method = st.selectbox(
                 "Price transformation:",
-                ["returns", "log_returns", "prices", "dtw_features"],
+                ["returns", "log_returns", "prices", "log_prices", "dtw_features"],
                 help="Method for analyzing across lifespan categories"
             )
+            
+            # Add guidance for extreme volatility
+            if multi_method == "returns":
+                st.info("💡 **Returns** work well for normal volatility. For extreme moves (>1000%), consider **log_returns**.")
+            elif multi_method == "log_returns":
+                st.info("💡 **Log Returns** handle extreme volatility better. Recommended for memecoin analysis.")
+            elif multi_method == "log_prices":
+                st.info("💡 **Log Prices** are best for extreme volatility (10M%+ pumps, 99.9% dumps). Most stable for memecoin analysis.")
+            elif multi_method == "dtw_features":
+                st.info("💡 **DTW Features** find similar temporal patterns regardless of scale. Good for discovering behavioral patterns.")
+            else:
+                st.info("💡 **Raw Prices** can be unstable with extreme volatility. Consider log_returns for better results.")
             
             # Token limit with support for unlimited analysis
             token_limit_input = st.text_input(
@@ -445,11 +504,20 @@ def main():
                 k_range_max = st.number_input("Max clusters (K):", min_value=3, max_value=15, value=10)
                 
                 # Stability testing
-                n_stability_runs = st.number_input(
-                    "Number of stability runs:", 
-                    min_value=3, max_value=10, value=5,
-                    help="Number of runs to test clustering stability (ARI calculation)"
+                run_stability_tests = st.checkbox(
+                    "Run stability tests", 
+                    value=True,
+                    help="Stability tests validate clustering consistency but can be slow for large datasets"
                 )
+                
+                if run_stability_tests:
+                    n_stability_runs = st.number_input(
+                        "Number of stability runs:", 
+                        min_value=1, max_value=10, value=5,
+                        help="Number of runs to test clustering stability (ARI calculation)"
+                    )
+                else:
+                    n_stability_runs = 0  # Skip stability testing
                 
                 # Export options
                 export_results = st.checkbox("Export results to files", value=True)
@@ -470,7 +538,6 @@ def main():
             """)
         
         # Multi-resolution uses fixed optimal settings
-        use_log_price = True
         find_optimal_k = True
         n_clusters = None
         clustering_method = 'kmeans'
@@ -486,7 +553,7 @@ def main():
             export_results = True
     
     # Initialize variables for other analysis types that don't have multi-resolution settings
-    if analysis_type not in ["Multi-Resolution ACF + Baseline Clustering"]:
+    if analysis_type not in ["📊 Lifespan Analysis (Sprint/Standard/Marathon)"]:
         multi_method = "returns"  # Default for non-multi-resolution analysis
         max_tokens_per_category = None  # Use None as default for unlimited
         enable_dtw_clustering = False
@@ -505,7 +572,7 @@ def main():
     
     
     # Quick rerun option if results exist (only for non-multi-resolution analysis)
-    if 'results' in st.session_state and analysis_type not in ["Multi-Resolution ACF + Baseline Clustering"]:
+    if 'results' in st.session_state and analysis_type not in ["📊 Lifespan Analysis (Sprint/Standard/Marathon)"]:
         st.sidebar.markdown("---")
         st.sidebar.markdown("**Quick Rerun Options:**")
         
@@ -560,116 +627,148 @@ def main():
                 
                 st.info(f"Found {len(parquet_files)} parquet files in {data_path.absolute()}")
                 
-                # Run analysis based on selected type
+                # Validate configuration based on analysis type
                 if analysis_type == "Price-only":
-                    # Run price-only analysis
-                    results = analyzer.run_price_only_analysis(
-                        data_path,
-                        method=price_method,
-                        use_log_price=use_log_price,
-                        n_clusters=n_clusters,
-                        find_optimal_k=find_optimal_k,
-                        clustering_method=clustering_method,
-                        max_tokens=max_tokens,
-                        max_length=max_sequence_length if use_max_length else None
-                    )
-                elif analysis_type == "Multi-Resolution ACF + Baseline Clustering":
-                    # Run multi-resolution lifespan category analysis
-                    st.info("🚀 Running Phase 1A: Multi-Resolution ACF Analysis...")
-                    
-                    # Use processed data directory for multi-resolution analysis
-                    processed_data_path = data_path.parent / "processed"
-                    if not processed_data_path.exists():
-                        st.error(f"Processed data directory not found: {processed_data_path.absolute()}")
-                        st.error("Please run data analysis first to generate processed categories.")
+                    if 'price_method' not in locals():
+                        st.error("Price method not selected. Please configure the analysis settings.")
                         return
-                    
-                    st.info(f"Using processed data from: {processed_data_path.absolute()}")
-                    
-                    results = analyzer.analyze_by_lifespan_category(
-                        processed_data_path,
-                        method=multi_method,
-                        use_log_price=use_log_price,
-                        max_tokens_per_category=max_tokens_per_category,
-                        sample_ratio=sample_ratio
-                    )
-                    
-                    # If DTW clustering is enabled, run it on each category
-                    if enable_dtw_clustering:
-                        st.info("Running DTW clustering for variable-length sequences...")
-                        for category_name, category_results in results['categories'].items():
-                            try:
-                                dtw_results = analyzer.dtw_clustering_variable_length(
-                                    category_results['token_data'],
-                                    use_log_price=use_log_price,
-                                    n_clusters=5,
-                                    max_tokens=50  # Limit for DTW performance
-                                )
-                                category_results['dtw_clustering'] = dtw_results
-                            except Exception as e:
-                                st.warning(f"DTW clustering failed for {category_name}: {e}")
-                    
-                    # Compare ACF across categories if enabled
-                    if compare_across_categories:
-                        st.info("Comparing ACF patterns across lifespan categories...")
-                        try:
-                            acf_comparison = analyzer.compare_acf_across_lifespans(results)
-                            results['acf_comparison'] = acf_comparison
-                        except Exception as e:
-                            st.warning(f"ACF comparison failed: {e}")
-                    
-                    # Run baseline clustering if enabled
-                    if enable_baseline_clustering:
-                        st.info("🎯 Running Baseline Clustering Analysis (CEO Requirements)...")
+                elif analysis_type == "🎭 Behavioral Archetypes (15-Feature)":
+                    if 'use_log_returns' not in locals():
+                        st.error("Time series type not selected. Please configure the analysis settings.")
+                        return
+                elif analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
+                    if 'multi_method' not in locals():
+                        st.error("Price transformation not selected. Please configure the analysis settings.")
+                        return
+                
+                # Check for cached results with parameter-based invalidation
+                cache_key = f"{analysis_type}_{data_dir}"
+                if analysis_type == "Price-only":
+                    cache_key += f"_{price_method}_{max_tokens}_{clustering_method}_{find_optimal_k}_{n_clusters}"
+                elif analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
+                    cache_key += f"_{multi_method}_{max_tokens_per_category}_{sample_ratio}_{clustering_method}_{find_optimal_k}_{n_clusters}"
+                elif analysis_type == "🎭 Behavioral Archetypes (15-Feature)":
+                    cache_key += f"_{use_log_returns}_{max_tokens}_{clustering_method}_{find_optimal_k}_{n_clusters}"
+                
+                # Check if we have cached results with same parameters
+                use_cached = False
+                if 'cached_results' in st.session_state and 'cached_key' in st.session_state:
+                    if st.session_state['cached_key'] == cache_key:
+                        st.info("🎯 **Found cached results with same parameters** - using cached analysis")
+                        use_cached = True
+                        results = st.session_state['cached_results']
+                
+                if not use_cached:
+                    # Run unified analysis - eliminates redundancy and streamlines all analysis types
+                    from .unified_analysis import UnifiedAnalysisEngine
+                    unified_engine = UnifiedAnalysisEngine()
+                
+                    # Map analysis types to unified engine parameters
+                    if analysis_type == "Price-only":
+                        st.info(f"🔄 Running unified price-only analysis with method: {price_method}")
                         
-                        # Pass the already sampled categories to baseline clustering
-                        sampled_categories = {}
-                        for cat_name, cat_results in results['categories'].items():
-                            if 'token_data' in cat_results:
-                                sampled_categories[cat_name] = cat_results['token_data']
-                        
-                        baseline_results = run_baseline_clustering_analysis(
-                            processed_data_path,
-                            token_limits={
-                                'sprint': None,  # No limits - use all tokens
-                                'standard': None, 
-                                'marathon': None
-                            },
-                            k_range=(k_range_min, k_range_max),
-                            n_stability_runs=n_stability_runs,
-                            export_results=export_results,
-                            sample_ratio=None,  # Don't sample again
-                            pre_loaded_tokens=sampled_categories
+                        results = unified_engine.run_unified_analysis(
+                            data_path=data_path,
+                            analysis_type="price_only",
+                            time_series_method=price_method,
+                            max_tokens=max_tokens,
+                            clustering_method=clustering_method,
+                            find_optimal_k=find_optimal_k,
+                            n_clusters=n_clusters
                         )
                         
-                        # Merge baseline results into main results
-                        results['baseline_clustering'] = baseline_results
+                    elif analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
+                        st.info(f"🔄 Running unified lifespan analysis with method: {multi_method}")
+                        
+                        # Use processed data directory
+                        processed_data_path = data_path.parent / "processed"
+                        if not processed_data_path.exists():
+                            st.error(f"Processed data directory not found: {processed_data_path.absolute()}")
+                            st.error("Please run data analysis first to generate processed categories.")
+                            return
+                        
+                        results = unified_engine.run_unified_analysis(
+                            data_path=processed_data_path,
+                            analysis_type="lifespan", 
+                            time_series_method=multi_method,
+                            max_tokens_per_category=max_tokens_per_category,
+                            sample_ratio=sample_ratio,
+                            clustering_method=clustering_method,
+                            find_optimal_k=find_optimal_k,
+                            n_clusters=n_clusters
+                        )
+                        
+                    elif analysis_type == "🎭 Behavioral Archetypes (15-Feature)":
+                        st.info(f"🔄 Running unified behavioral archetype analysis with method: {use_log_returns}")
+                        
+                        # Use processed data directory
+                        processed_data_path = data_path.parent / "processed"
+                        if not processed_data_path.exists():
+                            st.error(f"Processed data directory not found: {processed_data_path.absolute()}")
+                            st.error("Please run data analysis first to generate processed categories.")
+                            return
+                        
+                        results = unified_engine.run_unified_analysis(
+                            data_path=processed_data_path,
+                            analysis_type="behavioral",
+                            time_series_method=use_log_returns,
+                            max_tokens=max_tokens,
+                            clustering_method=clustering_method,
+                            find_optimal_k=find_optimal_k,
+                            n_clusters=n_clusters
+                        )
+                        
+                    else:
+                        st.error(f"Unknown analysis type: {analysis_type}")
+                        return
+                    
+                    # Cache the results for future use
+                    st.session_state['cached_results'] = results
+                    st.session_state['cached_key'] = cache_key
+                    st.info("💾 **Results cached** for faster future access with same parameters")
                 
-                
-                else:
-                    # Run complete feature-based analysis
-                    results = analyzer.run_complete_analysis(
-                        data_path,
-                        use_log_price=use_log_price,
-                        n_clusters=n_clusters,
-                        find_optimal_k=find_optimal_k,
-                        clustering_method=clustering_method,
-                        max_tokens=max_tokens
-                    )
+                # Display cluster quality analysis
+                if 'quality_metrics' in results:
+                    quality = results['quality_metrics']
+                    
+                    if quality['is_severely_imbalanced']:
+                        st.warning(f"⚠️ **Cluster Imbalance Detected**: {quality['max_cluster_percentage']:.1f}% of tokens in one cluster")
+                        
+                        # Show imbalance analysis
+                        if 'imbalance_analysis' in quality and 'death_analysis' in quality['imbalance_analysis']:
+                            st.info("**Likely cause**: Most tokens are dead/inactive, creating natural clustering imbalance")
+                            death_analysis = quality['imbalance_analysis']['death_analysis']
+                            for cluster_id, stats in death_analysis.items():
+                                if stats['size'] > len(results.get('features_df', [])) * 0.5:  # Large cluster
+                                    st.info(f"Cluster {cluster_id}: {stats['death_rate']*100:.1f}% death rate ({stats['size']} tokens)")
+                    
+                    st.info(f"📊 **Clustering Quality**: Silhouette={quality['silhouette_score']:.3f}, K={quality['n_clusters']}")
+                    
+                    # Show cluster distribution
+                    st.info("**Cluster Distribution**:")
+                    for cluster_id, percentage in quality['cluster_percentages'].items():
+                        st.text(f"  Cluster {cluster_id}: {percentage:.1f}% ({quality['cluster_sizes'][cluster_id]} tokens)")
+                    
+                    # Recommendations
+                    if quality['is_severely_imbalanced']:
+                        st.info("💡 **Recommendations**:")
+                        st.info("• Try DBSCAN clustering for outlier detection")
+                        st.info("• Use stratified sampling to balance alive/dead tokens")  
+                        st.info("• Consider filtering out dead tokens for behavioral analysis")
                 
                 # Store results in session state with caching metadata
                 st.session_state['results'] = results
                 st.session_state['analysis_metadata'] = {
                     'analysis_type': analysis_type,
-                    'sample_ratio': sample_ratio if analysis_type == "Multi-Resolution ACF + Baseline Clustering" else None,
-                    'baseline_clustering_enabled': enable_baseline_clustering if analysis_type == "Multi-Resolution ACF + Baseline Clustering" else False,
-                    'processed_data_path': str(processed_data_path) if analysis_type == "Multi-Resolution ACF + Baseline Clustering" else None,
+                    'sample_ratio': sample_ratio if analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)" else None,
+                    'baseline_clustering_enabled': enable_baseline_clustering if analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)" else False,
+                    'processed_data_path': str(processed_data_path) if analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)" else None,
                     'total_tokens_analyzed': results.get('total_tokens_analyzed', 0),
                     'timestamp': datetime.now().isoformat()
                 }
                 
                 # Success message depends on analysis type
-                if analysis_type == "Multi-Resolution ACF + Baseline Clustering":
+                if analysis_type == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
                     total_tokens = results.get('total_tokens_analyzed', 0)
                     n_categories = len(results.get('categories', {}))
                     success_msg = f"✅ Multi-Resolution Analysis complete! Analyzed {total_tokens} tokens across {n_categories} lifespan categories."
@@ -678,7 +777,7 @@ def main():
                     if enable_baseline_clustering and 'baseline_clustering' in results:
                         baseline_results = results['baseline_clustering']
                         stability_summary = baseline_results.get('stability_summary', {})
-                        avg_ari = stability_summary.get('average_ari', 0)
+                        avg_ari = stability_summary.get('mean_ari', 0)
                         success_msg += f" Baseline clustering: Average ARI {avg_ari:.3f}"
                     
                     st.success(success_msg)
@@ -2308,7 +2407,7 @@ def display_behavioral_archetypes(results: Dict):
     can_use_cached = False
     cached_metadata = st.session_state.get('analysis_metadata', {})
     
-    if cached_metadata.get('analysis_type') == "Multi-Resolution ACF + Baseline Clustering":
+    if cached_metadata.get('analysis_type') == "📊 Lifespan Analysis (Sprint/Standard/Marathon)":
         can_use_cached = True
         st.info("✅ Using cached multi-resolution analysis results for faster processing!")
         
@@ -2868,7 +2967,7 @@ def display_baseline_cluster_overview(results: Dict):
         st.metric("Categories", n_categories)
     
     with col3:
-        avg_ari = stability_summary.get('average_ari', 0)
+        avg_ari = stability_summary.get('mean_ari', 0)
         st.metric("Average ARI", f"{avg_ari:.3f}")
     
     with col4:
@@ -2884,7 +2983,7 @@ def display_baseline_cluster_overview(results: Dict):
             'Category': category_name,
             'Tokens': category_results['n_tokens'],
             'Optimal K': category_results['optimal_k'],
-            'Average ARI': category_results['stability_results']['average_ari'],
+            'Average ARI': category_results['stability_results']['mean_ari'],
             'Min ARI': category_results['stability_results']['min_ari']
         })
     
@@ -2926,7 +3025,7 @@ def display_baseline_stability_analysis(results: Dict):
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("Average ARI", f"{stability_summary['average_ari']:.3f}")
+            st.metric("Average ARI", f"{stability_summary['mean_ari']:.3f}")
         
         with col2:
             st.metric("Min ARI", f"{stability_summary['min_ari']:.3f}")
@@ -2945,11 +3044,11 @@ def display_baseline_stability_analysis(results: Dict):
         stability = category_results['stability_results']
         stability_data.append({
             'Category': category_name,
-            'Average ARI': stability['average_ari'],
+            'Average ARI': stability['mean_ari'],
             'Min ARI': stability['min_ari'],
             'Max ARI': stability['max_ari'],
             'Runs': stability['n_runs'],
-            'Status': '✅ STABLE' if stability['average_ari'] > 0.75 else '⚠️ UNSTABLE'
+            'Status': '✅ STABLE' if stability['mean_ari'] > 0.75 else '⚠️ UNSTABLE'
         })
     
     if stability_data:

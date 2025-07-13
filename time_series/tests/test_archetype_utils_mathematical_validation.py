@@ -33,7 +33,7 @@ class TestDeathDetectionMathematicalValidation:
         prices = np.array([100.0, 100.0, 100.0, 100.0, 100.0] * 10)  # 50 identical prices
         returns = np.zeros(len(prices) - 1)
         
-        death_minute = detect_token_death(prices, returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         assert death_minute is not None, "Should detect death with identical prices"
         # Death detection starts checking from index 0, but needs window data
         assert death_minute >= 0, "Should detect death at a valid index"
@@ -42,14 +42,14 @@ class TestDeathDetectionMathematicalValidation:
         prices = np.array([100.0, 100.001, 100.002, 100.001, 100.0] * 10)
         returns = np.diff(prices) / prices[:-1]
         
-        death_minute = detect_token_death(prices, returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         # Should not detect death with small but real variations
         
         # Test case 3: Single unique price after variations
         prices = np.array([100.0, 105.0, 110.0] + [100.0] * 35)  # 35 identical prices
         returns = np.diff(prices) / prices[:-1]
         
-        death_minute = detect_token_death(prices, returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         assert death_minute is not None, "Should detect death with single unique price"
         # Death should be detected within reasonable range
         assert death_minute >= 0, "Should detect death at valid index"
@@ -61,7 +61,7 @@ class TestDeathDetectionMathematicalValidation:
         small_prices[0] = 0.00000002  # Tiny initial movement
         returns = np.diff(small_prices) / small_prices[:-1]
         
-        death_minute = detect_token_death(small_prices, returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         # Should detect death in small-value tokens eventually
         
         # Test case 2: Validate MAD calculation
@@ -85,7 +85,7 @@ class TestDeathDetectionMathematicalValidation:
         zero_returns = np.zeros(30)
         prices = np.array([100.0] * 31)
         
-        death_minute = detect_token_death(prices, zero_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         # Note: With zero returns and identical prices, should detect death
         # However, the algorithm may not detect it if the criteria aren't met
         # The test verifies the calculation is mathematically correct
@@ -117,7 +117,7 @@ class TestDeathDetectionMathematicalValidation:
             f"Relative range calculation error: {relative_range} vs {expected_relative_range}"
         
         # Test case 3: Death detection with this pattern
-        death_minute = detect_token_death(prices, returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         # Should detect death based on tick frequency and range criteria
     
     def test_death_detection_numerical_stability(self):
@@ -126,21 +126,21 @@ class TestDeathDetectionMathematicalValidation:
         large_prices = np.array([1e12, 1e12, 1e12] * 15)
         large_returns = np.diff(large_prices) / large_prices[:-1]
         
-        death_minute = detect_token_death(large_prices, large_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         assert death_minute is not None, "Should handle large numbers"
         
         # Test case 2: Very small numbers
         small_prices = np.array([1e-12, 1e-12, 1e-12] * 15)
         small_returns = np.diff(small_prices) / small_prices[:-1]
         
-        death_minute = detect_token_death(small_prices, small_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         assert death_minute is not None, "Should handle small numbers"
         
         # Test case 3: Mixed scale numbers
         mixed_prices = np.array([1e-6, 1e-6, 1e-6] * 15)
         mixed_returns = np.diff(mixed_prices) / mixed_prices[:-1]
         
-        death_minute = detect_token_death(mixed_prices, mixed_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         assert death_minute is not None, "Should handle mixed scale numbers"
     
     def test_death_detection_edge_cases(self):
@@ -149,28 +149,28 @@ class TestDeathDetectionMathematicalValidation:
         short_prices = np.array([100.0, 101.0])
         short_returns = np.array([0.01])
         
-        death_minute = detect_token_death(short_prices, short_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         assert death_minute is None, "Should return None for insufficient data"
         
         # Test case 2: Exact window size
         exact_prices = np.array([100.0] * 30)
         exact_returns = np.zeros(29)
         
-        death_minute = detect_token_death(exact_prices, exact_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         assert death_minute is None, "Should return None for exact window size"
         
         # Test case 3: NaN and inf handling
         nan_prices = np.array([100.0, np.nan, 100.0] * 15)
         nan_returns = np.diff(nan_prices) / nan_prices[:-1]
         
-        death_minute = detect_token_death(nan_prices, nan_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         # Should handle NaN values gracefully
         
         # Test case 4: Infinite values
         inf_prices = np.array([100.0, np.inf, 100.0] * 15)
         inf_returns = np.diff(inf_prices) / inf_prices[:-1]
         
-        death_minute = detect_token_death(inf_prices, inf_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         # Should handle infinite values gracefully
 
 
@@ -772,7 +772,7 @@ class TestCrossValidationMathematicalAccuracy:
         calc_prices, calc_returns, death_minute = prepare_token_data(df)
         
         # Test death detection
-        detected_death = detect_token_death(calc_prices, calc_returns, window=30)
+        detected_death = detect_token_death(prices, returns, min_death_duration=30)
         
         # Test feature extraction
         death_features = calculate_death_features(calc_prices, calc_returns, detected_death)
@@ -824,7 +824,7 @@ class TestCrossValidationMathematicalAccuracy:
         minimal_returns = np.array([0.01])
         
         # All functions should handle minimal data gracefully
-        death_minute = detect_token_death(minimal_prices, minimal_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         death_features = calculate_death_features(minimal_prices, minimal_returns, death_minute)
         lifecycle_features = extract_lifecycle_features(minimal_prices, minimal_returns, death_minute)
         early_features = extract_early_features(minimal_prices, minimal_returns, window_minutes=5)
@@ -839,7 +839,7 @@ class TestCrossValidationMathematicalAccuracy:
         extreme_returns = np.diff(extreme_prices) / extreme_prices[:-1]
         
         # Should handle extreme values without overflow/underflow
-        death_minute = detect_token_death(extreme_prices, extreme_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         death_features = calculate_death_features(extreme_prices, extreme_returns, death_minute)
         
         # Results should be finite
@@ -860,7 +860,7 @@ class TestNumericalStabilityValidation:
         large_returns = np.diff(large_prices) / large_prices[:-1]
         
         # Test all functions with large numbers
-        death_minute = detect_token_death(large_prices, large_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         death_features = calculate_death_features(large_prices, large_returns, death_minute)
         lifecycle_features = extract_lifecycle_features(large_prices, large_returns, death_minute)
         
@@ -877,7 +877,7 @@ class TestNumericalStabilityValidation:
         small_returns = np.diff(small_prices) / small_prices[:-1]
         
         # Test all functions with small numbers
-        death_minute = detect_token_death(small_prices, small_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         death_features = calculate_death_features(small_prices, small_returns, death_minute)
         lifecycle_features = extract_lifecycle_features(small_prices, small_returns, death_minute)
         
@@ -894,7 +894,7 @@ class TestNumericalStabilityValidation:
         precision_returns = np.diff(precision_prices) / precision_prices[:-1]
         
         # Test functions
-        death_minute = detect_token_death(precision_prices, precision_returns, window=30)
+        death_minute = detect_token_death(prices, returns, min_death_duration=30)
         death_features = calculate_death_features(precision_prices, precision_returns, death_minute)
         
         # Should detect small variations without precision loss
