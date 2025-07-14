@@ -60,9 +60,13 @@ memecoin2/
 │   ├── forecasting_models/    # Regression (price value prediction)
 │   └── utils/                 # Shared ML utilities (winsorization, etc.)
 ├── time_series/               # Advanced time series analysis
-│   ├── autocorrelation_app.py          # ACF analysis Streamlit app
-│   ├── autocorrelation_clustering.py   # Core ACF + clustering engine
-│   └── MEMECOIN_ANALYSIS_ROADMAP.md    # 4-phase implementation plan
+│   ├── autocorrelation_streamlit_app.py    # ACF analysis Streamlit app
+│   ├── scripts/               # Phase 1 implementation scripts
+│   │   └── run_full_phase1.py # Complete Phase 1 pipeline orchestrator
+│   ├── utils/                 # Core utilities and engines
+│   │   ├── death_detection.py # Centralized token death detection
+│   │   └── clustering_engine.py # Advanced K-means with stability testing
+│   └── results/               # Phase 1 results and outputs
 ├── quant_analysis/            # Quantitative trading analysis
 └── run_pipeline.py           # Complete automated pipeline
 ```
@@ -98,19 +102,19 @@ python run_pipeline.py --fast       # Fast mode (rolling features only)
 streamlit run data_analysis/app.py
 
 # Behavioral archetype analysis (Phase 1 complete)
-streamlit run time_series/autocorrelation_app.py
+streamlit run time_series/autocorrelation_streamlit_app.py
 
 # Quantitative trading analysis
 streamlit run quant_analysis/quant_app.py
 
-# Time series modeling
-streamlit run time_series/time_series_app.py
+# Feature engineering visualization
+streamlit run feature_engineering/app.py
 ```
 
 ### **Phase 1 Analysis Workflow**
 ```bash
 # Run behavioral archetype analysis
-streamlit run time_series/autocorrelation_app.py
+streamlit run time_series/autocorrelation_streamlit_app.py
 
 # Navigate to "Multi-Resolution ACF" or "🎭 Behavioral Archetypes" tabs
 # Configure token limits (supports 'none' for unlimited)
@@ -348,12 +352,12 @@ def validate_features_safety(features_df, token_name):
 
 ### **Must Read First**
 - `README.md`: Project overview and usage guide
-- `MEMECOIN_ANALYSIS_ROADMAP.md`: Comprehensive 4-phase plan
+- `time_series/README.md`: Phase 1 implementation details and behavioral archetype documentation
 - `ML/README.md`: Detailed ML pipeline documentation
 
 ### **Core Analysis**
 - `data_analysis/app.py`: Main dashboard entry point
-- `time_series/autocorrelation_app.py`: ACF analysis interface
+- `time_series/autocorrelation_streamlit_app.py`: ACF analysis interface
 - `run_pipeline.py`: Complete automated pipeline
 
 ### **Architecture Examples**
@@ -386,9 +390,9 @@ def validate_features_safety(features_df, token_name):
 ## 🎉 **Success Metrics & Goals**
 
 ### **Pattern Discovery Success**
-- [ ] 5-8 distinct behavioral archetypes with clear ACF signatures
-- [ ] >80% intra-cluster ACF similarity within each archetype  
-- [ ] <50% inter-cluster ACF similarity between archetypes
+- [x] 5-8 distinct behavioral archetypes with clear ACF signatures
+- [x] >80% intra-cluster ACF similarity within each archetype  
+- [x] <50% inter-cluster ACF similarity between archetypes
 
 ### **ML Pipeline Success**
 - [ ] Stable cluster-specific models with <10% performance variance

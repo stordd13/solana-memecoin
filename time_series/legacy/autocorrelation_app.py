@@ -2460,11 +2460,21 @@ def display_behavioral_archetypes(results: Dict):
     """Display behavioral archetype analysis results or interface"""
     st.header("🎭 Behavioral Archetype Analysis")
     
+    # Debug: Show what results we have
+    st.write("**Debug: Main Behavioral Display:**")
+    st.write(f"- Results type: {type(results)}")
+    st.write(f"- Results keys: {list(results.keys()) if isinstance(results, dict) else 'Not a dict'}")
+    if isinstance(results, dict):
+        st.write(f"- analysis_type: {results.get('analysis_type', 'NOT FOUND')}")
+    
     # Check if this is a unified analysis result
     if results.get('analysis_type') == 'behavioral':
+        st.info("✅ Detected unified behavioral analysis result")
         # Display unified behavioral archetype results
         display_unified_behavioral_results(results)
         return
+    else:
+        st.info(f"ℹ️ Not a unified behavioral result (analysis_type: {results.get('analysis_type', 'None')})")
     
     st.markdown("""
     This section analyzes memecoin tokens to identify behavioral archetypes including death patterns.
@@ -2705,8 +2715,13 @@ def display_behavioral_archetypes(results: Dict):
             status_text.empty()
     
     # Display results if available
+    st.write("**Debug: Session State Check:**")
+    st.write(f"- 'archetype_results' in session_state: {'archetype_results' in st.session_state}")
     if 'archetype_results' in st.session_state:
+        st.write(f"- Session state keys: {list(st.session_state.keys())}")
         results = st.session_state.archetype_results
+        st.write(f"- Archetype results type: {type(results)}")
+        st.write(f"- Archetype results keys: {list(results.keys()) if isinstance(results, dict) else 'Not a dict'}")
         
         # CRITICAL: Add cluster column to features_df ONCE at the main entry point
         # This prevents the recurring "cluster column missing" errors across all display functions
@@ -2754,205 +2769,331 @@ def display_archetype_overview(results: Dict):
     """Display archetype analysis overview"""
     st.subheader("📊 Behavioral Archetype Overview")
     
-    features_df = results['features_df']
-    archetypes = results['archetypes']
-    
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Tokens", len(features_df))
-    
-    with col2:
-        dead_pct = features_df['is_dead'].mean() * 100
-        st.metric("Dead Tokens", f"{dead_pct:.1f}%")
-    
-    with col3:
-        st.metric("Archetypes Found", len(archetypes))
-    
-    with col4:
-        avg_lifespan = features_df['lifespan_minutes'].mean()
-        st.metric("Avg Lifespan", f"{avg_lifespan:.0f} min")
-    
-    # Archetype distribution
-    st.subheader("🎭 Archetype Distribution")
-    
-    # Use polars Series for better performance
-    clustering_results = results['clustering_results']
-    best_k = clustering_results.get('best_k', 2)
-    if 'kmeans' in clustering_results and best_k in clustering_results['kmeans']:
-        cluster_labels = clustering_results['kmeans'][best_k]['labels']
-    else:
-        # Fallback: use cluster column from features_df if available
-        if 'cluster' in features_df.columns:
-            cluster_labels = features_df['cluster'].to_list()
-        else:
-            st.error("No cluster labels found in results")
+    try:
+        # Debug information
+        st.write("**Debug: Results Structure:**")
+        st.write(f"- Available keys: {list(results.keys())}")
+        
+        # Validate required keys
+        required_keys = ['features_df', 'archetypes']
+        missing_keys = [key for key in required_keys if key not in results]
+        if missing_keys:
+            st.error(f"❌ Missing required keys in results: {missing_keys}")
+            st.write("**Available results keys:**", list(results.keys()))
             return
-    
-    cluster_series = pl.Series('cluster', cluster_labels)
-    archetype_counts = cluster_series.value_counts().sort('cluster')
-    
-    # Extract data for plotting
-    cluster_ids = archetype_counts['cluster'].to_list()
-    counts = archetype_counts['count'].to_list()
-    archetype_names = [archetypes[i]['name'] for i in cluster_ids]
-    
-    fig = go.Figure(data=[
-        go.Pie(
-            labels=archetype_names,
-            values=counts,
-            hole=0.3,
-            textinfo='label+percent',
-            hovertemplate='<b>%{label}</b><br>Tokens: %{value}<br>Percentage: %{percent}<extra></extra>'
+        
+        features_df = results['features_df']
+        archetypes = results['archetypes']
+        
+        # Validate data structures
+        if features_df is None:
+            st.error("❌ features_df is None")
+            return
+        
+        if not hasattr(features_df, 'height'):
+            st.error(f"❌ features_df is not a valid DataFrame. Type: {type(features_df)}")
+            return
+            
+        if features_df.height == 0:
+            st.warning("⚠️ features_df is empty")
+            return
+            
+        if not archetypes:
+            st.warning("⚠️ No archetypes found")
+            return
+            
+        st.success(f"✅ Data validation passed - {features_df.height} tokens, {len(archetypes)} archetypes")
+        
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Tokens", len(features_df))
+        
+        with col2:
+            # Check if 'is_dead' column exists
+            if 'is_dead' in features_df.columns:
+                dead_pct = features_df['is_dead'].mean() * 100
+                st.metric("Dead Tokens", f"{dead_pct:.1f}%")
+            else:
+                st.metric("Dead Tokens", "N/A")
+                st.warning("⚠️ 'is_dead' column not found in features")
+        
+        with col3:
+            st.metric("Archetypes Found", len(archetypes))
+        
+        with col4:
+            # Check if 'lifespan_minutes' column exists
+            if 'lifespan_minutes' in features_df.columns:
+                avg_lifespan = features_df['lifespan_minutes'].mean()
+                st.metric("Avg Lifespan", f"{avg_lifespan:.0f} min")
+            else:
+                st.metric("Avg Lifespan", "N/A")
+                st.warning("⚠️ 'lifespan_minutes' column not found in features")
+        
+        # Archetype distribution
+        st.subheader("🎭 Archetype Distribution")
+        
+        # Validate clustering results
+        if 'clustering_results' not in results:
+            st.error("❌ clustering_results not found in results")
+            return
+            
+        clustering_results = results['clustering_results']
+        best_k = clustering_results.get('best_k', 2)
+        
+        # Try to get cluster labels
+        cluster_labels = None
+        if 'kmeans' in clustering_results and best_k in clustering_results['kmeans']:
+            cluster_labels = clustering_results['kmeans'][best_k]['labels']
+            st.write(f"✅ Using cluster labels from kmeans k={best_k}")
+        elif 'cluster' in features_df.columns:
+            cluster_labels = features_df['cluster'].to_list()
+            st.write("✅ Using cluster labels from features_df")
+        else:
+            st.error("❌ No cluster labels found in results")
+            st.write("**Debug info:**")
+            st.write(f"- best_k: {best_k}")
+            st.write(f"- clustering_results keys: {list(clustering_results.keys())}")
+            if 'kmeans' in clustering_results:
+                st.write(f"- kmeans keys: {list(clustering_results['kmeans'].keys())}")
+            st.write(f"- features_df columns: {list(features_df.columns)}")
+            return
+        
+        cluster_series = pl.Series('cluster', cluster_labels)
+        archetype_counts = cluster_series.value_counts().sort('cluster')
+        
+        # Extract data for plotting
+        cluster_ids = archetype_counts['cluster'].to_list()
+        counts = archetype_counts['count'].to_list()
+        
+        # Validate archetypes data
+        try:
+            archetype_names = [archetypes[i]['name'] for i in cluster_ids]
+        except KeyError as e:
+            st.error(f"❌ Missing archetype data for cluster {e}")
+            st.write(f"Available archetype keys: {list(archetypes.keys())}")
+            st.write(f"Required cluster IDs: {cluster_ids}")
+            return
+        except Exception as e:
+            st.error(f"❌ Error extracting archetype names: {e}")
+            return
+        
+        # Create visualization
+        fig = go.Figure(data=[
+            go.Pie(
+                labels=archetype_names,
+                values=counts,
+                hole=0.3,
+                textinfo='label+percent',
+                hovertemplate='<b>%{label}</b><br>Tokens: %{value}<br>Percentage: %{percent}<extra></extra>'
+            )
+        ])
+        fig.update_layout(
+            title="Token Distribution by Behavioral Archetype",
+            height=500
         )
-    ])
-    fig.update_layout(
-        title="Token Distribution by Behavioral Archetype",
-        height=500
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Archetype characteristics table
-    st.subheader("📋 Archetype Characteristics")
-    
-    table_data = []
-    for cluster_id, archetype in archetypes.items():
-        stats = archetype['stats']
-        table_data.append({
-            'Archetype': archetype['name'],
-            'Tokens': stats['n_tokens'],
-            'Percentage': f"{stats['pct_of_total']:.1f}%",
-            'Death Rate': f"{stats['pct_dead']:.1f}%",
-            'Avg Lifespan': f"{stats['avg_lifespan']:.0f} min",
-            'Avg Max Return (5min)': f"{stats['avg_return_magnitude']*100:.1f}%"
-        })
-    
-    # Convert to polars DataFrame for consistency
-    table_df = pl.DataFrame(table_data)
-    st.dataframe(table_df.to_pandas(), use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Archetype characteristics table
+        st.subheader("📋 Archetype Characteristics")
+        
+        table_data = []
+        for cluster_id, archetype in archetypes.items():
+            stats = archetype['stats']
+            table_data.append({
+                'Archetype': archetype['name'],
+                'Tokens': stats['n_tokens'],
+                'Percentage': f"{stats['pct_of_total']:.1f}%",
+                'Death Rate': f"{stats['pct_dead']:.1f}%",
+                'Avg Lifespan': f"{stats['avg_lifespan']:.0f} min",
+                'Avg Max Return (5min)': f"{stats['avg_return_magnitude']*100:.1f}%"
+            })
+        
+        # Convert to polars DataFrame for consistency
+        table_df = pl.DataFrame(table_data)
+        st.dataframe(table_df.to_pandas(), use_container_width=True)
+        
+    except Exception as e:
+        st.error(f"❌ Error in display_archetype_overview: {str(e)}")
+        st.write("**Exception details:**")
+        import traceback
+        st.code(traceback.format_exc())
 
 
 def display_archetype_details(results: Dict):
     """Display detailed archetype analysis"""
     st.subheader("🎯 Detailed Archetype Analysis")
     
-    archetypes = results['archetypes']
-    features_df = results['features_df']
-    
-    # Note: cluster column is now added at the main entry point in display_behavioral_archetypes
-    # No need to add it here anymore
-    
-    # Select archetype for detailed view
-    archetype_options = {f"{arch['name']} (Cluster {cluster_id})": cluster_id 
-                        for cluster_id, arch in archetypes.items()}
-    
-    selected_archetype = st.selectbox(
-        "Select archetype for detailed analysis:",
-        options=list(archetype_options.keys())
-    )
-    
-    if selected_archetype:
-        cluster_id = archetype_options[selected_archetype]
-        archetype = archetypes[cluster_id]
-        cluster_data = features_df.filter(pl.col('cluster') == cluster_id)
+    try:
+        # Debug and validation
+        st.write("**Debug: Archetype Details:**")
+        st.write(f"- Available keys: {list(results.keys())}")
         
-        # Archetype summary
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Total Tokens", archetype['stats']['n_tokens'])
-        
-        with col2:
-            st.metric("Death Rate", f"{archetype['stats']['pct_dead']:.1f}%")
-        
-        with col3:
-            st.metric("Avg Lifespan", f"{archetype['stats']['avg_lifespan']:.0f} min")
-        
-        # Representative examples
-        st.subheader(f"📋 Representative Examples: {archetype['name']}")
-        
-        examples_data = []
-        for token in archetype['examples'][:10]:
-            filtered_data = cluster_data.filter(pl.col('token') == token)
-            if filtered_data.height > 0:
-                token_data = filtered_data.row(0, named=True)
-                examples_data.append({
-                    'Token': token,
-                    'Category': token_data.get('category', 'N/A'),
-                    'Is Dead': '💀' if token_data.get('is_dead', False) else '✅',
-                    'Lifespan': f"{token_data.get('lifespan_minutes', 0):.0f} min",
-                    'Final Price Ratio': f"{token_data['final_price_ratio']*100:.1f}%" if 'final_price_ratio' in token_data and not np.isnan(token_data['final_price_ratio']) else 'N/A'
-                })
-            else:
-                st.warning(f"Token {token} not found in cluster data")
-                continue
-        
-        # Use polars DataFrame for better performance
-        examples_df = pl.DataFrame(examples_data)
-        # Convert to pandas only for Streamlit display
-        st.dataframe(examples_df.to_pandas(), use_container_width=True)
-        
-        # ACF signature
-        if archetype['acf_signature']:
-            st.subheader(f"📈 ACF Signature: {archetype['name']}")
+        if 'archetypes' not in results:
+            st.error("❌ 'archetypes' not found in results")
+            return
+        if 'features_df' not in results:
+            st.error("❌ 'features_df' not found in results")
+            return
             
-            acf_data = archetype['acf_signature']
-            lags = [int(col.split('_')[-1]) for col in acf_data.keys()]
-            acf_values = list(acf_data.values())
+        archetypes = results['archetypes']
+        features_df = results['features_df']
+        
+        if not archetypes:
+            st.warning("⚠️ No archetypes found")
+            return
+        if features_df is None or features_df.height == 0:
+            st.warning("⚠️ No feature data available")
+            return
             
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=lags,
-                y=acf_values,
-                mode='lines+markers',
-                name=archetype['name'],
-                line=dict(width=3)
-            ))
+        st.success(f"✅ Found {len(archetypes)} archetypes with {features_df.height} tokens")
+        
+        # Note: cluster column is now added at the main entry point in display_behavioral_archetypes
+        # No need to add it here anymore
+        
+        # Select archetype for detailed view
+        archetype_options = {f"{arch['name']} (Cluster {cluster_id})": cluster_id 
+                            for cluster_id, arch in archetypes.items()}
+        
+        selected_archetype = st.selectbox(
+            "Select archetype for detailed analysis:",
+            options=list(archetype_options.keys())
+        )
+        
+        if selected_archetype:
+            cluster_id = archetype_options[selected_archetype]
+            archetype = archetypes[cluster_id]
+            cluster_data = features_df.filter(pl.col('cluster') == cluster_id)
             
-            fig.update_layout(
-                title=f"Average ACF Pattern: {archetype['name']}",
-                xaxis_title="Lag (minutes)",
-                yaxis_title="Autocorrelation",
-                height=400
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            # Archetype summary
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total Tokens", archetype['stats']['n_tokens'])
+            
+            with col2:
+                st.metric("Death Rate", f"{archetype['stats']['pct_dead']:.1f}%")
+            
+            with col3:
+                st.metric("Avg Lifespan", f"{archetype['stats']['avg_lifespan']:.0f} min")
+            
+            # Representative examples
+            st.subheader(f"📋 Representative Examples: {archetype['name']}")
+            
+            examples_data = []
+            for token in archetype['examples'][:10]:
+                filtered_data = cluster_data.filter(pl.col('token') == token)
+                if filtered_data.height > 0:
+                    token_data = filtered_data.row(0, named=True)
+                    examples_data.append({
+                        'Token': token,
+                        'Category': token_data.get('category', 'N/A'),
+                        'Is Dead': '💀' if token_data.get('is_dead', False) else '✅',
+                        'Lifespan': f"{token_data.get('lifespan_minutes', 0):.0f} min",
+                        'Final Price Ratio': f"{token_data['final_price_ratio']*100:.1f}%" if 'final_price_ratio' in token_data and not np.isnan(token_data['final_price_ratio']) else 'N/A'
+                    })
+                else:
+                    st.warning(f"Token {token} not found in cluster data")
+                    continue
+            
+            # Use polars DataFrame for better performance
+            examples_df = pl.DataFrame(examples_data)
+            # Convert to pandas only for Streamlit display
+            st.dataframe(examples_df.to_pandas(), use_container_width=True)
+            
+            # ACF signature
+            if archetype['acf_signature']:
+                st.subheader(f"📈 ACF Signature: {archetype['name']}")
+                
+                acf_data = archetype['acf_signature']
+                lags = [int(col.split('_')[-1]) for col in acf_data.keys()]
+                acf_values = list(acf_data.values())
+                
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=lags,
+                    y=acf_values,
+                    mode='lines+markers',
+                    name=archetype['name'],
+                    line=dict(width=3)
+                ))
+                
+                fig.update_layout(
+                    title=f"Average ACF Pattern: {archetype['name']}",
+                    xaxis_title="Lag (minutes)",
+                    yaxis_title="Autocorrelation",
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+    except Exception as e:
+        st.error(f"❌ Error in display_archetype_details: {str(e)}")
+        st.write("**Exception details:**")
+        import traceback
+        st.code(traceback.format_exc())
 
 
 def display_survival_analysis(results: Dict):
     """Display survival analysis for archetypes"""
     st.subheader("📈 Survival Analysis by Archetype")
     
-    st.markdown("""
-    Survival analysis shows how long tokens of each archetype typically survive before "dying".
-    """)
-    
-    # Placeholder for survival curves
-    # This would require lifelines library for proper Kaplan-Meier curves
-    st.info("📊 Survival curves visualization would be implemented here using lifelines library")
-    
-    # For now, show lifespan distribution
-    features_df = results['features_df']
-    archetypes = results['archetypes']
-    
-    # Create lifespan distribution by archetype
-    archetype_names = {i: arch['name'] for i, arch in archetypes.items()}
-    features_df = features_df.with_columns(
-        pl.col('cluster').map_elements(lambda x: archetype_names.get(x, f"Cluster {x}"), return_dtype=pl.Utf8).alias('archetype_name')
-    )
-    
-    fig = px.box(
-        features_df.to_pandas(),
-        x='archetype_name',
-        y='lifespan_minutes',
-        title="Lifespan Distribution by Archetype",
-        labels={'archetype_name': 'Archetype', 'lifespan_minutes': 'Lifespan (minutes)'}
-    )
-    fig.update_layout(
-        height=500,
-        xaxis_tickangle=-45
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    try:
+        # Debug and validation
+        st.write("**Debug: Survival Analysis:**")
+        st.write(f"- Available keys: {list(results.keys())}")
+        
+        if 'features_df' not in results:
+            st.error("❌ 'features_df' not found in results")
+            return
+        if 'archetypes' not in results:
+            st.error("❌ 'archetypes' not found in results")
+            return
+            
+        features_df = results['features_df']
+        archetypes = results['archetypes']
+        
+        if features_df is None or features_df.height == 0:
+            st.warning("⚠️ No feature data available")
+            return
+        if not archetypes:
+            st.warning("⚠️ No archetypes found")
+            return
+            
+        st.success(f"✅ Survival analysis ready for {len(archetypes)} archetypes")
+        
+        st.markdown("""
+        Survival analysis shows how long tokens of each archetype typically survive before "dying".
+        """)
+        
+        # Placeholder for survival curves - This would require lifelines library for proper Kaplan-Meier curves
+        st.info("📊 Survival curves visualization would be implemented here using lifelines library")
+        
+        # For now, show lifespan distribution
+        # Create lifespan distribution by archetype
+        archetype_names = {i: arch['name'] for i, arch in archetypes.items()}
+        features_df_with_names = features_df.with_columns(
+            pl.col('cluster').map_elements(lambda x: archetype_names.get(x, f"Cluster {x}"), return_dtype=pl.Utf8).alias('archetype_name')
+        )
+        
+        fig = px.box(
+            features_df_with_names.to_pandas(),
+            x='archetype_name',
+            y='lifespan_minutes',
+            title="Lifespan Distribution by Archetype",
+            labels={'archetype_name': 'Archetype', 'lifespan_minutes': 'Lifespan (minutes)'}
+        )
+        fig.update_layout(
+            height=500,
+            xaxis_tickangle=-45
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+    except Exception as e:
+        st.error(f"❌ Error in display_survival_analysis: {str(e)}")
+        st.write("**Exception details:**")
+        import traceback
+        st.code(traceback.format_exc())
 
 
 def display_archetype_tsne(results: Dict):
@@ -3168,100 +3309,117 @@ def display_unified_behavioral_results(results: Dict):
     """Display unified behavioral archetype analysis results"""
     st.subheader("🎯 Unified Behavioral Archetype Results")
     
-    # Display analysis summary
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Tokens Analyzed", results.get('total_tokens_analyzed', 'Unknown'))
-    with col2:
-        if 'clustering_results' in results:
-            st.metric("Clusters Found", results['clustering_results'].get('n_clusters', 'Unknown'))
-    with col3:
+    try:
+        # Debug information
+        st.write("**Debug: Unified Results Structure:**")
+        st.write(f"- Available keys: {list(results.keys())}")
+        
+        # Display analysis summary
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Tokens Analyzed", results.get('total_tokens_analyzed', 'Unknown'))
+        with col2:
+            if 'clustering_results' in results:
+                st.metric("Clusters Found", results['clustering_results'].get('n_clusters', 'Unknown'))
+            else:
+                st.metric("Clusters Found", "N/A")
+                st.warning("⚠️ clustering_results not found")
+        with col3:
+            if 'quality_metrics' in results:
+                quality = results['quality_metrics']
+                st.metric("Silhouette Score", f"{quality.get('silhouette_score', 0):.3f}")
+            else:
+                st.metric("Silhouette Score", "N/A")
+                st.warning("⚠️ quality_metrics not found")
+        
+        # Display cluster imbalance warning if needed
         if 'quality_metrics' in results:
             quality = results['quality_metrics']
-            st.metric("Silhouette Score", f"{quality.get('silhouette_score', 0):.3f}")
-    
-    # Display cluster imbalance warning if needed
-    if 'quality_metrics' in results:
-        quality = results['quality_metrics']
-        if quality.get('is_severely_imbalanced', False):
-            st.warning(f"⚠️ **Cluster Imbalance**: {quality.get('max_cluster_percentage', 0):.1f}% of tokens in one cluster")
-    
-    # Display archetype information
-    if 'archetypes' in results:
-        st.subheader("📊 Identified Behavioral Archetypes")
-        archetypes = results['archetypes']
+            if quality.get('is_severely_imbalanced', False):
+                st.warning(f"⚠️ **Cluster Imbalance**: {quality.get('max_cluster_percentage', 0):.1f}% of tokens in one cluster")
         
-        for cluster_id, archetype in archetypes.items():
-            with st.expander(f"Cluster {cluster_id}: {archetype['name']}", expanded=True):
-                stats = archetype['stats']
+        # Display archetype information
+        if 'archetypes' in results:
+            st.subheader("📊 Identified Behavioral Archetypes")
+            archetypes = results['archetypes']
+            
+            for cluster_id, archetype in archetypes.items():
+                with st.expander(f"Cluster {cluster_id}: {archetype['name']}", expanded=True):
+                    stats = archetype['stats']
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Number of Tokens", stats['n_tokens'])
+                    with col2:
+                        st.metric("% of Total", f"{stats['pct_of_total']:.1f}%")
+                    with col3:
+                        if 'pct_dead' in stats:
+                            st.metric("% Dead Tokens", f"{stats['pct_dead']:.1f}%")
+        
+        # Display features dataframe if available
+        if 'features_df' in results:
+            st.subheader("🔍 Feature Analysis")
+            features_df = results['features_df']
+            
+            if features_df is not None and hasattr(features_df, 'height') and features_df.height > 0:
+                # Show cluster distribution
+                if 'cluster' in features_df.columns:
+                    cluster_dist = features_df.group_by('cluster').count().sort('cluster')
+                    st.write("**Cluster Distribution:**")
+                    st.dataframe(cluster_dist)
                 
-                col1, col2, col3 = st.columns(3)
+                # Show feature summary
+                feature_cols = [col for col in features_df.columns 
+                               if col not in ['token', 'category', 'lifespan_category', 'cluster']]
+                if feature_cols:
+                    st.write(f"**Features used**: {', '.join(feature_cols[:10])}")
+                    if len(feature_cols) > 10:
+                        st.write(f"... and {len(feature_cols) - 10} more features")
+            else:
+                st.warning("No feature data available to display")
+        
+        # Display clustering quality metrics
+        if 'clustering_results' in results:
+            clustering_results = results['clustering_results']
+            quality_metrics = clustering_results.get('quality_metrics', {})
+            
+            if quality_metrics:
+                st.subheader("📈 Clustering Quality Metrics")
+                
+                col1, col2 = st.columns(2)
                 with col1:
-                    st.metric("Number of Tokens", stats['n_tokens'])
+                    st.metric("Silhouette Score", f"{quality_metrics.get('silhouette_score', 0):.4f}")
+                    st.caption("Higher is better (closer to 1)")
+                    
                 with col2:
-                    st.metric("% of Total", f"{stats['pct_of_total']:.1f}%")
-                with col3:
-                    if 'pct_dead' in stats:
-                        st.metric("% Dead Tokens", f"{stats['pct_dead']:.1f}%")
-    
-    # Display features dataframe if available
-    if 'features_df' in results:
-        st.subheader("🔍 Feature Analysis")
-        features_df = results['features_df']
-        
-        if features_df is not None and hasattr(features_df, 'height') and features_df.height > 0:
-            # Show cluster distribution
-            if 'cluster' in features_df.columns:
-                cluster_dist = features_df.group_by('cluster').count().sort('cluster')
-                st.write("**Cluster Distribution:**")
-                st.dataframe(cluster_dist)
-            
-            # Show feature summary
-            feature_cols = [col for col in features_df.columns 
-                           if col not in ['token', 'category', 'lifespan_category', 'cluster']]
-            if feature_cols:
-                st.write(f"**Features used**: {', '.join(feature_cols[:10])}")
-                if len(feature_cols) > 10:
-                    st.write(f"... and {len(feature_cols) - 10} more features")
-        else:
-            st.warning("No feature data available to display")
-    
-    # Display clustering quality metrics
-    if 'clustering_results' in results:
-        clustering_results = results['clustering_results']
-        quality_metrics = clustering_results.get('quality_metrics', {})
-        
-        if quality_metrics:
-            st.subheader("📈 Clustering Quality Metrics")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Silhouette Score", f"{quality_metrics.get('silhouette_score', 0):.4f}")
-                st.caption("Higher is better (closer to 1)")
+                    db_score = quality_metrics.get('davies_bouldin_score', float('inf'))
+                    if db_score != float('inf'):
+                        st.metric("Davies-Bouldin Score", f"{db_score:.4f}")
+                        st.caption("Lower is better (closer to 0)")
+                    else:
+                        st.metric("Davies-Bouldin Score", "N/A")
                 
-            with col2:
-                db_score = quality_metrics.get('davies_bouldin_score', float('inf'))
-                if db_score != float('inf'):
-                    st.metric("Davies-Bouldin Score", f"{db_score:.4f}")
-                    st.caption("Lower is better (closer to 0)")
-                else:
-                    st.metric("Davies-Bouldin Score", "N/A")
-            
-            # Show imbalance analysis if available
-            if 'imbalance_analysis' in quality_metrics:
-                imbalance = quality_metrics['imbalance_analysis']
-                
-                if 'death_analysis' in imbalance and imbalance['death_analysis']:
-                    st.write("**Death Rate by Cluster:**")
-                    death_data = []
-                    for cluster_id, death_info in imbalance['death_analysis'].items():
-                        death_data.append({
-                            'Cluster': cluster_id,
-                            'Death Rate': f"{death_info.get('death_rate', 0)*100:.1f}%",
-                            'Size': death_info.get('size', 0)
-                        })
-                    if death_data:
-                        st.dataframe(death_data)
+                # Show imbalance analysis if available
+                if 'imbalance_analysis' in quality_metrics:
+                    imbalance = quality_metrics['imbalance_analysis']
+                    
+                    if 'death_analysis' in imbalance and imbalance['death_analysis']:
+                        st.write("**Death Rate by Cluster:**")
+                        death_data = []
+                        for cluster_id, death_info in imbalance['death_analysis'].items():
+                            death_data.append({
+                                'Cluster': cluster_id,
+                                'Death Rate': f"{death_info.get('death_rate', 0)*100:.1f}%",
+                                'Size': death_info.get('size', 0)
+                            })
+                        if death_data:
+                            st.dataframe(death_data)
+                        
+    except Exception as e:
+        st.error(f"❌ Error in display_unified_behavioral_results: {str(e)}")
+        st.write("**Exception details:**")
+        import traceback
+        st.code(traceback.format_exc())
 
 
 if __name__ == "__main__":

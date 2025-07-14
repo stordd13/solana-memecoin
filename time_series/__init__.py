@@ -1,12 +1,10 @@
 """
 Time Series Analysis Module for Memecoin Data
-Contains autocorrelation analysis, clustering, and behavioral archetype identification
+Contains focused autocorrelation analysis for deep learning model optimization
 """
 
-from .autocorrelation_clustering import AutocorrelationClusteringAnalyzer
-from .behavioral_archetype_analysis import BehavioralArchetypeAnalyzer
+from .autocorrelation_analysis import AutocorrelationAnalyzer
 
 __all__ = [
-    'AutocorrelationClusteringAnalyzer',
-    'BehavioralArchetypeAnalyzer'
+    'AutocorrelationAnalyzer'
 ]
