@@ -313,8 +313,15 @@ class Phase1PipelineRunner:
         
         # Save to results directory
         pipeline_results_path = self.results_manager.base_results_dir / "phase1_full_pipeline_results.json"
+        
+        # Custom JSON encoder for datetime objects
+        def json_serializable(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            raise TypeError(f"Type {type(obj)} not serializable")
+        
         with open(pipeline_results_path, 'w') as f:
-            json.dump(pipeline_results, f, indent=2)
+            json.dump(pipeline_results, f, indent=2, default=json_serializable)
         
         print(f"\n📊 Pipeline execution complete!")
         print(f"📁 Pipeline results saved to: {pipeline_results_path}")

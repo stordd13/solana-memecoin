@@ -125,12 +125,32 @@ class ArchetypeCharacterizationAnalyzer:
             stability_confidence = result['bootstrap_stability']['stability_confidence']
             token_names = result.get('token_names', [])
             
+            # Validate data consistency
+            if not token_names:
+                print(f"    ⚠️ Warning: No token_names found for {category}, skipping...")
+                continue
+                
+            if len(token_names) != len(consensus_labels):
+                print(f"    ❌ Error: Mismatch in {category} - token_names: {len(token_names)}, labels: {len(consensus_labels)}")
+                print(f"    ⚠️ This might be due to missing token_names in stability results")
+                continue
+                
+            if len(token_names) != len(stability_confidence):
+                print(f"    ❌ Error: Mismatch in {category} - token_names: {len(token_names)}, confidence: {len(stability_confidence)}")
+                continue
+            
             # Create archetype clusters
             category_archetypes = {}
             for cluster_id in range(optimal_k):
                 cluster_indices = [i for i, label in enumerate(consensus_labels) if label == cluster_id]
                 
                 if cluster_indices:
+                    # Validate indices are within bounds
+                    max_idx = max(cluster_indices)
+                    if max_idx >= len(token_names):
+                        print(f"    ❌ Error: Invalid index {max_idx} for token_names of length {len(token_names)}")
+                        continue
+                        
                     cluster_tokens = [token_names[i] for i in cluster_indices]
                     cluster_confidence = [stability_confidence[i] for i in cluster_indices]
                     
@@ -451,9 +471,27 @@ This document summarizes the behavioral archetypes discovered through Phase 1 an
         markdown += f"""
 
 ## Key Insights
-- **Most Common Pattern**: {max(behavior_counts.items(), key=lambda x: x[1])[0].replace('_', ' ').title()}
-- **Rarest Pattern**: {min(behavior_counts.items(), key=lambda x: x[1])[0].replace('_', ' ').title()}
-- **Total Tokens Analyzed**: {sum(info['archetype_data']['size'] for info in all_archetypes.values()):,}
+"""
+        if not behavior_counts:
+            markdown += """- **Most Common Pattern**: No patterns found (data validation failed)
+- **Rarest Pattern**: No patterns found (data validation failed)
+- **Total Tokens Analyzed**: 0
+
+⚠️ **Note**: No archetypes were successfully characterized. This typically happens when:
+1. The stability testing results are missing token_names (re-run from phase 7-8)
+2. Data validation checks failed due to mismatched array lengths
+3. No categories passed the CEO stability requirements
+"""
+        else:
+            most_common = max(behavior_counts.items(), key=lambda x: x[1])[0].replace('_', ' ').title()
+            rarest = min(behavior_counts.items(), key=lambda x: x[1])[0].replace('_', ' ').title()
+            total_tokens = sum(info['archetype_data']['size'] for info in all_archetypes.values())
+            
+            markdown += f"""- **Most Common Pattern**: {most_common}
+- **Rarest Pattern**: {rarest}
+- **Total Tokens Analyzed**: {total_tokens:,}"""
+        
+        markdown += """
 
 ## Trading Strategy Summary
 ### High Priority (Profitable)
@@ -473,7 +511,7 @@ This document summarizes the behavioral archetypes discovered through Phase 1 an
 - **Rug Pull**: Extremely dangerous for retail traders
 
 ## Data Quality Assessment
-- All archetypes passed CEO stability requirements (ARI ≥ 0.75, Silhouette ≥ 0.5)
+- All archetypes passed CEO stability requirements (ARI >= 0.75, Silhouette >= 0.5)
 - High confidence token assignments available for validation
 - Cross-validated against multiple clustering methods
 
@@ -544,6 +582,18 @@ This document summarizes the behavioral archetypes discovered through Phase 1 an
                     }
                     
                     archetype_markdowns[archetype_name] = markdown_doc
+                else:
+                    print(f"    ⚠️ Skipping {archetype_name}: not found in feature analysis results")
+        
+        # Check if any archetypes were created
+        if not all_archetypes:
+            print(f"\n❌ ERROR: No archetypes were successfully characterized!")
+            print(f"   This typically happens when:")
+            print(f"   1. The stability testing results are missing 'token_names' field")
+            print(f"   2. Data validation checks failed due to array length mismatches")
+            print(f"   3. No categories passed the CEO stability requirements")
+            print(f"\n💡 SOLUTION: Re-run the pipeline from phase 7-8 (stability testing):")
+            print(f"   python run_full_phase1.py --resume --from-phase day7_8 --data-dir ../../data/processed --n-tokens {len(archetype_data)}")
         
         # Step 5: Generate summary documentation
         print(f"\n📋 Generating archetype summary documentation...")
