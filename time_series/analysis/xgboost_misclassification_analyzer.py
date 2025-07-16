@@ -37,24 +37,40 @@ class XGBoostMisclassificationAnalyzer:
     """Analyzes XGBoost classifier misclassification patterns."""
     
     def __init__(self, results_dir: Path = None):
-        self.results_dir = results_dir or Path("../results")
-        self.classifier = ArchetypeClassifier()
+        # Fix path resolution - ensure we save to time_series/results/
+        if results_dir is None:
+            # From analysis/ folder, go up one level to time_series/, then to results/
+            self.results_dir = Path(__file__).parent.parent / "results"
+        else:
+            self.results_dir = results_dir
+        self.classifier = ArchetypeClassifier(results_dir=self.results_dir)
         self.token_data = {}
         self.predictions = {}
         self.misclassification_analysis = {}
         
     def load_and_predict(self, archetype_results_path: Path, data_dir: Path) -> None:
-        """Load data and run XGBoost predictions."""
-        print(f"🔥 Loading data and training XGBoost classifier...")
+        """Load pre-trained models and run XGBoost predictions."""
+        print(f"🔥 Loading pre-trained XGBoost models...")
         
-        # Train the classifier
-        training_results = self.classifier.run_training(
-            archetype_results_path,
-            data_dir,
-            minutes=5
-        )
+        # Try to load pre-trained models first
+        try:
+            self.classifier.load_models()
+            print(f"✅ Pre-trained XGBoost models loaded successfully")
+        except FileNotFoundError as e:
+            print(f"⚠️ Pre-trained models not found: {e}")
+            print(f"🔄 Training models from scratch...")
+            
+            # Fallback to training if models don't exist
+            training_results = self.classifier.run_training(
+                archetype_results_path,
+                data_dir,
+                minutes=5
+            )
+            print(f"✅ XGBoost classifier trained successfully")
         
-        print(f"✅ XGBoost classifier trained successfully")
+        # Load archetype results for token mapping (must be done before loading tokens)
+        if not hasattr(self.classifier, 'archetype_data') or not self.classifier.archetype_data:
+            self.classifier.load_archetype_results(archetype_results_path)
         
         # Load all token data to make predictions
         self._load_all_tokens(data_dir)
@@ -107,9 +123,14 @@ class XGBoostMisclassificationAnalyzer:
                 if len(pdf) < 5:  # Need at least 5 minutes
                     continue
                 
-                # Calculate true category based on lifespan
+                # Calculate true category based on lifespan (3-category system)
                 lifespan_minutes = len(pdf)
-                true_category = 'marathon' if lifespan_minutes >= 1200 else 'standard'
+                if lifespan_minutes >= 1200:
+                    true_category = 'marathon'
+                elif lifespan_minutes >= 400:
+                    true_category = 'standard'
+                else:  # 0-399 minutes
+                    true_category = 'sprint'
                 
                 # Get archetype assignment if available
                 archetype_category = 'unknown'
@@ -137,16 +158,22 @@ class XGBoostMisclassificationAnalyzer:
                 feature_cols = [col for col in features_dict.keys() if col not in ['token_name']]
                 X = np.array([[features_dict[col] for col in feature_cols]])
                 
-                # Make prediction
+                # Make prediction with dual model
                 try:
-                    predicted_category, predicted_cluster = self.classifier.predict(X)
+                    predicted_category, predicted_archetype, predicted_cluster = self.classifier.predict(X)
                     predicted_category = predicted_category[0]
+                    predicted_archetype = predicted_archetype[0]
                     predicted_cluster = predicted_cluster[0]
                     
-                    # Calculate prediction confidence
-                    _, _, category_confidence, cluster_confidence = self.classifier.predict_with_confidence(X)
-                    category_conf = category_confidence[0]
-                    cluster_conf = cluster_confidence[0]
+                    # Calculate prediction confidence (for backward compatibility)
+                    try:
+                        _, _, category_confidence, cluster_confidence = self.classifier.predict_with_confidence(X)
+                        category_conf = category_confidence[0]
+                        cluster_conf = cluster_confidence[0]
+                    except:
+                        # If confidence prediction fails, use placeholder values
+                        category_conf = 0.0
+                        cluster_conf = 0.0
                     
                 except Exception as pred_error:
                     # Skip tokens that cause prediction errors
@@ -163,6 +190,7 @@ class XGBoostMisclassificationAnalyzer:
                     'lifespan_minutes': lifespan_minutes,
                     'true_category': true_category,
                     'predicted_category': predicted_category,
+                    'predicted_archetype': predicted_archetype,
                     'predicted_cluster': predicted_cluster,
                     'category_confidence': category_conf,
                     'cluster_confidence': cluster_conf,
@@ -268,13 +296,18 @@ class XGBoostMisclassificationAnalyzer:
         
         # Marathon-specific misclassification
         true_marathons = df[df['true_category'] == 'marathon']
-        marathon_misclassified = true_marathons[true_marathons['predicted_category'] == 'standard']
+        marathon_misclassified = true_marathons[true_marathons['predicted_category'] != 'marathon']
         marathon_misclassification_rate = (len(marathon_misclassified) / len(true_marathons) * 100) if len(true_marathons) > 0 else 0
         
         # Standard-specific misclassification
         true_standards = df[df['true_category'] == 'standard']
-        standard_misclassified = true_standards[true_standards['predicted_category'] == 'marathon']
+        standard_misclassified = true_standards[true_standards['predicted_category'] != 'standard']
         standard_misclassification_rate = (len(standard_misclassified) / len(true_standards) * 100) if len(true_standards) > 0 else 0
+        
+        # Sprint-specific misclassification
+        true_sprints = df[df['true_category'] == 'sprint']
+        sprint_misclassified = true_sprints[true_sprints['predicted_category'] != 'sprint']
+        sprint_misclassification_rate = (len(sprint_misclassified) / len(true_sprints) * 100) if len(true_sprints) > 0 else 0
         
         # Analyze borderline cases (1150-1250 minutes)
         borderline_tokens = df[(df['lifespan_minutes'] >= 1150) & (df['lifespan_minutes'] <= 1250)]
@@ -287,6 +320,14 @@ class XGBoostMisclassificationAnalyzer:
         # Archetype vs prediction comparison
         archetype_tokens = df[df['has_archetype']]
         archetype_vs_prediction_mismatch = archetype_tokens[archetype_tokens['archetype_category'] != archetype_tokens['predicted_category']]
+        
+        # Archetype-level analysis (17-class predictions)
+        archetype_perfect_match = archetype_tokens[archetype_tokens['archetype_name'] == archetype_tokens['predicted_archetype']]
+        archetype_accuracy = len(archetype_perfect_match) / len(archetype_tokens) * 100 if len(archetype_tokens) > 0 else 0
+        
+        # Marathon→Standard misclassification specifically (Q3 focus)
+        marathon_to_standard = true_marathons[true_marathons['predicted_category'] == 'standard']
+        marathon_to_standard_rate = (len(marathon_to_standard) / len(true_marathons) * 100) if len(true_marathons) > 0 else 0
         
         self.misclassification_analysis = {
             'total_tokens': total_tokens,
@@ -301,6 +342,10 @@ class XGBoostMisclassificationAnalyzer:
             'standard_misclassified': len(standard_misclassified),
             'standard_misclassification_rate': standard_misclassification_rate,
             
+            'true_sprints': len(true_sprints),
+            'sprint_misclassified': len(sprint_misclassified),
+            'sprint_misclassification_rate': sprint_misclassification_rate,
+            
             'borderline_tokens': len(borderline_tokens),
             'borderline_misclassified': len(borderline_misclassified),
             'borderline_misclassification_rate': (len(borderline_misclassified) / len(borderline_tokens) * 100) if len(borderline_tokens) > 0 else 0,
@@ -308,6 +353,14 @@ class XGBoostMisclassificationAnalyzer:
             'low_confidence_misclassified': len(low_confidence_misclassified),
             'archetype_tokens': len(archetype_tokens),
             'archetype_prediction_mismatch': len(archetype_vs_prediction_mismatch),
+            
+            # Archetype-level metrics (17-class model)
+            'archetype_accuracy': archetype_accuracy,
+            'archetype_perfect_matches': len(archetype_perfect_match),
+            
+            # Q3-specific metric: Marathon→Standard misclassification
+            'marathon_to_standard_misclassified': len(marathon_to_standard),
+            'marathon_to_standard_rate': marathon_to_standard_rate,
             
             'accuracy': 100 - overall_misclassification_rate
         }
@@ -319,6 +372,46 @@ class XGBoostMisclassificationAnalyzer:
         print(f"   Borderline case misclassification: {self.misclassification_analysis['borderline_misclassification_rate']:.1f}%")
         
         return self.misclassification_analysis
+    
+    def print_key_answer(self) -> None:
+        """Print clear answer to Question 3."""
+        if not self.misclassification_analysis:
+            print("❌ No misclassification analysis available")
+            return
+        
+        analysis = self.misclassification_analysis
+        
+        print("\n" + "="*80)
+        print("🎯 KEY TRADING STRATEGY ANSWER")
+        print("="*80)
+        
+        print(f"\n3️⃣  QUESTION 3: What % of true marathons get misclassified?")
+        print(f"   📊 ANSWER: {analysis['marathon_misclassification_rate']:.1f}%")
+        print(f"   🎯 Specifically Marathon→Standard: {analysis['marathon_to_standard_rate']:.1f}%")
+        print(f"   📈 Coverage Impact: {analysis['true_marathons'] - analysis['marathon_misclassified']}/{analysis['true_marathons']} marathons correctly identified")
+        
+        print(f"\n📋 DETAILED BREAKDOWN (3-Category System):")
+        print(f"   • Total true marathons: {analysis['true_marathons']:,}")
+        print(f"   • Marathon misclassified: {analysis['marathon_misclassified']:,}")
+        print(f"   • Marathon→Standard: {analysis['marathon_to_standard_misclassified']:,}")
+        print(f"   • Correctly identified: {analysis['true_marathons'] - analysis['marathon_misclassified']:,}")
+        
+        print(f"\n📊 ALL CATEGORIES PERFORMANCE:")
+        print(f"   • Sprint misclassification: {analysis['sprint_misclassification_rate']:.1f}% ({analysis['sprint_misclassified']:,}/{analysis['true_sprints']:,})")
+        print(f"   • Standard misclassification: {analysis['standard_misclassification_rate']:.1f}% ({analysis['standard_misclassified']:,}/{analysis['true_standards']:,})")
+        print(f"   • Marathon misclassification: {analysis['marathon_misclassification_rate']:.1f}% ({analysis['marathon_misclassified']:,}/{analysis['true_marathons']:,})")
+        
+        print(f"\n🎭 ARCHETYPE MODEL PERFORMANCE (17-Class):")
+        print(f"   • Archetype accuracy: {analysis['archetype_accuracy']:.1f}%")
+        print(f"   • Perfect archetype matches: {analysis['archetype_perfect_matches']:,}/{analysis['archetype_tokens']:,}")
+        
+        if analysis['borderline_tokens'] > 0:
+            print(f"   • Borderline cases (1150-1250 min): {analysis['borderline_tokens']:,}")
+        
+        if analysis.get('archetype_prediction_mismatch', 0) > 0:
+            print(f"   • Archetype vs prediction mismatch: {analysis['archetype_prediction_mismatch']:,}")
+        
+        print("="*80)
     
     def create_visualizations(self) -> Dict[str, go.Figure]:
         """Create misclassification analysis visualizations."""
@@ -591,6 +684,9 @@ class XGBoostMisclassificationAnalyzer:
         """Create comprehensive misclassification dashboard."""
         fig = make_subplots(
             rows=3, cols=2,
+            specs=[[{"type": "pie"}, {"type": "xy"}],
+                   [{"type": "xy"}, {"type": "pie"}], 
+                   [{"type": "xy"}, {"type": "xy"}]],
             subplot_titles=[
                 'Overall Classification Performance',
                 'Misclassification by Category',
@@ -819,15 +915,8 @@ def main():
         # Run complete analysis
         results = analyzer.run_complete_analysis(args.archetype_results, args.data_dir)
         
-        print(f"\n🎯 XGBoost Misclassification Analysis Results:")
-        print(f"=" * 60)
-        
-        if results.get('misclassification_analysis'):
-            analysis = results['misclassification_analysis']
-            print(f"📊 Overall Accuracy: {analysis.get('accuracy', 0):.1f}%")
-            print(f"🏃 Marathon Misclassification Rate: {analysis.get('marathon_misclassification_rate', 0):.1f}%")
-            print(f"🚶 Standard Misclassification Rate: {analysis.get('standard_misclassification_rate', 0):.1f}%")
-            print(f"🎲 Borderline Misclassification Rate: {analysis.get('borderline_misclassification_rate', 0):.1f}%")
+        # Print key answer clearly
+        analyzer.print_key_answer()
         
         print(f"\n🎉 XGBoost misclassification analysis complete!")
         print(f"📈 Results saved with timestamp: {results.get('timestamp', 'unknown')}")

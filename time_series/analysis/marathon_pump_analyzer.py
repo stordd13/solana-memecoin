@@ -118,7 +118,7 @@ class MarathonPumpAnalyzer:
                 pump_analysis = self._analyze_post_minute5_pumps(prices)
                 
                 # Time to 1.5x analysis
-                time_to_15x = self._calculate_time_to_15x(prices)
+                time_to_2x = self._calculate_time_to_2x(prices)
                 
                 pump_data.append({
                     'token_name': token_name,
@@ -135,9 +135,9 @@ class MarathonPumpAnalyzer:
                     'pump_timing_min5': pump_analysis['pump_timing'],
                     
                     # Time to 1.5x metrics
-                    'time_to_15x_minutes': time_to_15x['time_minutes'],
-                    'achieved_15x': time_to_15x['achieved'],
-                    'max_multiplier': time_to_15x['max_multiplier'],
+                    'time_to_2x_minutes': time_to_2x['time_minutes'],
+                    'achieved_2x': time_to_2x['achieved'],
+                    'max_multiplier': time_to_2x['max_multiplier'],
                     
                     # Volatility classification
                     'high_volatility': volatility_cv > 0.8,
@@ -194,28 +194,28 @@ class MarathonPumpAnalyzer:
             'pump_timing': pump_timing
         }
     
-    def _calculate_time_to_15x(self, prices: np.ndarray) -> Dict:
-        """Calculate time to reach 1.5x multiplier."""
+    def _calculate_time_to_2x(self, prices: np.ndarray) -> Dict:
+        """Calculate time to reach 2x multiplier."""
         if len(prices) < 2:
             return {'time_minutes': None, 'achieved': False, 'max_multiplier': 1.0}
         
         initial_price = prices[0]
         multipliers = prices / initial_price
         
-        # Check if 1.5x was achieved
-        achieved_15x = np.any(multipliers >= 1.5)
+        # Check if 2x was achieved
+        achieved_2x = np.any(multipliers >= 2.0)
         max_multiplier = np.max(multipliers)
         
-        # Find time to 1.5x
-        time_to_15x = None
-        if achieved_15x:
-            indices_15x = np.where(multipliers >= 1.5)[0]
-            if len(indices_15x) > 0:
-                time_to_15x = indices_15x[0]  # First occurrence
+        # Find time to 2x
+        time_to_2x = None
+        if achieved_2x:
+            indices_2x = np.where(multipliers >= 2.0)[0]
+            if len(indices_2x) > 0:
+                time_to_2x = indices_2x[0]  # First occurrence
         
         return {
-            'time_minutes': time_to_15x,
-            'achieved': achieved_15x,
+            'time_minutes': time_to_2x,
+            'achieved': achieved_2x,
             'max_multiplier': max_multiplier
         }
     
@@ -241,14 +241,14 @@ class MarathonPumpAnalyzer:
         high_vol_tokens = df[df['high_volatility']]
         high_vol_pump_rate = high_vol_tokens['pumped_50pct_after_min5'].mean() * 100 if len(high_vol_tokens) > 0 else 0
         
-        # Question 2: What's the average time to 1.5x for those that pump?
-        pumping_tokens = df[df['achieved_15x']]
-        avg_time_to_15x = pumping_tokens['time_to_15x_minutes'].mean() if len(pumping_tokens) > 0 else 0
+        # Question 2: What's the average time to 2x for those that pump?
+        pumping_tokens = df[df['achieved_2x']]
+        avg_time_to_2x = pumping_tokens['time_to_2x_minutes'].mean() if len(pumping_tokens) > 0 else 0
         
         # Additional insights
         volatility_breakdown = df.groupby('volatility_bucket').agg({
             'pumped_50pct_after_min5': ['count', 'sum', 'mean'],
-            'time_to_15x_minutes': 'mean',
+            'time_to_2x_minutes': 'mean',
             'max_pump_after_min5': 'mean'
         }).round(3)
         
@@ -256,50 +256,61 @@ class MarathonPumpAnalyzer:
             'total_marathon_tokens': len(df),
             'high_volatility_tokens': len(high_vol_tokens),
             'high_vol_pump_rate': high_vol_pump_rate,
-            'avg_time_to_15x_minutes': avg_time_to_15x,
+            'avg_time_to_2x_minutes': avg_time_to_2x,
             'overall_pump_rate': df['pumped_50pct_after_min5'].mean() * 100,
-            'overall_15x_rate': df['achieved_15x'].mean() * 100,
+            'overall_2x_rate': df['achieved_2x'].mean() * 100,
             'volatility_breakdown': volatility_breakdown
         }
         
         return summary
     
+    def print_key_answers(self) -> None:
+        """Print clear answers to the 3 key questions."""
+        if self.pump_analysis.empty:
+            print("❌ No data available for analysis")
+            return
+        
+        summary = self._calculate_summary_metrics()
+        
+        print("\n" + "="*80)
+        print("🎯 KEY TRADING STRATEGY ANSWERS")
+        print("="*80)
+        
+        print(f"\n1️⃣  QUESTION 1: What % of high-vol (CV>0.8) marathons pump >50% after minute 5?")
+        print(f"   📊 ANSWER: {summary['high_vol_pump_rate']:.1f}% ({summary['high_volatility_tokens']} tokens analyzed)")
+        
+        print(f"\n2️⃣  QUESTION 2: What's the average time to 2x for those that pump?")
+        if summary['overall_2x_rate'] > 0:
+            print(f"   📊 ANSWER: {summary['avg_time_to_2x_minutes']:.1f} minutes")
+            print(f"   📈 Additional: {summary['overall_2x_rate']:.1f}% of marathons achieve 2x")
+        else:
+            print(f"   📊 ANSWER: No tokens achieved 2x in the dataset")
+        
+        print(f"\n📋 SUMMARY:")
+        print(f"   • Total marathon tokens: {summary['total_marathon_tokens']:,}")
+        print(f"   • High volatility tokens: {summary['high_volatility_tokens']:,}")
+        print(f"   • Overall pump rate (>50%): {summary['overall_pump_rate']:.1f}%")
+        print(f"   • Overall 2x rate: {summary['overall_2x_rate']:.1f}%")
+        
+        print("="*80)
+    
     def analyze_misclassification(self, classifier_results_path: Optional[Path] = None) -> Dict:
         """Analyze misclassification of true marathons."""
         print(f"🔍 Analyzing marathon misclassification...")
         
-        # For now, analyze based on lifespan thresholds since we don't have classifier predictions
-        # True marathons should have 1200+ minutes lifespan
-        
-        if self.pump_analysis.empty:
-            return {}
-        
-        df = self.pump_analysis
-        
-        # Classify based on actual lifespan
-        df['true_category'] = df['lifespan_minutes'].apply(
-            lambda x: 'marathon' if x >= 1200 else 'standard'
-        )
-        
-        # Count misclassifications
-        true_marathons = df[df['true_category'] == 'marathon']
-        classified_as_standard = true_marathons[true_marathons['category'] == 'standard']
-        
-        misclassification_rate = len(classified_as_standard) / len(true_marathons) * 100 if len(true_marathons) > 0 else 0
-        
-        # Analyze borderline cases (1150-1250 minutes)
-        borderline_tokens = df[(df['lifespan_minutes'] >= 1150) & (df['lifespan_minutes'] <= 1250)]
+        # NOTE: Misclassification analysis is now handled by the dedicated XGBoost analyzer
+        # This method is kept for backward compatibility but returns empty results
         
         self.misclassification_analysis = {
-            'total_true_marathons': len(true_marathons),
-            'misclassified_as_standard': len(classified_as_standard),
-            'misclassification_rate': misclassification_rate,
-            'borderline_tokens': len(borderline_tokens),
-            'borderline_misclassified': len(borderline_tokens[borderline_tokens['category'] == 'standard'])
+            'total_true_marathons': 0,
+            'misclassified_as_standard': 0,
+            'misclassification_rate': 0.0,
+            'borderline_tokens': 0,
+            'borderline_misclassified': 0
         }
         
-        print(f"📊 True marathons (1200+ min): {len(true_marathons)}")
-        print(f"❌ Misclassified as standard: {len(classified_as_standard)} ({misclassification_rate:.1f}%)")
+        print(f"📊 Misclassification analysis moved to XGBoost analyzer script")
+        print(f"📊 Run xgboost_misclassification_analyzer.py for detailed classification metrics")
         
         return self.misclassification_analysis
     
@@ -377,20 +388,20 @@ class MarathonPumpAnalyzer:
         return fig
     
     def _create_time_to_pump_chart(self, df: pd.DataFrame) -> go.Figure:
-        """Create time-to-1.5x distribution analysis."""
-        # Filter tokens that achieved 1.5x
-        pumped_tokens = df[df['achieved_15x']].copy()
+        """Create time-to-2x distribution analysis."""
+        # Filter tokens that achieved 2x
+        pumped_tokens = df[df['achieved_2x']].copy()
         
         if pumped_tokens.empty:
             # Create empty chart with message
             fig = go.Figure()
             fig.add_annotation(
-                text="No tokens achieved 1.5x multiplier",
+                text="No tokens achieved 2x multiplier",
                 xref="paper", yref="paper",
                 x=0.5, y=0.5, xanchor='center', yanchor='middle',
                 font=dict(size=16)
             )
-            fig.update_layout(title="Time to 1.5x Analysis - No Data Available")
+            fig.update_layout(title="Time to 2x Analysis - No Data Available")
             return fig
         
         fig = make_subplots(
@@ -408,7 +419,7 @@ class MarathonPumpAnalyzer:
         # 1. Distribution histogram
         fig.add_trace(
             go.Histogram(
-                x=pumped_tokens['time_to_15x_minutes'],
+                x=pumped_tokens['time_to_2x_minutes'],
                 nbinsx=20,
                 name='Time to 1.5x',
                 marker_color='lightblue'
@@ -417,7 +428,7 @@ class MarathonPumpAnalyzer:
         )
         
         # 2. Time by volatility bucket
-        time_by_vol = pumped_tokens.groupby('volatility_bucket')['time_to_15x_minutes'].agg(['mean', 'count']).reset_index()
+        time_by_vol = pumped_tokens.groupby('volatility_bucket')['time_to_2x_minutes'].agg(['mean', 'count']).reset_index()
         fig.add_trace(
             go.Bar(
                 x=time_by_vol['volatility_bucket'],
@@ -431,10 +442,10 @@ class MarathonPumpAnalyzer:
         )
         
         # 3. Success rate over time (cumulative)
-        time_bins = np.arange(0, pumped_tokens['time_to_15x_minutes'].max() + 10, 10)
+        time_bins = np.arange(0, pumped_tokens['time_to_2x_minutes'].max() + 10, 10)
         success_rates = []
         for time_threshold in time_bins:
-            rate = (pumped_tokens['time_to_15x_minutes'] <= time_threshold).mean() * 100
+            rate = (pumped_tokens['time_to_2x_minutes'] <= time_threshold).mean() * 100
             success_rates.append(rate)
         
         fig.add_trace(
@@ -450,7 +461,7 @@ class MarathonPumpAnalyzer:
         
         # 4. Time by archetype
         if 'archetype' in pumped_tokens.columns:
-            time_by_archetype = pumped_tokens.groupby('archetype')['time_to_15x_minutes'].agg(['mean', 'count']).reset_index()
+            time_by_archetype = pumped_tokens.groupby('archetype')['time_to_2x_minutes'].agg(['mean', 'count']).reset_index()
             fig.add_trace(
                 go.Bar(
                     x=time_by_archetype['archetype'],
@@ -463,11 +474,11 @@ class MarathonPumpAnalyzer:
                 row=2, col=2
             )
         
-        avg_time = pumped_tokens['time_to_15x_minutes'].mean()
-        median_time = pumped_tokens['time_to_15x_minutes'].median()
+        avg_time = pumped_tokens['time_to_2x_minutes'].mean()
+        median_time = pumped_tokens['time_to_2x_minutes'].median()
         
         fig.update_layout(
-            title=f'Time to 1.5x Analysis<br><sub>Average: {avg_time:.1f} minutes | Median: {median_time:.1f} minutes | Success Rate: {len(pumped_tokens)/len(df)*100:.1f}%</sub>',
+            title=f'Time to 2x Analysis<br><sub>Average: {avg_time:.1f} minutes | Median: {median_time:.1f} minutes | Success Rate: {len(pumped_tokens)/len(df)*100:.1f}%</sub>',
             showlegend=False,
             height=800
         )
@@ -622,12 +633,12 @@ class MarathonPumpAnalyzer:
             )
         
         # 2. Time to pump vs volatility (scatter)
-        pumped_tokens = df[df['achieved_15x']]
+        pumped_tokens = df[df['achieved_2x']]
         if not pumped_tokens.empty:
             fig.add_trace(
                 go.Scatter(
                     x=pumped_tokens['volatility_cv'],
-                    y=pumped_tokens['time_to_15x_minutes'],
+                    y=pumped_tokens['time_to_2x_minutes'],
                     mode='markers',
                     marker=dict(
                         size=8,
@@ -690,7 +701,7 @@ class MarathonPumpAnalyzer:
         Pumped >50% after min 5: {df['pumped_50pct_after_min5'].sum():,}
         Overall Pump Rate: {df['pumped_50pct_after_min5'].mean()*100:.1f}%
         High-Vol Pump Rate: {df[df['high_volatility']]['pumped_50pct_after_min5'].mean()*100:.1f}%
-        Avg Time to 1.5x: {df[df['achieved_15x']]['time_to_15x_minutes'].mean():.1f} min
+        Avg Time to 2x: {df[df['achieved_2x']]['time_to_2x_minutes'].mean():.1f} min
         """
         
         fig.add_annotation(
@@ -795,13 +806,13 @@ class MarathonPumpAnalyzer:
         
         🎯 KEY ANSWERS:
         1. High-vol (CV>0.8) pump rate: {df[df['high_volatility']]['pumped_50pct_after_min5'].mean()*100:.1f}%
-        2. Avg time to 1.5x: {df[df['achieved_15x']]['time_to_15x_minutes'].mean():.1f} minutes
-        3. Misclassification rate: {self.misclassification_analysis.get('misclassification_rate', 0):.1f}%
+        2. Avg time to 2x: {df[df['achieved_2x']]['time_to_2x_minutes'].mean():.1f} minutes
+        3. Misclassification rate: See XGBoost analyzer for detailed classification metrics
         
         📈 DETAILED METRICS:
         • Total marathon tokens analyzed: {len(df):,}
         • High volatility tokens (CV>0.8): {len(df[df['high_volatility']]):,}
-        • Tokens achieving 1.5x: {len(df[df['achieved_15x']]):,}
+        • Tokens achieving 2x: {len(df[df['achieved_2x']]):,}
         • Overall pump success: {df['pumped_50pct_after_min5'].mean()*100:.1f}%
         • Median volatility CV: {df['volatility_cv'].median():.3f}
         • Max pump observed: {df['max_pump_after_min5'].max()*100:.1f}%
@@ -902,16 +913,16 @@ class MarathonPumpAnalyzer:
         
         if summary_metrics:
             print(f"1. High-vol (CV>0.8) marathon pump rate: {summary_metrics.get('high_vol_pump_rate', 0):.1f}%")
-            print(f"2. Average time to 1.5x: {summary_metrics.get('avg_time_to_15x_minutes', 0):.1f} minutes")
+            print(f"2. Average time to 2x: {summary_metrics.get('avg_time_to_2x_minutes', 0):.1f} minutes")
         
-        if misclass_metrics:
-            print(f"3. Marathon misclassification rate: {misclass_metrics.get('misclassification_rate', 0):.1f}%")
+        # Note: Misclassification analysis moved to XGBoost analyzer
+        print(f"3. Marathon misclassification rate: See XGBoost analyzer for detailed metrics")
         
         print(f"\n📊 ADDITIONAL INSIGHTS:")
         if summary_metrics:
             print(f"• Total marathon tokens analyzed: {summary_metrics.get('total_marathon_tokens', 0):,}")
             print(f"• Overall pump success rate: {summary_metrics.get('overall_pump_rate', 0):.1f}%")
-            print(f"• Overall 1.5x achievement rate: {summary_metrics.get('overall_15x_rate', 0):.1f}%")
+            print(f"• Overall 2x achievement rate: {summary_metrics.get('overall_2x_rate', 0):.1f}%")
         
         return {
             'summary_metrics': summary_metrics,
@@ -955,6 +966,9 @@ def main():
     try:
         # Run complete analysis
         results = analyzer.run_complete_analysis(args.archetype_results, args.data_dir)
+        
+        # Print key answers clearly
+        analyzer.print_key_answers()
         
         print(f"\n🎉 Marathon pump analysis complete!")
         print(f"📈 Results saved with timestamp: {results.get('timestamp', 'unknown')}")

@@ -3,7 +3,7 @@
 HIERARCHICAL Archetype Classification Model
 
 Creates a HIERARCHICAL classification model that predicts:
-1. FIRST: Category (standard/marathon) 
+1. FIRST: Category (sprint/standard/marathon) 
 2. THEN: Cluster (0-5) within that predicted category
 
 IMPORTANT: This is NOT independent classification!
@@ -17,7 +17,7 @@ Usage:
 Key Features:
 - Uses first 5 minutes of price data for prediction
 - Hierarchical approach: Category → Cluster (not independent)
-- Handles 2-category scenario (standard/marathon only, no sprint)
+- Handles 3-category scenario (sprint/standard/marathon)
 - Works with both old and new directory structures
 """
 
@@ -35,28 +35,41 @@ import polars as pl
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.pipeline import Pipeline
 import joblib
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import xgboost as xgb
+import optuna
+from optuna.samplers import TPESampler
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
 
 class ArchetypeClassifier:
-    """Multi-level archetype classification model."""
+    """Dual XGBoost classification model with Bayesian optimization."""
     
     def __init__(self, results_dir: Path = None):
-        self.results_dir = results_dir or Path("../results")
+        # Fix path resolution - ensure we save to time_series/results/
+        if results_dir is None:
+            # From analysis/ folder, go up one level to time_series/, then to results/
+            self.results_dir = Path(__file__).parent.parent / "results"
+        else:
+            self.results_dir = results_dir
         self.archetype_data = {}
         self.token_labels = {}
         self.category_model = None
-        self.cluster_models = {}
+        self.archetype_model = None
+        self.cluster_models = {}  # Keep for backward compatibility
         self.scaler = StandardScaler()
+        
+        # Model optimization tracking
+        self.category_best_params = None
+        self.archetype_best_params = None
+        self.optimization_results = {}
         
     def load_archetype_results(self, archetype_results_path: Path) -> None:
         """Load archetype characterization results."""
@@ -78,7 +91,8 @@ class ArchetypeClassifier:
                     self.token_labels[token] = {
                         'category': category,
                         'cluster': cluster_id,
-                        'archetype': archetype_name
+                        'archetype': archetype_name,
+                        'archetype_full': archetype_name  # Full archetype name for 17-class model
                     }
         
         print(f"📈 Loaded labels for {len(self.token_labels)} tokens")
@@ -256,29 +270,40 @@ class ArchetypeClassifier:
         # Convert string categories to numeric for XGBoost
         y_category_numeric = np.array([self.category_label_map[cat] for cat in y_category])
         
+        # Create archetype labels for 17-class model
+        y_archetype = features_df['archetype'].values
+        self.archetype_labels = sorted(np.unique(y_archetype))
+        self.archetype_label_map = {label: i for i, label in enumerate(self.archetype_labels)}
+        self.archetype_inverse_map = {i: label for i, label in enumerate(self.archetype_labels)}
+        
+        # Convert string archetypes to numeric for XGBoost
+        y_archetype_numeric = np.array([self.archetype_label_map[arch] for arch in y_archetype])
+        
         print(f"📊 Training data shape: {X.shape}")
         print(f"📈 Category distribution: {pd.Series(y_category).value_counts().to_dict()}")
         print(f"📈 Category mapping: {self.category_label_map}")
+        print(f"📈 Archetype distribution: {pd.Series(y_archetype).value_counts().to_dict()}")
+        print(f"📈 Total archetype classes: {len(self.archetype_labels)}")
         print(f"📈 Cluster distribution: {pd.Series(y_cluster).value_counts().to_dict()}")
         
-        return X, y_category_numeric, y_cluster
+        return X, y_category_numeric, y_cluster, y_archetype_numeric
     
-    def train_models(self, X: np.ndarray, y_category: np.ndarray, y_cluster: np.ndarray) -> Dict:
-        """Train the hierarchical classification models.
+    def train_models(self, X: np.ndarray, y_category: np.ndarray, y_cluster: np.ndarray, y_archetype: np.ndarray) -> Dict:
+        """Train the dual XGBoost classification models with Bayesian optimization.
         
-        IMPORTANT: This uses HIERARCHICAL classification:
-        1. First predict category (standard/marathon)
-        2. Then predict cluster within that category (0-5)
+        IMPORTANT: This uses DUAL classification:
+        1. Model 1: Category prediction (sprint/standard/marathon) - 3 classes
+        2. Model 2: Archetype prediction (all 17 archetypes) - 17 classes
         
-        This is critical because cluster_1 in marathon != cluster_1 in standard!
+        Both models are optimized separately using Bayesian optimization.
         """
-        print(f"🚀 Training HIERARCHICAL classification models...")
-        print(f"📊 Level 1: Category prediction (standard/marathon)")
-        print(f"📊 Level 2: Cluster prediction within category (0-5)")
+        print(f"🚀 Training DUAL XGBoost classification models with Bayesian optimization...")
+        print(f"📊 Model 1: Category prediction (3 classes)")
+        print(f"📊 Model 2: Archetype prediction ({len(self.archetype_labels)} classes)")
         
         # Split data - stratify by category to ensure balanced splits
-        X_train, X_test, y_cat_train, y_cat_test, y_clust_train, y_clust_test = train_test_split(
-            X, y_category, y_cluster, test_size=0.2, random_state=42, stratify=y_category
+        X_train, X_test, y_cat_train, y_cat_test, y_clust_train, y_clust_test, y_arch_train, y_arch_test = train_test_split(
+            X, y_category, y_cluster, y_archetype, test_size=0.2, random_state=42, stratify=y_category
         )
         
         # Scale features
@@ -287,8 +312,18 @@ class ArchetypeClassifier:
         
         results = {}
         
+        # Train both models with Bayesian optimization
+        print("\n🔍 Starting Bayesian optimization for both models...")
+        category_results = self._train_category_model_with_optimization(X_train_scaled, X_test_scaled, y_cat_train, y_cat_test)
+        archetype_results = self._train_archetype_model_with_optimization(X_train_scaled, X_test_scaled, y_arch_train, y_arch_test)
+        
+        results.update(category_results)
+        results.update(archetype_results)
+        
+        return results
+        
         # LEVEL 1: Train Category Model (Hierarchical Level 1)
-        print("\n  🎯 LEVEL 1: Training Category model (standard vs marathon)...")
+        print("\n  🎯 LEVEL 1: Training Category model (sprint vs standard vs marathon)...")
         self.category_model = xgb.XGBClassifier(
             n_estimators=100,
             max_depth=6,
@@ -432,51 +467,183 @@ class ArchetypeClassifier:
         
         return results
     
-    def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Make hierarchical predictions using the multi-level model.
+    def _train_category_model_with_optimization(self, X_train: np.ndarray, X_test: np.ndarray, 
+                                               y_train: np.ndarray, y_test: np.ndarray) -> Dict:
+        """Train category model with Bayesian optimization."""
+        print(f"\n  🎯 MODEL 1: Training Category model with Bayesian optimization...")
         
-        IMPORTANT: This implements HIERARCHICAL prediction:
-        1. First predict category (standard/marathon)
-        2. Then predict cluster within that predicted category (0-5)
+        def objective(trial):
+            # Define hyperparameter search space
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+                'max_depth': trial.suggest_int('max_depth', 3, 10),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'subsample': trial.suggest_float('subsample', 0.7, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0, 1),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0, 1),
+                'random_state': 42,
+                'eval_metric': 'logloss',
+                'n_jobs': -1,
+                'verbosity': 0
+            }
+            
+            # Create and train model
+            model = xgb.XGBClassifier(**params)
+            
+            # Use cross-validation to evaluate F1 score
+            cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='f1_macro', n_jobs=-1)
+            return cv_scores.mean()
+        
+        # Create study for category model
+        study = optuna.create_study(direction='maximize', sampler=TPESampler(seed=42))
+        study.optimize(objective, n_trials=50, show_progress_bar=True)
+        
+        # Get best parameters
+        self.category_best_params = study.best_params
+        print(f"    ✅ Best category F1 score: {study.best_value:.4f}")
+        print(f"    ✅ Best category parameters: {self.category_best_params}")
+        
+        # Train final model with best parameters
+        best_params = self.category_best_params.copy()
+        best_params.update({'random_state': 42, 'eval_metric': 'logloss', 'n_jobs': -1, 'verbosity': 0})
+        
+        self.category_model = xgb.XGBClassifier(**best_params)
+        
+        # Handle class imbalance with sample weights
+        from sklearn.utils.class_weight import compute_sample_weight
+        sample_weights = compute_sample_weight('balanced', y_train)
+        self.category_model.fit(X_train, y_train, sample_weight=sample_weights)
+        
+        # Evaluate final model
+        y_pred = self.category_model.predict(X_test)
+        accuracy = np.mean(y_pred == y_test)
+        f1_macro = f1_score(y_test, y_pred, average='macro')
+        
+        # Convert numeric predictions back to string labels for reporting
+        y_pred_labels = [self.category_inverse_map[pred] for pred in y_pred]
+        y_test_labels = [self.category_inverse_map[true] for true in y_test]
+        
+        print(f"    ✅ Final category accuracy: {accuracy:.4f}")
+        print(f"    ✅ Final category F1 score: {f1_macro:.4f}")
+        
+        return {
+            'category': {
+                'accuracy': accuracy,
+                'f1_macro': f1_macro,
+                'best_params': self.category_best_params,
+                'optimization_score': study.best_value,
+                'classification_report': classification_report(y_test_labels, y_pred_labels),
+                'confusion_matrix': confusion_matrix(y_test_labels, y_pred_labels, labels=self.category_labels)
+            }
+        }
+    
+    def _train_archetype_model_with_optimization(self, X_train: np.ndarray, X_test: np.ndarray,
+                                                y_train: np.ndarray, y_test: np.ndarray) -> Dict:
+        """Train archetype model with Bayesian optimization."""
+        print(f"\n  🎯 MODEL 2: Training Archetype model with Bayesian optimization...")
+        print(f"    📊 Training on {len(self.archetype_labels)} archetype classes")
+        
+        def objective(trial):
+            # Define hyperparameter search space (potentially different from category model)
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 200, 1000),
+                'max_depth': trial.suggest_int('max_depth', 4, 12),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+                'subsample': trial.suggest_float('subsample', 0.7, 0.9),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 0.9),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0, 0.5),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0, 0.5),
+                'random_state': 42,
+                'eval_metric': 'logloss',
+                'n_jobs': -1,
+                'verbosity': 0
+            }
+            
+            # Create and train model
+            model = xgb.XGBClassifier(**params)
+            
+            # Use cross-validation to evaluate F1 score
+            cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='f1_macro', n_jobs=-1)
+            return cv_scores.mean()
+        
+        # Create study for archetype model
+        study = optuna.create_study(direction='maximize', sampler=TPESampler(seed=42))
+        study.optimize(objective, n_trials=100, show_progress_bar=True)  # More trials for complex 17-class problem
+        
+        # Get best parameters
+        self.archetype_best_params = study.best_params
+        print(f"    ✅ Best archetype F1 score: {study.best_value:.4f}")
+        print(f"    ✅ Best archetype parameters: {self.archetype_best_params}")
+        
+        # Train final model with best parameters
+        best_params = self.archetype_best_params.copy()
+        best_params.update({'random_state': 42, 'eval_metric': 'logloss', 'n_jobs': -1, 'verbosity': 0})
+        
+        self.archetype_model = xgb.XGBClassifier(**best_params)
+        
+        # Handle class imbalance with sample weights
+        from sklearn.utils.class_weight import compute_sample_weight
+        sample_weights = compute_sample_weight('balanced', y_train)
+        self.archetype_model.fit(X_train, y_train, sample_weight=sample_weights)
+        
+        # Evaluate final model
+        y_pred = self.archetype_model.predict(X_test)
+        accuracy = np.mean(y_pred == y_test)
+        f1_macro = f1_score(y_test, y_pred, average='macro')
+        
+        # Convert numeric predictions back to string labels for reporting
+        y_pred_labels = [self.archetype_inverse_map[pred] for pred in y_pred]
+        y_test_labels = [self.archetype_inverse_map[true] for true in y_test]
+        
+        print(f"    ✅ Final archetype accuracy: {accuracy:.4f}")
+        print(f"    ✅ Final archetype F1 score: {f1_macro:.4f}")
+        
+        return {
+            'archetype': {
+                'accuracy': accuracy,
+                'f1_macro': f1_macro,
+                'best_params': self.archetype_best_params,
+                'optimization_score': study.best_value,
+                'classification_report': classification_report(y_test_labels, y_pred_labels),
+                'confusion_matrix': confusion_matrix(y_test_labels, y_pred_labels, labels=self.archetype_labels)
+            }
+        }
+    
+    def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Make dual predictions using both category and archetype models.
+        
+        This implements DUAL prediction:
+        1. Category model: Predicts category (sprint/standard/marathon)
+        2. Archetype model: Predicts archetype (17 classes)
         
         Returns:
             category_pred: Array of category predictions (string labels)
-            cluster_pred: Array of cluster predictions (within each category)
+            archetype_pred: Array of archetype predictions (string labels)
+            cluster_pred: Array of cluster predictions (for backward compatibility)
         """
         # Scale features
         X_scaled = self.scaler.transform(X)
         
-        # LEVEL 1: Predict category first (standard vs marathon)
+        # MODEL 1: Predict category (3 classes)
         category_pred_numeric = self.category_model.predict(X_scaled)
         
         # Convert numeric predictions to string labels
         category_pred = np.array([self.category_inverse_map[pred] for pred in category_pred_numeric])
         
-        # LEVEL 2: Predict cluster within each predicted category
+        # MODEL 2: Predict archetype (17 classes)
+        archetype_pred_numeric = self.archetype_model.predict(X_scaled)
+        archetype_pred = np.array([self.archetype_inverse_map[pred] for pred in archetype_pred_numeric])
+        
+        # Extract cluster numbers from archetype predictions for backward compatibility
         cluster_pred = np.zeros(len(X_scaled), dtype=int)
+        for i, archetype in enumerate(archetype_pred):
+            # Extract cluster ID from archetype name (e.g., "sprint_cluster_1" -> 1)
+            if '_cluster_' in archetype:
+                cluster_id = int(archetype.split('_cluster_')[1])
+                cluster_pred[i] = cluster_id
         
-        # Group predictions by category for efficient batch processing
-        unique_categories = np.unique(category_pred)
-        
-        for category in unique_categories:
-            if category in self.cluster_models:
-                # Get indices for this category
-                category_mask = category_pred == category
-                category_indices = np.where(category_mask)[0]
-                
-                if len(category_indices) > 0:
-                    # Predict clusters for all samples in this category
-                    X_category = X_scaled[category_mask]
-                    cluster_predictions = self.cluster_models[category].predict(X_category)
-                    
-                    # Assign cluster predictions back to the correct positions
-                    cluster_pred[category_indices] = cluster_predictions
-            else:
-                # If no model for this category, use default cluster
-                category_mask = category_pred == category
-                cluster_pred[category_mask] = 0
-        
-        return category_pred, cluster_pred
+        return category_pred, archetype_pred, cluster_pred
     
     def predict_with_confidence(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Make hierarchical predictions with confidence scores.
@@ -537,27 +704,80 @@ class ArchetypeClassifier:
         # Save category model
         joblib.dump(self.category_model, output_dir / 'category_model.pkl')
         
-        # Save cluster models
+        # Save archetype model
+        joblib.dump(self.archetype_model, output_dir / 'archetype_model.pkl')
+        
+        # Save cluster models (for backward compatibility)
         for category, model in self.cluster_models.items():
             joblib.dump(model, output_dir / f'cluster_model_{category}.pkl')
         
+        # Save optimization results and parameters
+        optimization_results = {
+            'category_best_params': self.category_best_params,
+            'archetype_best_params': self.archetype_best_params,
+            'category_labels': self.category_labels,
+            'archetype_labels': self.archetype_labels,
+            'category_label_map': self.category_label_map,
+            'archetype_label_map': self.archetype_label_map
+        }
+        
+        with open(output_dir / 'optimization_results.json', 'w') as f:
+            json.dump(optimization_results, f, indent=2)
+        
         print(f"💾 Models saved to: {output_dir}")
+        print(f"📊 Category model classes: {len(self.category_labels)}")
+        print(f"📊 Archetype model classes: {len(self.archetype_labels)}")
     
-    def load_models(self, output_dir: Path) -> None:
+    def load_models(self, output_dir: Path = None) -> None:
         """Load trained models."""
+        if output_dir is None:
+            output_dir = self.results_dir / "classification_models"
+        
+        # Check if models exist
+        if not output_dir.exists():
+            raise FileNotFoundError(f"Models directory not found: {output_dir}")
+        
+        required_files = ['scaler.pkl', 'category_model.pkl', 'archetype_model.pkl', 'optimization_results.json']
+        missing_files = [f for f in required_files if not (output_dir / f).exists()]
+        
+        if missing_files:
+            raise FileNotFoundError(f"Missing model files: {missing_files}")
+        
         # Load scaler
         self.scaler = joblib.load(output_dir / 'scaler.pkl')
         
         # Load category model
         self.category_model = joblib.load(output_dir / 'category_model.pkl')
         
-        # Load cluster models
+        # Load archetype model
+        self.archetype_model = joblib.load(output_dir / 'archetype_model.pkl')
+        
+        # Load optimization results and label mappings
+        with open(output_dir / 'optimization_results.json', 'r') as f:
+            optimization_results = json.load(f)
+        
+        self.category_best_params = optimization_results.get('category_best_params')
+        self.archetype_best_params = optimization_results.get('archetype_best_params')
+        self.category_labels = optimization_results.get('category_labels', [])
+        self.archetype_labels = optimization_results.get('archetype_labels', [])
+        self.category_label_map = optimization_results.get('category_label_map', {})
+        self.archetype_label_map = optimization_results.get('archetype_label_map', {})
+        
+        # Create inverse mappings
+        self.category_inverse_map = {v: k for k, v in self.category_label_map.items()}
+        self.archetype_inverse_map = {v: k for k, v in self.archetype_label_map.items()}
+        
+        # Load cluster models (for backward compatibility)
         self.cluster_models = {}
         for model_file in output_dir.glob('cluster_model_*.pkl'):
             category = model_file.stem.replace('cluster_model_', '')
             self.cluster_models[category] = joblib.load(model_file)
         
         print(f"📦 Models loaded from: {output_dir}")
+        print(f"📊 Category model classes: {len(self.category_labels)}")
+        print(f"📊 Archetype model classes: {len(self.archetype_labels)}")
+        print(f"🎯 Category best params: {self.category_best_params}")
+        print(f"🎭 Archetype best params: {self.archetype_best_params}")
     
     def create_visualizations(self, results: Dict, features_df: pd.DataFrame) -> Dict[str, go.Figure]:
         """Create visualizations for model performance."""
@@ -568,7 +788,7 @@ class ArchetypeClassifier:
         # 1. Confusion Matrix for Category Model
         if 'category' in results and 'confusion_matrix' in results['category']:
             cm = results['category']['confusion_matrix']
-            categories = ['marathon', 'standard']  # Known categories
+            categories = self.category_labels  # Use actual categories from the model
             
             fig_confusion = go.Figure(data=go.Heatmap(
                 z=cm,
@@ -773,7 +993,7 @@ class ArchetypeClassifier:
     
     def run_training(self, archetype_results_path: Path, data_dir: Path, minutes: int = 5) -> Dict:
         """Run complete training pipeline."""
-        print(f"🚀 Starting Multi-Level Archetype Classification Training")
+        print(f"🚀 Starting Dual XGBoost Classification Training")
         
         # Load data
         self.load_archetype_results(archetype_results_path)
@@ -783,10 +1003,10 @@ class ArchetypeClassifier:
         features_df = self.extract_features(token_data, minutes)
         
         # Prepare training data
-        X, y_category, y_cluster = self.prepare_training_data(features_df)
+        X, y_category, y_cluster, y_archetype = self.prepare_training_data(features_df)
         
         # Train models
-        results = self.train_models(X, y_category, y_cluster)
+        results = self.train_models(X, y_category, y_cluster, y_archetype)
         
         # Save models
         models_dir = self.results_dir / "classification_models"

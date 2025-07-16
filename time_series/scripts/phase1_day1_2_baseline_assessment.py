@@ -267,6 +267,8 @@ class BaselineAssessmentAnalyzer:
             }
         
         # Check CEO thresholds
+        # NOTE: Using uniform thresholds for baseline assessment
+        # Category-specific thresholds (sprint: 0.25, marathon: 0.30) are applied in Day 7-8
         meets_ceo_requirements = {
             'ari_threshold': winner_metrics['ari'] >= 0.75,
             'silhouette_threshold': winner_metrics['silhouette'] >= 0.5,

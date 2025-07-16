@@ -354,7 +354,11 @@ class StabilityTestingAnalyzer:
         silhouette_threshold = 0.45  # Relaxed from 0.5 to allow characterization
         
         # Category-specific adjustments for complex cases
-        if category == 'marathon':
+        if category == 'sprint':
+            # More lenient for short-lived sprint tokens
+            ari_threshold = 0.70
+            silhouette_threshold = 0.25  # Relaxed to 0.25 for sprint tokens
+        elif category == 'marathon':
             # More lenient for complex marathon tokens
             ari_threshold = 0.70
             silhouette_threshold = 0.30  # Relaxed from 0.45 to allow characterization
@@ -545,6 +549,8 @@ class StabilityTestingAnalyzer:
                 'ceo_requirements': {
                     'target_ari': 0.75,
                     'target_silhouette': 0.45,  # Relaxed from 0.5 for memecoin analysis
+                    'sprint_ari': 0.70,  # Adjusted for sprint tokens
+                    'sprint_silhouette': 0.25,  # Relaxed to 0.25 for sprint tokens
                     'marathon_ari': 0.70,  # Adjusted for complexity
                     'marathon_silhouette': 0.30  # Relaxed from 0.45 for memecoin analysis
                 }

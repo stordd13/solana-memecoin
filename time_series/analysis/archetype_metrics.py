@@ -280,6 +280,8 @@ class ArchetypeMetricsAnalyzer:
                     'sharpe_ratio': df['returns_mean'].mean() / df['returns_std'].mean() if df['returns_std'].mean() > 0 else 0,
                     'extreme_loss_rate': (df['total_return'] < -0.9).mean(),  # 90%+ loss rate
                     'extreme_gain_rate': (df['total_return'] > 10).mean(),    # 1000%+ gain rate
+                    'mega_pump_rate': (df['total_return'] > 1000).mean(),     # 100,000%+ gain rate (extreme pumps)
+                    'billion_pump_rate': (df['total_return'] > 1000000).mean(), # 100,000,000%+ gain rate (billion% pumps)
                 }
                 
                 archetype_metrics[archetype_name] = aggregated
