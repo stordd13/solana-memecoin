@@ -11,7 +11,7 @@ from statsmodels.tsa.stattools import acf
 import warnings
 warnings.filterwarnings('ignore')
 
-from .death_detection import detect_token_death, calculate_death_features, safe_divide
+from death_detection import detect_token_death, calculate_death_features, safe_divide
 
 
 # EXACT 15 Features as specified by CEO

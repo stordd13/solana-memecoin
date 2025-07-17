@@ -146,7 +146,7 @@ class ArchetypeClassifier:
         return all_tokens
     
     def extract_features(self, token_data: Dict[str, pl.DataFrame], minutes: int = 5) -> pd.DataFrame:
-        """Extract features from first N minutes of token data."""
+        """Extract features from first N minutes of token data with dynamic window sizing."""
         print(f"⚡ Extracting features from first {minutes} minutes...")
         
         features_list = []
@@ -182,48 +182,103 @@ class ArchetypeClassifier:
                     # Progressive price features (safe - only current state)
                     'initial_price': prices[0] if len(prices) > 0 else 0,
                     'current_price': prices[-1] if len(prices) > 0 else 0,  # Last available price
-                    
-                    # Progressive return features (cumulative up to current minute)
-                    'cumulative_return_1m': (prices[0] - prices[0]) / prices[0] if len(prices) >= 1 and prices[0] != 0 else 0,
-                    'cumulative_return_2m': (prices[1] - prices[0]) / prices[0] if len(prices) >= 2 and prices[0] != 0 else 0,
-                    'cumulative_return_3m': (prices[2] - prices[0]) / prices[0] if len(prices) >= 3 and prices[0] != 0 else 0,
-                    'cumulative_return_4m': (prices[3] - prices[0]) / prices[0] if len(prices) >= 4 and prices[0] != 0 else 0,
-                    'cumulative_return_5m': (prices[4] - prices[0]) / prices[0] if len(prices) >= 5 and prices[0] != 0 else 0,
-                    
-                    # Rolling volatility (expanding window - safe)
-                    'rolling_volatility_1m': 0,  # Cannot calculate with 1 point
-                    'rolling_volatility_2m': np.std(prices[:2]) / np.mean(prices[:2]) if len(prices) >= 2 and np.mean(prices[:2]) != 0 else 0,
-                    'rolling_volatility_3m': np.std(prices[:3]) / np.mean(prices[:3]) if len(prices) >= 3 and np.mean(prices[:3]) != 0 else 0,
-                    'rolling_volatility_4m': np.std(prices[:4]) / np.mean(prices[:4]) if len(prices) >= 4 and np.mean(prices[:4]) != 0 else 0,
-                    'rolling_volatility_5m': np.std(prices[:5]) / np.mean(prices[:5]) if len(prices) >= 5 and np.mean(prices[:5]) != 0 else 0,
-                    
-                    # Momentum features (safe - only recent data)
-                    'momentum_1min': returns[-1] if len(returns) >= 1 else 0,
-                    'momentum_2min': np.mean(returns[-2:]) if len(returns) >= 2 else 0,
-                    'momentum_3min': np.mean(returns[-3:]) if len(returns) >= 3 else 0,
-                    
-                    # Progressive trend features (expanding window - safe)
-                    'trend_slope_2m': np.polyfit(range(2), prices[:2], 1)[0] if len(prices) >= 2 else 0,
-                    'trend_slope_3m': np.polyfit(range(3), prices[:3], 1)[0] if len(prices) >= 3 else 0,
-                    'trend_slope_4m': np.polyfit(range(4), prices[:4], 1)[0] if len(prices) >= 4 else 0,
-                    'trend_slope_5m': np.polyfit(range(5), prices[:5], 1)[0] if len(prices) >= 5 else 0,
-                    
-                    # Progressive statistical features (expanding window - safe)
-                    'returns_mean_2m': np.mean(returns[:1]) if len(returns) >= 1 else 0,  # 2min = 1 return
-                    'returns_mean_3m': np.mean(returns[:2]) if len(returns) >= 2 else 0,  # 3min = 2 returns
-                    'returns_mean_4m': np.mean(returns[:3]) if len(returns) >= 3 else 0,
-                    'returns_mean_5m': np.mean(returns[:4]) if len(returns) >= 4 else 0,
-                    
-                    'returns_std_2m': 0,  # Cannot calculate std with 1 point
-                    'returns_std_3m': np.std(returns[:2]) if len(returns) >= 2 else 0,
-                    'returns_std_4m': np.std(returns[:3]) if len(returns) >= 3 else 0,
-                    'returns_std_5m': np.std(returns[:4]) if len(returns) >= 4 else 0,
-                    
-                    # Labels
+                }
+                
+                # DYNAMIC FEATURE GENERATION BASED ON WINDOW SIZE
+                
+                # 1. Progressive return features (cumulative from start)
+                # For window W: cumulative_return_1m to cumulative_return_Wm
+                for i in range(1, minutes + 1):
+                    feature_name = f'cumulative_return_{i}m'
+                    if len(prices) >= i + 1 and prices[0] != 0:
+                        features[feature_name] = (prices[i] - prices[0]) / prices[0]
+                    else:
+                        features[feature_name] = 0
+                
+                # 2. Rolling volatility (expanding window - safe)
+                # For window W: rolling_volatility_1m to rolling_volatility_Wm
+                for i in range(1, minutes + 1):
+                    feature_name = f'rolling_volatility_{i}m'
+                    if i == 1:
+                        features[feature_name] = 0  # Cannot calculate with 1 point
+                    elif len(prices) >= i and np.mean(prices[:i]) != 0:
+                        features[feature_name] = np.std(prices[:i]) / np.mean(prices[:i])
+                    else:
+                        features[feature_name] = 0
+                
+                # 3. Momentum features (safe - only recent data)
+                # For window W: momentum_1min to momentum_{W//2+1}min
+                max_momentum = minutes // 2 + 1
+                for i in range(1, max_momentum + 1):
+                    feature_name = f'momentum_{i}min'
+                    if i == 1:
+                        features[feature_name] = returns[-1] if len(returns) >= 1 else 0
+                    elif len(returns) >= i:
+                        features[feature_name] = np.mean(returns[-i:])
+                    else:
+                        features[feature_name] = 0
+                
+                # 4. Progressive trend features (expanding window - safe)
+                # For window W: trend_slope_2m to trend_slope_Wm
+                for i in range(2, minutes + 1):
+                    feature_name = f'trend_slope_{i}m'
+                    if len(prices) >= i:
+                        features[feature_name] = np.polyfit(range(i), prices[:i], 1)[0]
+                    else:
+                        features[feature_name] = 0
+                
+                # 5. Progressive statistical features (expanding window - safe)
+                # For window W: returns_mean_2m to returns_mean_Wm
+                for i in range(2, minutes + 1):
+                    feature_name = f'returns_mean_{i}m'
+                    returns_needed = i - 1  # N minutes = N-1 returns
+                    if len(returns) >= returns_needed:
+                        features[feature_name] = np.mean(returns[:returns_needed])
+                    else:
+                        features[feature_name] = 0
+                
+                # For window W: returns_std_2m to returns_std_Wm
+                for i in range(2, minutes + 1):
+                    feature_name = f'returns_std_{i}m'
+                    returns_needed = i - 1  # N minutes = N-1 returns
+                    if i == 2:
+                        features[feature_name] = 0  # Cannot calculate std with 1 point
+                    elif len(returns) >= returns_needed:
+                        features[feature_name] = np.std(returns[:returns_needed])
+                    else:
+                        features[feature_name] = 0
+                
+                # 6. Log feature variants (enhanced for non-linear patterns)
+                # Log cumulative returns for i=1 to window
+                for i in range(1, minutes + 1):
+                    cum_return_feature = f'cumulative_return_{i}m'
+                    if cum_return_feature in features:
+                        log_feature_name = f'log_cumulative_return_{i}m'
+                        features[log_feature_name] = np.log(1 + abs(features[cum_return_feature]) + 1e-12) * np.sign(features[cum_return_feature])
+                
+                # Log rolling volatility for i=1 to window
+                for i in range(1, minutes + 1):
+                    vol_feature = f'rolling_volatility_{i}m'
+                    if vol_feature in features:
+                        log_feature_name = f'log_rolling_vol_{i}m'
+                        features[log_feature_name] = np.log(1 + features[vol_feature] + 1e-12)
+                
+                # 7. Sprint-specific features (6 features - consistent across windows)
+                features.update({
+                    'instant_pump': 1 if (len(returns) > 0 and returns[0] > 0.5) else 0,
+                    'flat_minutes': np.sum(np.abs(returns) < 0.01) if len(returns) > 0 else 0,
+                    'consecutive_negative': np.max(np.cumsum(returns < 0) * (returns >= 0).cumsum() == 0) if len(returns) > 0 else 0,
+                    'pump_fade_ratio': returns[-1] / np.max(returns + 1e-12) if len(returns) > 0 and np.max(returns) > 0 else 1,
+                    'downtrend_strength': -features[f'trend_slope_{minutes}m'] if f'trend_slope_{minutes}m' in features and features[f'trend_slope_{minutes}m'] < 0 else 0,
+                    'acf_lag_1_early': np.corrcoef(returns[:-1], returns[1:])[0,1] if len(returns) > 1 and np.std(returns[:-1]) > 0 and np.std(returns[1:]) > 0 else 0,
+                })
+                
+                # 7. Labels
+                features.update({
                     'category': self.token_labels[token_name]['category'],
                     'cluster': self.token_labels[token_name]['cluster'],
                     'archetype': self.token_labels[token_name]['archetype']
-                }
+                })
                 
                 features_list.append(features)
                 
@@ -234,7 +289,29 @@ class ArchetypeClassifier:
         features_df = pd.DataFrame(features_list)
         print(f"✅ Extracted features for {len(features_df)} tokens")
         
+        # Log feature count for verification
+        feature_cols = [col for col in features_df.columns if col not in ['token_name', 'category', 'cluster', 'archetype']]
+        print(f"📊 Total features extracted: {len(feature_cols)} (expected: {self._get_expected_feature_count(minutes)})")
+        
         return features_df
+    
+    def _get_expected_feature_count(self, minutes: int) -> int:
+        """Calculate expected feature count based on window size."""
+        base_features = 2  # initial_price, current_price
+        cumulative_returns = minutes  # 1m to Wm
+        rolling_volatility = minutes  # 1m to Wm
+        momentum = minutes // 2 + 1  # 1min to (W//2+1)min
+        trend_slopes = minutes - 1  # 2m to Wm
+        returns_mean = minutes - 1  # 2m to Wm
+        returns_std = minutes - 1  # 2m to Wm
+        log_cumulative_returns = minutes  # log variants for cumulative returns
+        log_rolling_volatility = minutes  # log variants for rolling volatility
+        sprint_features = 6  # Fixed 6 sprint-specific features
+        
+        total = (base_features + cumulative_returns + rolling_volatility + momentum + 
+                trend_slopes + returns_mean + returns_std + log_cumulative_returns + 
+                log_rolling_volatility + sprint_features)
+        return total
     
     def _calculate_max_drawdown(self, prices: np.ndarray) -> float:
         """Calculate maximum drawdown."""

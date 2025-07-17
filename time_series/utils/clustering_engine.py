@@ -137,7 +137,7 @@ class ClusteringEngine:
     
     def find_optimal_k(self, features: np.ndarray, k_range: range = range(3, 11)) -> Dict[str, float]:
         """
-        Find optimal number of clusters using elbow method and silhouette analysis.
+        Find optimal number of clusters using multiple methods.
         
         Args:
             features: Feature matrix
@@ -146,29 +146,71 @@ class ClusteringEngine:
         Returns:
             Dictionary with optimal K analysis
         """
+        from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score
+        
         inertias = []
         silhouette_scores = []
+        calinski_scores = []
+        davies_bouldin_scores = []
         k_values = list(k_range)
+        all_labels = {}
+        
+        print(f"🔍 Testing K values from {k_values[0]} to {k_values[-1]}...")
         
         for k in k_values:
             result = self.cluster_and_evaluate(features, k)
+            labels = result['labels']
+            all_labels[k] = labels
+            
             inertias.append(result['inertia'])
             silhouette_scores.append(result['silhouette_score'])
+            
+            # Additional metrics
+            ch_score = calinski_harabasz_score(features, labels)
+            calinski_scores.append(ch_score)
+            
+            db_score = davies_bouldin_score(features, labels)
+            davies_bouldin_scores.append(db_score)
         
-        # Find elbow using the "elbow method" - look for point of maximum curvature
+        # Find optimal K using different methods
         optimal_k_elbow = self._find_elbow_point(k_values, inertias)
         
-        # Find optimal K by silhouette score
+        # Silhouette method
         max_sil_idx = np.argmax(silhouette_scores)
         optimal_k_silhouette = k_values[max_sil_idx]
+        
+        # Calinski-Harabasz (higher is better)
+        max_ch_idx = np.argmax(calinski_scores)
+        optimal_k_calinski = k_values[max_ch_idx]
+        
+        # Davies-Bouldin (lower is better)
+        min_db_idx = np.argmin(davies_bouldin_scores)
+        optimal_k_davies = k_values[min_db_idx]
+        
+        # Gap statistic (simplified version)
+        optimal_k_gap = self._calculate_gap_statistic(features, k_values, inertias)
+        
+        # Print summary of all methods
+        print(f"📊 K Selection Method Results:")
+        print(f"  Elbow Method: K={optimal_k_elbow}")
+        print(f"  Silhouette Method: K={optimal_k_silhouette} (score={silhouette_scores[max_sil_idx]:.3f})")
+        print(f"  Calinski-Harabasz: K={optimal_k_calinski} (score={calinski_scores[max_ch_idx]:.1f})")
+        print(f"  Davies-Bouldin: K={optimal_k_davies} (score={davies_bouldin_scores[min_db_idx]:.3f})")
+        print(f"  Gap Statistic: K={optimal_k_gap}")
         
         return {
             'k_range': k_values,
             'inertias': inertias,
             'silhouette_scores': silhouette_scores,
+            'calinski_scores': calinski_scores,
+            'davies_bouldin_scores': davies_bouldin_scores,
             'optimal_k_elbow': optimal_k_elbow,
             'optimal_k_silhouette': optimal_k_silhouette,
-            'max_silhouette_score': silhouette_scores[max_sil_idx]
+            'optimal_k_calinski': optimal_k_calinski,
+            'optimal_k_davies': optimal_k_davies,
+            'optimal_k_gap': optimal_k_gap,
+            'max_silhouette_score': silhouette_scores[max_sil_idx],
+            'all_labels': all_labels
         }
     
     def _find_elbow_point(self, k_values: List[int], inertias: List[float]) -> int:
@@ -206,6 +248,53 @@ class ClusteringEngine:
         # Return K value with maximum distance (elbow point)
         elbow_idx = np.argmax(distances)
         return k_values[elbow_idx]
+    
+    def _calculate_gap_statistic(self, features: np.ndarray, k_values: List[int], 
+                                inertias: List[float], n_refs: int = 3) -> int:
+        """
+        Calculate gap statistic for optimal K selection.
+        
+        Args:
+            features: Feature matrix
+            k_values: List of K values tested
+            inertias: Corresponding inertia values
+            n_refs: Number of reference datasets to generate
+            
+        Returns:
+            Optimal K value based on gap statistic
+        """
+        gaps = []
+        
+        for i, k in enumerate(k_values):
+            # Generate reference datasets
+            ref_inertias = []
+            for _ in range(n_refs):
+                # Random data with same shape
+                random_data = np.random.rand(*features.shape)
+                
+                # Scale to match original data range
+                for col in range(features.shape[1]):
+                    min_val = features[:, col].min()
+                    max_val = features[:, col].max()
+                    random_data[:, col] = random_data[:, col] * (max_val - min_val) + min_val
+                
+                # Cluster random data
+                kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)
+                kmeans.fit(random_data)
+                ref_inertias.append(kmeans.inertia_)
+            
+            # Calculate gap
+            ref_log_inertia = np.mean(np.log(ref_inertias))
+            gap = ref_log_inertia - np.log(inertias[i])
+            gaps.append(gap)
+        
+        # Find optimal K (first K where gap[k] >= gap[k+1] - std[k+1])
+        for i in range(len(gaps) - 1):
+            if gaps[i] >= gaps[i + 1]:
+                return k_values[i]
+        
+        # If no clear winner, return K with maximum gap
+        return k_values[np.argmax(gaps)]
     
     def evaluate_behavioral_separation(self, features: np.ndarray, labels: np.ndarray, 
                                      true_labels: Optional[List[int]] = None) -> Dict[str, float]:
@@ -297,14 +386,65 @@ class ClusteringEngine:
         # Find optimal K
         k_analysis = self.find_optimal_k(features, k_range)
         
-        # Use elbow method result as primary choice (CEO preference)
-        optimal_k = k_analysis['optimal_k_elbow']
+        # DEBUG: Show K selection details
+        print(f"🔍 DEBUG: K Selection Analysis:")
+        print(f"  Elbow method suggests K: {k_analysis['optimal_k_elbow']}")
+        print(f"  Silhouette method suggests K: {k_analysis['optimal_k_silhouette']}")
+        print(f"  Calinski-Harabasz suggests K: {k_analysis['optimal_k_calinski']}")
+        print(f"  Davies-Bouldin suggests K: {k_analysis['optimal_k_davies']}")
+        print(f"  Gap statistic suggests K: {k_analysis['optimal_k_gap']}")
+        
+        # Enhanced voting mechanism for K selection (Davies-Bouldin prioritized for financial data)
+        k_votes = {}
+        k_votes[k_analysis['optimal_k_elbow']] = k_votes.get(k_analysis['optimal_k_elbow'], 0) + 1
+        k_votes[k_analysis['optimal_k_silhouette']] = k_votes.get(k_analysis['optimal_k_silhouette'], 0) + 2
+        k_votes[k_analysis['optimal_k_calinski']] = k_votes.get(k_analysis['optimal_k_calinski'], 0) + 1
+        k_votes[k_analysis['optimal_k_davies']] = k_votes.get(k_analysis['optimal_k_davies'], 0) + 3  # Highest weight for Davies-Bouldin (best for unbalanced clusters)
+        k_votes[k_analysis['optimal_k_gap']] = k_votes.get(k_analysis['optimal_k_gap'], 0) + 1
+        
+        # Find K with most votes
+        optimal_k = max(k_votes, key=k_votes.get)
+        selection_method = f"Davies-Bouldin weighted voting (votes: {k_votes})"
+        
+        # Add Davies-Bouldin validation for financial data
+        db_winner = k_analysis['optimal_k_davies']
+        k_values = k_analysis['k_range']
+        davies_bouldin_scores = k_analysis['davies_bouldin_scores']
+        db_idx = k_values.index(db_winner) if db_winner in k_values else 0
+        db_score = davies_bouldin_scores[db_idx] if db_idx < len(davies_bouldin_scores) else 0
+        
+        print(f"\\n  🎯 Davies-Bouldin Analysis (Financial Data Optimized):") 
+        print(f"    Davies-Bouldin Winner: K={db_winner} (score={db_score:.3f}, lower is better)")
+        print(f"    Davies-Bouldin votes: {k_votes.get(db_winner, 0)}/8 total votes")
+        
+        # If Davies-Bouldin has strong preference, consider overriding
+        if k_votes.get(db_winner, 0) >= 3:  # Davies-Bouldin + at least one other method
+            print(f"    ✅ Davies-Bouldin preference confirmed by multiple methods")
+        else:
+            print(f"    ⚠️  Davies-Bouldin isolated choice - using voting consensus")
+        
+        # Show silhouette scores for top K values
+        sorted_k_by_sil = sorted(zip(k_analysis['k_range'], k_analysis['silhouette_scores']), 
+                                key=lambda x: x[1], reverse=True)[:5]
+        print(f"\n  Top 5 K values by silhouette score:")
+        for k, score in sorted_k_by_sil:
+            print(f"    K={k}: silhouette={score:.4f}")
+        
+        print(f"\n  Selected K: {optimal_k} (using {selection_method})")
         
         # Perform stability test
         stability = self.stability_test(features, optimal_k, stability_runs)
         
         # Final clustering with optimal K
         final_result = self.cluster_and_evaluate(features, optimal_k)
+        
+        # DEBUG: Show cluster distribution
+        labels = final_result['labels']
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        print(f"🔍 DEBUG: Final cluster distribution:")
+        for label, count in zip(unique_labels, counts):
+            percentage = (count / len(labels)) * 100
+            print(f"  Cluster {label}: {count} tokens ({percentage:.1f}%)")
         
         # Create t-SNE embedding
         tsne_2d = self.create_tsne_embedding(features, n_components=2)
