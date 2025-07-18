@@ -21,6 +21,12 @@ wheels/
 *.egg
 MANIFEST
 
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 # Virtual environments
 memecoin2/
 venv/
