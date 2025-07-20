@@ -22,7 +22,7 @@ def real_time_update_loop(existing_path: str) -> None:
     df = pl.read_parquet(existing_path)
     while True:
         # Sim new data (5 min chunk; real: fetch from QuickNode/Pump.fun)
-        new_data = df.tail(100).with_columns(pl.col("timestamp") + pl.duration(minutes=5), pl.col("price") * 1.05)  # Toy volatility
+        new_data = df.tail(100).with_columns(pl.col("datetime") + pl.duration(minutes=5), pl.col("price") * 1.05)  # Toy volatility
         df = df.vstack(new_data)
         
         # Re-run pipeline on updated DF (it handles multi-file, but here on single temp)

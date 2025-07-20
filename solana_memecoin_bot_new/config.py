@@ -1,8 +1,12 @@
 import os
+import logging
 
 # config.py - Global constants with dynamic paths for multi-file loading
 BOT_NEW_ROOT = os.path.abspath(os.path.dirname(__file__))
 DATA_RAW_DIR = os.path.join(BOT_NEW_ROOT, '..', 'data/raw/dataset')  # Parent data/raw/dataset/
+DEBUG_MODE = True  # Toggle for verbose debug logs
+LOG_LEVEL = logging.DEBUG if DEBUG_MODE else logging.INFO
+LOG_FILE = os.path.join(BOT_NEW_ROOT, 'logs/pipeline.log')
 TOKENS_LIST_FILE = '_tokens_list.parquet'  # File to exclude during scan
 RESAMPLE_INTERVALS = ["1m", "5m"]
 N_ARCHETYPES_RANGE = (2, 10)

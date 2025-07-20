@@ -13,6 +13,10 @@ def engineer_features(df: pl.DataFrame, lags: int = 10) -> pl.DataFrame:
     Expanded features (20+): Rolling, momentum, RSI, MACD, ACF lags, dump flag (cum returns < threshold in first 2 min).
     Vectorized for efficiency; challenges early dump risks.
     """
+    # Check for 'returns' column existence before proceeding
+    if "returns" not in df.columns:
+        raise ValueError("The 'returns' column must be calculated before engineering features.")
+
     def acf_per_group(group, lags):
         returns = group["returns"].to_numpy()
         if len(returns) > lags:
@@ -58,6 +62,13 @@ def engineer_features(df: pl.DataFrame, lags: int = 10) -> pl.DataFrame:
     ).with_columns(
         (pl.col("vol_std_5") / (pl.col("ma_5") + 1e-6)).alias("vol_return_ratio")  # New: Volatility relative to mean, for ML
     ).drop("min_rank", "early_cum_returns")
+    
+    # Add pump_label (binary: next returns > 0.5; shift(-1) per-token, safe post-split)
+    result = result.with_columns(
+        pl.when(pl.col("returns").shift(-1) > 0.5).then(1).otherwise(0).alias("pump_label")
+    ).with_columns(  # NaN fill for pump_label (e.g., last row)
+        pl.col("pump_label").fill_nan(0).alias("pump_label")
+    )
     
     # Final NaN handling - replace any remaining NaN/inf values with 0
     # This is critical for K-means clustering which doesn't handle NaN values
