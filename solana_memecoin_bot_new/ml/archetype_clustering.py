@@ -24,7 +24,7 @@ def select_best_k(features, min_k=2, max_k=10):
     for k in range(min_k, max_k + 1):
         if k >= len(features): break
         k_start = time.time()
-        kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)  # Increased n_init for better init
+        kmeans = KMeans(n_clusters=k, random_state=42)
         labels = kmeans.fit_predict(features)
         labels_list.append(labels)
         if len(set(labels)) > 1:
@@ -49,70 +49,77 @@ def select_best_k(features, min_k=2, max_k=10):
     return best_k, silhouette_scores[best_k - min_k], labels_list[best_k - min_k]
 
 def fast_early_clustering(df: pl.DataFrame, min_minutes: int = config.EARLY_MINUTES) -> pl.DataFrame:
-    """
-    Lightweight clustering on first 5 min for early entry (features: returns std/mean/momentum/dump flag).
-    Dynamic K with multi-metric; challenges noise in initial data.
-    """
     start = time.time()
-    early_df = df.group_by("token_id").head(min_minutes).with_columns(
-        pl.col("returns").pct_change().alias("momentum")
-    )
-    features = early_df.group_by("token_id").agg(
-        pl.col("returns").std().alias("ret_std"),
-        pl.col("returns").mean().alias("ret_mean"),
-        pl.col("momentum").mean().alias("avg_momentum"),
-        pl.col("initial_dump_flag").any().alias("dump_flag")
-    ).select(pl.exclude("token_id")).to_numpy()
     
-    # Check for NaN/inf values in the early feature matrix
+    # Take only first min_minutes (10 by default) of each token
+    early_df = df.group_by("token_id").head(min_minutes)
+    
+    # Use early features that work well with 10-minute windows
+    early_feature_cols = [
+        "early_mean_returns", "early_max_return", "early_min_return", "early_return_volatility",
+        "early_price_range", "early_avg_volatility", "early_max_volatility",
+        "rolling_mean_6min", "rolling_std_6min", "volatility_trend_6min",
+        "rolling_mean_7min", "momentum_7min", "early_dump_flag", "early_stability_ratio"
+    ]
+    
+    # Check which early features are available in the dataframe
+    available_early_cols = [col for col in early_feature_cols if col in early_df.columns]
+    
+    if not available_early_cols:
+        # Fallback to basic features if early features not available
+        logger.warning("Early features not found, using basic aggregations")
+        agg_df = early_df.group_by("token_id").agg([
+            pl.col("returns").std().alias("ret_std"),
+            pl.col("returns").mean().alias("ret_mean"),
+            pl.col("returns").pct_change().mean().alias("avg_momentum"),
+            pl.col("initial_dump_flag").any().alias("dump_flag")
+        ]).fill_nan(0.0)
+        features = agg_df.select(pl.exclude("token_id")).to_numpy()
+    else:
+        # Use early features with aggregation (take last value per token for each feature)
+        agg_df = early_df.group_by("token_id").agg([
+            pl.col(col).last().alias(f"{col}_last") if col not in ["early_dump_flag"] 
+            else pl.col(col).any().alias(f"{col}_any") for col in available_early_cols
+        ]).fill_nan(0.0)
+        features = agg_df.select(pl.exclude("token_id")).to_numpy()
+    
+    # Clean any remaining NaN/inf values
     if np.any(np.isnan(features)) or np.any(np.isinf(features)):
-        logger.warning("Found NaN or inf values in early feature matrix, replacing with 0")
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        logger.warning("Found NaN or inf values in early feature matrix, cleaning...")
+        features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
     
-    # Scale features to [0,1] to handle extremes
     scaler = MinMaxScaler()
     features = scaler.fit_transform(features)
     
     best_k, best_score, best_labels = select_best_k(features, config.N_ARCHETYPES_RANGE[0], config.N_ARCHETYPES_RANGE[1])
     logger.info(f"Early Clustering: Optimal K={best_k}, Score={best_score:.3f}, Time={time.time() - start:.2f}s")
     
-    token_ids = early_df["token_id"].unique().to_list()
-    return df.join(pl.DataFrame({"token_id": token_ids, "early_archetype": best_labels}), on="token_id", how="left")
+    return df.join(agg_df.with_columns(pl.Series("early_archetype", best_labels)).select("token_id", "early_archetype"), on="token_id", how="left")
 
 def cluster_archetypes(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Full dynamic K-means on expanded features; uses early as optional seed.
-    """
     start = time.time()
-    feature_cols = ["scaled_returns", "ma_5", "vol_std_5", "momentum_lag1", "rsi_14", "acf_lag_1", "imbalance_ratio", "initial_dump_flag"]
+    # Updated to use dual-track scaling features: volatility metrics for clustering, raw returns preserved for analysis
+    feature_cols = ["scaled_volatility", "scaled_vol_metrics", "ma_5", "vol_std_5", "momentum_lag1", "rsi_14", "acf_lag_1", "imbalance_ratio", "initial_dump_flag"]
     
-    # Check which columns exist and filter accordingly
     available_cols = [col for col in feature_cols if col in df.columns]
-    missing_cols = [col for col in feature_cols if col not in df.columns]
-    
-    if missing_cols:
-        logger.warning(f"Missing columns for clustering: {missing_cols}")
-    
     if not available_cols:
         logger.error("No feature columns available for clustering")
         return df.with_columns(pl.lit(0).alias("archetype"))
     
     logger.info(f"Using {len(available_cols)} features for clustering: {available_cols}")
     
-    # Use only available columns and ensure we have the right number of rows
-    features_df = df.select(pl.col(available_cols)).drop_nulls()
-    features = features_df.to_numpy()
+    # Per-token aggregation with fill_nan to keep short/dead tokens
+    agg_df = df.group_by("token_id").agg([pl.col(col).mean().alias(col) for col in available_cols]).fill_nan(0.0)
+    features = agg_df.select(available_cols).to_numpy()
     
     if len(features) == 0:
         logger.error("No valid feature data for clustering")
         return df.with_columns(pl.lit(0).alias("archetype"))
     
-    # Check for NaN/inf values in the feature matrix
     if np.any(np.isnan(features)) or np.any(np.isinf(features)):
         logger.warning("Found NaN or inf values in feature matrix, replacing with 0")
         features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     
-    # Scale features to [0,1] to handle extremes
     scaler = MinMaxScaler()
     features = scaler.fit_transform(features)
     
@@ -122,16 +129,4 @@ def cluster_archetypes(df: pl.DataFrame) -> pl.DataFrame:
     best_k, best_score, best_labels = select_best_k(features, config.N_ARCHETYPES_RANGE[0], config.N_ARCHETYPES_RANGE[1])
     logger.info(f"Full Clustering: Optimal K={best_k}, Score={best_score:.3f}, Time={time.time() - start:.2f}s")
     
-    # Create labels for the original dataframe
-    # Since we dropped nulls, we need to map back to original indices
-    original_indices = features_df.select(pl.int_range(pl.len()).alias("idx")).to_numpy().flatten()
-    
-    # Create a series with the same length as original df, filling with -1 for missing values
-    archetype_series = pl.Series("archetype", [-1] * len(df))
-    
-    # Assign cluster labels to the valid indices
-    for i, label in enumerate(best_labels):
-        if i < len(original_indices):
-            archetype_series = archetype_series.scatter(original_indices[i], label)
-    
-    return df.with_columns(archetype_series)
+    return df.join(agg_df.with_columns(pl.Series("archetype", best_labels)).select("token_id", "archetype"), on="token_id", how="left")
