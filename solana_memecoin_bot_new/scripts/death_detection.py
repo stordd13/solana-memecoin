@@ -123,8 +123,33 @@ def trim_post_death(df: pl.DataFrame) -> pl.DataFrame:
     # Ensure min 1 row per dead token
     dead_tokens = df.filter(pl.col("is_dead")).select("token_id").unique()
     missing = dead_tokens.join(trimmed.select("token_id").unique(), on="token_id", how="anti")
+    
+    # Ensure we have a DataFrame (not LazyFrame) and check if there are missing tokens
+    if isinstance(missing, pl.LazyFrame):
+        missing = missing.collect()
+    
     if missing.height > 0:
-        placeholders = missing.with_columns(pl.lit(None).cast(pl.Datetime).alias("datetime"), pl.lit(0.0).alias("avg_price"), ... )  # Fill other cols
+        # Get column names and types from the original dataframe
+        cols = df.columns
+        dtypes = df.dtypes
+        
+        # Create placeholders with proper columns
+        placeholder_data = {}
+        for col, dtype in zip(cols, dtypes):
+            if col == "token_id":
+                placeholder_data[col] = missing["token_id"]
+            elif col == "datetime":
+                placeholder_data[col] = [None] * missing.height
+            elif dtype in [pl.Float32, pl.Float64]:
+                placeholder_data[col] = [0.0] * missing.height
+            elif dtype in [pl.Int32, pl.Int64]:
+                placeholder_data[col] = [0] * missing.height
+            elif dtype == pl.Boolean:
+                placeholder_data[col] = [False] * missing.height
+            else:
+                placeholder_data[col] = [None] * missing.height
+        
+        placeholders = pl.DataFrame(placeholder_data)
         trimmed = pl.concat([trimmed, placeholders])
     return trimmed
 

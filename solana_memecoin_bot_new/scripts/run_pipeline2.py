@@ -103,8 +103,9 @@ def run_pipeline(output_base: str) -> dict:
         
         # Add pump_label here post-split (binary next returns >0.5, per-token shift safe)
         start = time.time()
+        # Changed from 0.5 (50%) to 0.10 (10%) for more realistic pump detection
         split_df = split_df.with_columns(
-            pl.when(pl.col("returns").shift(-1) > 0.5).then(1).otherwise(0).alias("pump_label")
+            pl.when(pl.col("returns").shift(-1) > 0.10).then(1).otherwise(0).alias("pump_label")
         ).with_columns(
             pl.col("pump_label").fill_nan(0).alias("pump_label")  # Fill last row NaN
         )

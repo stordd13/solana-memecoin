@@ -65,7 +65,7 @@ results/
 # Logs
 *.log
 logs/
-
+*.pkl
 # Streamlit
 .streamlit/
 

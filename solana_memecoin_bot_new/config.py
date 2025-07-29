@@ -12,6 +12,7 @@ RESAMPLE_INTERVALS = ["1m", "5m"]
 N_ARCHETYPES_RANGE = (2, 10)
 ZERO_THRESHOLD = 120  # Minutes for death (2 hours - adjusted for memecoin context)
 DUMP_RETURN_THRESHOLD = -0.1
+PUMP_RETURN_THRESHOLD = 0.10  # 10% gain for pump detection (reduced from 50% for better ML performance)
 EARLY_MINUTES = 10  # Increased to enable rolling features and natural filtering of ultra-short tokens
 IMBALANCE_BUY_THRESHOLD = 0.2
 HOLD_MINUTES = 10

@@ -113,8 +113,10 @@ def add_splits_and_labels(scaled: pl.DataFrame) -> pl.DataFrame:
         pl.when(pl.col("rank") <= pl.col("rank").max().over("token_id") * 0.8).then(pl.lit("train")).otherwise(pl.lit("test")).alias("split")
     ).drop("rank")
     
+    # Changed from 0.5 (50%) to 0.10 (10%) for more realistic pump detection
+    # 10% gains are much more tradeable and provide better class balance (~2% pump rate vs 0.5%)
     split_df = split_df.with_columns(
-        pl.when(pl.col("returns").shift(-1) > 0.5).then(1).otherwise(0).alias("pump_label")
+        pl.when(pl.col("returns").shift(-1) > 0.10).then(1).otherwise(0).alias("pump_label")
     ).with_columns(pl.col("pump_label").fill_nan(0).alias("pump_label"))  # Fill last row
     
     logger.info(f"Splits and labels took {time.time() - start:.2f}s")

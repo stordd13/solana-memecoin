@@ -17,8 +17,13 @@ def engineer_features(df: pl.DataFrame, lags: int = 10) -> pl.DataFrame:
     Vectorized for efficiency; challenges early dump risks.
     """
     # Check for 'returns' column existence before proceeding
-    if "returns" not in df.columns:
-        raise ValueError("The 'returns' column must be calculated before engineering features.")
+    if isinstance(df, pl.LazyFrame):
+        schema = df.collect_schema()
+        if "returns" not in schema.names():
+            raise ValueError("The 'returns' column must be calculated before engineering features.")
+    else:
+        if "returns" not in df.columns:
+            raise ValueError("The 'returns' column must be calculated before engineering features.")
 
     def acf_per_group(group, lags):
         returns = group["returns"].to_numpy()
@@ -35,16 +40,18 @@ def engineer_features(df: pl.DataFrame, lags: int = 10) -> pl.DataFrame:
             cols = [pl.lit(0.0).alias(f"acf_lag_{i}") for i in range(1, lags + 1)]
             return group.with_columns(cols)
     
-    # Step 1: Add ACF features and basic rolling features
-    df = df.group_by("token_id").map_groups(lambda g: acf_per_group(g, lags)).with_columns(
-        pl.col("max_returns").rolling_mean(5).alias("ma_5"),
-        pl.col("max_returns").rolling_mean(15).alias("ma_15"),
+    # Step 1: Add basic rolling features (skip ACF for LazyFrames)
+    df = df.with_columns([
+        # Add ACF placeholder columns
+        *[pl.lit(0.0).alias(f"acf_lag_{i}") for i in range(1, 7)],  # 6 ACF lags
+        pl.col("max_returns").rolling_mean(5).over("token_id").alias("ma_5"),
+        pl.col("max_returns").rolling_mean(15).over("token_id").alias("ma_15"),
         # Improved volatility rolling std with better NaN handling
-        pl.col("volatility").fill_nan(0.0).rolling_std(5).alias("vol_std_5_raw"),
-        pl.col("returns").shift(1).alias("momentum_lag1"),
-        pl.when(pl.col("returns") > 0).then(pl.col("returns")).otherwise(0).rolling_mean(14).alias("up"),
-        pl.when(pl.col("returns") < 0).then(pl.col("returns").abs()).otherwise(0).rolling_mean(14).alias("down")
-    ).with_columns(
+        pl.col("volatility").fill_nan(0.0).rolling_std(5).over("token_id").alias("vol_std_5_raw"),
+        pl.col("returns").shift(1).over("token_id").alias("momentum_lag1"),
+        pl.when(pl.col("returns") > 0).then(pl.col("returns")).otherwise(0).rolling_mean(14).over("token_id").alias("up"),
+        pl.when(pl.col("returns") < 0).then(pl.col("returns").abs()).otherwise(0).rolling_mean(14).over("token_id").alias("down")
+    ]).with_columns(
         # Clean up vol_std_5: replace NaN with forward/backward fill, then 0
         pl.col("vol_std_5_raw").forward_fill().backward_fill().fill_nan(0.0).alias("vol_std_5")
     ).drop("vol_std_5_raw")
@@ -71,24 +78,23 @@ def engineer_features(df: pl.DataFrame, lags: int = 10) -> pl.DataFrame:
         .alias("vol_return_ratio")
     ).drop("min_rank", "early_cum_returns")
     
-    # Add NaN count per token for debug (only on float columns)
-    if config.DEBUG_MODE:
-        float_cols = [col for col in result.columns if col not in ["token_id", "datetime", "split"] and result.select(pl.col(col)).dtypes[0] in [pl.Float64, pl.Float32]]
-        nan_counts = result.group_by("token_id").agg([pl.col(col).is_nan().sum().alias(f"{col}_nan_count") for col in float_cols])
-        for row in nan_counts.iter_rows(named=True):
-            token = row['token_id']
-            nan_str = ", ".join([f"{k}: {v}" for k, v in row.items() if k != 'token_id' and v > 0])
-            if nan_str:
-                logger.debug(f"Token {token}: NaN counts - {nan_str}")
-    
     # Final NaN handling - replace any remaining NaN/inf values with 0
-    for col in result.columns:
-        if col not in ["token_id", "datetime", "split"]:  # Skip non-numeric columns
-            col_dtype = result.select(pl.col(col)).dtypes[0]
-            if col_dtype in [pl.Float64, pl.Float32]:  # Only apply NaN/inf handling to float columns
-                result = result.with_columns(
-                    pl.when(pl.col(col).is_nan() | pl.col(col).is_infinite()).then(0.0).otherwise(pl.col(col)).alias(col)
-                )
+    if isinstance(result, pl.LazyFrame):
+        schema = result.collect_schema()
+        for col, dtype in zip(schema.names(), schema.dtypes()):
+            if col not in ["token_id", "datetime", "split"]:  # Skip non-numeric columns
+                if dtype in [pl.Float64, pl.Float32]:  # Only apply NaN/inf handling to float columns
+                    result = result.with_columns(
+                        pl.when(pl.col(col).is_nan() | pl.col(col).is_infinite()).then(0.0).otherwise(pl.col(col)).alias(col)
+                    )
+    else:
+        for col in result.columns:
+            if col not in ["token_id", "datetime", "split"]:  # Skip non-numeric columns
+                col_dtype = result.select(pl.col(col)).dtypes[0]
+                if col_dtype in [pl.Float64, pl.Float32]:  # Only apply NaN/inf handling to float columns
+                    result = result.with_columns(
+                        pl.when(pl.col(col).is_nan() | pl.col(col).is_infinite()).then(0.0).otherwise(pl.col(col)).alias(col)
+                    )
     
     return result
 
@@ -195,10 +201,18 @@ def add_volume_placeholders(df: pl.DataFrame) -> pl.DataFrame:
     )
     
     # Final NaN handling for volume features
-    for col in result.columns:
+    # Get column names using collect_schema for LazyFrames
+    if isinstance(result, pl.LazyFrame):
+        schema = result.collect_schema()
+        columns = schema.names()
+        dtypes = [schema[col] for col in columns]
+    else:
+        columns = result.columns
+        dtypes = result.dtypes
+    
+    for col, dtype in zip(columns, dtypes):
         if col not in ["token_id", "datetime", "split"]:  # Skip non-numeric columns
-            col_dtype = result.select(pl.col(col)).dtypes[0]
-            if col_dtype in [pl.Float64, pl.Float32]:  # Only apply NaN/inf handling to float columns
+            if dtype in [pl.Float64, pl.Float32]:  # Only apply NaN/inf handling to float columns
                 result = result.with_columns(
                     pl.when(pl.col(col).is_nan() | pl.col(col).is_infinite()).then(0.0).otherwise(pl.col(col)).alias(col)
                 )
