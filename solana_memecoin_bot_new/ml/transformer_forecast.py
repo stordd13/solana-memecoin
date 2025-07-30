@@ -397,7 +397,7 @@ def main():
                        help='Window sizes to train (e.g., 10 20 30)')
     parser.add_argument('--epochs', type=int, default=15, help='Training epochs')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
+    parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
     args = parser.parse_args()
     
     # Load unified data (no archetypes)
