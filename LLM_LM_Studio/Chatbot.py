@@ -201,10 +201,10 @@ def interactive_chat(
 # %%
 if __name__ == "__main__":
     try:
-        client = openai.OpenAI(base_url="http://localhost:1234/v1", api_key="")
+        client = openai.OpenAI(base_url="http://127.0.0.1:1234", api_key="")
 
         chat_config = ChatConfig(
-            model="gemma-3n-e2b-it-text",
+            model="qwen/qwen3-30b-a3b-2507",
             temperature=0.3,
             max_tokens=400,
             verbose=True,
