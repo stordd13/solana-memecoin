@@ -103,11 +103,30 @@ class MemecoinSequenceScaler:
                     scaled_sequences[:, :, idx] = (feat_data - mean) / std
         
         # 3. Ratios - Log transform vectorisé
+        # for feat_name in self.feature_groups["ratio_features"]:
+        #     if feat_name in self.feature_names:
+        #         idx = self.feature_names.index(feat_name)
+        #         scaled_sequences[:, :, idx] = np.log(sequences[:, :, idx] + 1e-8)
+        
+
+        # 3. RATIOS - Log transform et centrage
         for feat_name in self.feature_groups["ratio_features"]:
             if feat_name in self.feature_names:
                 idx = self.feature_names.index(feat_name)
-                scaled_sequences[:, :, idx] = np.log(sequences[:, :, idx] + 1e-8)
-        
+                feat_data = sequences[:, :, idx]  # ← Utiliser "sequences" pas "sequence"
+                
+                if feat_name == "price_multiple":
+                    # Price multiple peut être très large (0.01 à 1000)
+                    log_values = np.log(feat_data + 1e-8)
+                    # Calcul vectorisé du median et MAD
+                    median = np.median(log_values, axis=1, keepdims=True)
+                    mad = np.median(np.abs(log_values - median), axis=1, keepdims=True)
+                    mad = np.where(mad < 0.1, 1.0, mad)  # Éviter division par petit nombre
+                    scaled_sequences[:, :, idx] = (log_values - median) / mad
+                else:
+                    # Autres ratios - simple log transform
+                    scaled_sequences[:, :, idx] = np.log(feat_data + 1e-8)
+
         # 4. Features temporelles - Normalisation globale vectorisée
         for feat_name in self.feature_groups["temporal_features"]:
             if feat_name in self.feature_names:
@@ -129,7 +148,8 @@ class MemecoinSequenceScaler:
         # Remplacer NaN
         scaled_sequences = np.nan_to_num(scaled_sequences, nan=0.0)
         scaled_targets = np.nan_to_num(scaled_targets, nan=0.0)
-        
+
+
         # Créer les params (simplifié pour la version batch)
         scaling_params = [{
             "last_log_price": float(last_prices[i]) if "log_price" in self.feature_names else 0.0
@@ -307,16 +327,16 @@ class DataPreparer:
 
 
 if __name__ == "__main__":
-    # Chemins
-    sequences_path = Path("/Users/stordd/Documents/GitHub/Solana/memecoin2/data/jeff/sequences_raw.npz")
-    output_dir = Path("/Users/stordd/Documents/GitHub/Solana/memecoin2/data/jeff/")
+    # Updated paths to use new data from normal_behavior_tokens
+    sequences_path = Path("/Users/stordd/doc/Solana/memecoin2/data/processed/sequences_from_normal_tokens.npz")
+    output_dir = Path("/Users/stordd/doc/Solana/memecoin2/data/processed/")
     
     # Préparer les données
     preparer = DataPreparer(sequences_path)
     prepared_data = preparer.prepare_for_training(validation_split=0.2)
     
     # Sauvegarder les données scalées - SANS les metadata objects
-    output_path = output_dir / "sequences_scaled.npz"
+    output_path = output_dir / "sequences_scaled_normal_tokens.npz"
     np.savez_compressed(
         output_path,
         train_inputs=prepared_data["train"]["inputs"],
@@ -329,7 +349,7 @@ if __name__ == "__main__":
     print(f"\n💾 Données scalées sauvegardées: {output_path}")
     
     # Sauvegarder les metadata séparément en JSON
-    metadata_path = output_dir / "sequences_metadata.json"
+    metadata_path = output_dir / "sequences_metadata_normal_tokens.json"
     metadata_to_save = {
         "train_tokens": list(set([m["token"] for m in prepared_data["train"]["metadata"]])),
         "val_tokens": list(set([m["token"] for m in prepared_data["validation"]["metadata"]])),
@@ -343,7 +363,7 @@ if __name__ == "__main__":
     print(f"💾 Metadata sauvegardés: {metadata_path}")
     
     # Sauvegarder le scaler
-    scaler_path = output_dir / "scaler_params.json"
+    scaler_path = output_dir / "scaler_params_normal_tokens.json"
     prepared_data["scaler"].save_scaler(scaler_path)
     print(f"💾 Paramètres du scaler sauvegardés: {scaler_path}")
     

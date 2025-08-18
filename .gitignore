@@ -32,6 +32,7 @@ memecoin2/
 venv/
 env/
 ENV/
+botenv/
 
 # IDE
 .vscode/

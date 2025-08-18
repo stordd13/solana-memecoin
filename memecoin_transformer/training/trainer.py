@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from typing import Dict, List, Optional, Tuple
 import time
 import json
@@ -23,12 +23,20 @@ class MemecoinsTrainer:
     ):
         self.model = model.to(device)
         self.device = device
-        self.use_mixed_precision = use_mixed_precision and device in ['cuda', 'mps']
+        
+        # Mixed precision setup - only for CUDA devices
+        if use_mixed_precision and device == 'cuda':
+            self.use_mixed_precision = True
+            self.scaler = GradScaler('cuda')
+        else:
+            # Disable mixed precision for MPS and CPU
+            self.use_mixed_precision = False
+            self.scaler = None
+            if device == 'mps' and use_mixed_precision:
+                print("⚠️  Mixed precision disabled for Apple Silicon (MPS) - using float32")
+        
         self.gradient_clip = gradient_clip
         self.log_interval = log_interval
-        
-        # Mixed precision setup
-        self.scaler = GradScaler() if self.use_mixed_precision else None
         
         # Tracking
         self.train_history = []
@@ -59,25 +67,28 @@ class MemecoinsTrainer:
             inputs = inputs.to(self.device)
             targets = {k: v.to(self.device) for k, v in targets.items()}
             
-            # Mixed precision forward pass
-            if self.use_mixed_precision:
-                with autocast(device_type=self.device):
+            # Forward pass with conditional mixed precision
+            if self.use_mixed_precision and self.device == 'cuda':
+                with autocast('cuda'):
                     predictions = self.model(inputs)
                     loss, metrics = criterion(predictions, targets)
             else:
+                # Standard forward pass for MPS and CPU
                 predictions = self.model(inputs)
                 loss, metrics = criterion(predictions, targets)
             
             # Backward pass
             optimizer.zero_grad()
             
-            if self.use_mixed_precision:
+            if self.use_mixed_precision and self.device == 'cuda':
+                # Mixed precision backward pass for CUDA
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
                 self.scaler.step(optimizer)
                 self.scaler.update()
             else:
+                # Standard backward pass for MPS and CPU
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
                 optimizer.step()
@@ -161,6 +172,12 @@ class MemecoinsTrainer:
         # Calculer des métriques supplémentaires
         val_metrics.update(self._compute_extra_metrics(predictions_concat, targets_concat))
         
+        print(f"\n🔍 Prediction analysis:")
+        print(f"Pred prices mean: {predictions_concat['prices'].mean():.3f}")
+        print(f"Pred prices std: {predictions_concat['prices'].std():.3f}")
+        print(f"True prices mean: {targets_concat['prices'].mean():.3f}")
+        print(f"True prices std: {targets_concat['prices'].std():.3f}")
+
         return val_metrics, predictions_concat
     
     def _compute_extra_metrics(

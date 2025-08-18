@@ -204,6 +204,18 @@ class MemecoinsTransformer(nn.Module):
             nn.Linear(64, forecast_len)
         )
         
+        # ✅ RISK HEAD (NEW) - 0 = sûr, 1 = scam
+        self.risk_head = nn.Sequential(
+            nn.Linear(hidden_dim, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # 0 to 1
+        )
+        
     def _init_weights(self):
         """Initialisation des poids Xavier/He"""
         for p in self.parameters():
@@ -223,7 +235,7 @@ class MemecoinsTransformer(nn.Module):
             x: [batch_size, seq_len, input_dim]
             
         Returns:
-            Dict avec keys: 'prices', 'directions', 'uncertainty', 'volatility'
+            Dict avec keys: 'prices', 'directions', 'uncertainty', 'volatility', 'risk'
         """
         batch_size, seq_len, _ = x.shape
         device = x.device
@@ -260,6 +272,7 @@ class MemecoinsTransformer(nn.Module):
         direction_logits = self.direction_head(combined)  # [batch, forecast_len]
         uncertainty = self.uncertainty_head(combined)  # [batch, forecast_len]
         volatility = self.volatility_head(combined)  # [batch, forecast_len]
+        risk = self.risk_head(combined)  # [batch, 1] → Sigmoid → 0 to 1
         
         # 7. Activations finales
         direction_probs = torch.sigmoid(direction_logits)
@@ -271,6 +284,7 @@ class MemecoinsTransformer(nn.Module):
             'directions': direction_probs,     # P(price up)
             'uncertainty': uncertainty,        # Epistemic uncertainty
             'volatility': volatility,         # Predicted volatility
+            'risk': risk,                     # 0 = sûr, 1 = scam
             'attention_weights': attention_weights.detach()  # Pour visualisation
         }
     
@@ -289,7 +303,8 @@ class MemecoinsTransformer(nn.Module):
         head_params = list(self.price_head.parameters()) + \
                      list(self.direction_head.parameters()) + \
                      list(self.uncertainty_head.parameters()) + \
-                     list(self.volatility_head.parameters())
+                     list(self.volatility_head.parameters()) + \
+                     list(self.risk_head.parameters())  # ✅ INCLUS ICI
         
         return [
             {'params': embed_params, 'lr': lr * 0.1},  # Lower LR for embeddings

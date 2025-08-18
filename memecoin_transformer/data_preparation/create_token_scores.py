@@ -62,7 +62,7 @@ def compute_score(df: pl.DataFrame) -> float | None:
 
 if __name__ == "__main__":
     data_file_path = Path(
-        "/Users/stordd/Documents/GitHub/Solana/memecoin2/data/jeff/data_onchain_merged_tokens_list.parquet"
+        "/Users/stordd/doc/Solana/memecoin2/data/jeff/data_onchain_merged_tokens_list.parquet"
     )
 
     lf_raw = pl.scan_parquet(
@@ -117,7 +117,7 @@ if __name__ == "__main__":
     high_score_tokens = results_df.filter(pl.col("score") > 0.2)
     
     # Save to Parquet
-    output_path = Path("/Users/stordd/Documents/GitHub/Solana/memecoin2/data/jeff/scored_tokens_high_01.parquet")
+    output_path = Path("/Users/stordd/doc/Solana/memecoin2/data/jeff/scored_tokens_high_01.parquet")
     high_score_tokens.write_parquet(output_path, compression="snappy")
     
     print(f"✅ Found {len(high_score_tokens)} tokens with score > 0.2")
@@ -132,7 +132,7 @@ if __name__ == "__main__":
     print(high_score_tokens.sort("score", descending=True).head(10))
     
     # Save all scores for reference
-    all_scores_path = Path("/Users/stordd/Documents/GitHub/Solana/memecoin2/data/jeff/all_token_scores.parquet")
+    all_scores_path = Path("/Users/stordd/doc/Solana/memecoin2/data/jeff/all_token_scores.parquet")
     results_df.write_parquet(all_scores_path, compression="snappy")
     print(f"\n💾 All scores saved to: {all_scores_path}")
 
@@ -142,7 +142,7 @@ if __name__ == "__main__":
         
     address_list = addresses.get_column("token_address").to_list()
     final = lf.filter(pl.col("token_address").is_in(address_list))
-    final_path = Path("/Users/stordd/Documents/GitHub/Solana/memecoin2/data/jeff/data_onchain_merged_tokens_list_high_score.parquet")
+    final_path = Path("/Users/stordd/doc/Solana/memecoin2/data/jeff/data_onchain_merged_tokens_list_high_score.parquet")
     final.sink_parquet(final_path, compression="snappy")
     print(f"\n💾 All high scores saved to: {final_path}")
 

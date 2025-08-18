@@ -16,6 +16,7 @@ seaborn
 tqdm
 python-dotenv
 requests
+PyYAML
 
 # Development tools
 black

@@ -1,15 +1,20 @@
 # train.py
 
+import sys
+from pathlib import Path
+
+# Ajouter le dossier parent au path Python
+sys.path.append(str(Path(__file__).parent.parent))
+
 import torch
 import torch.optim as optim
-from pathlib import Path
 import argparse
 import json
 
-from models.transformer import create_memecoin_transformer
-from models.losses import MemecoinsLoss
+from model.transformer import create_memecoin_transformer
+from model.losses import MemecoinsLoss
+from model.data_loader import create_data_loaders
 from training.trainer import MemecoinsTrainer
-from training.data_loader import create_data_loaders
 
 def main():
     parser = argparse.ArgumentParser(description='Train Memecoin Transformer')
@@ -42,7 +47,7 @@ def main():
         device = args.device
     
     # Load metadata
-    metadata_path = Path(args.data_path).parent / 'sequences_metadata.json'
+    metadata_path = Path(args.data_path).parent / 'sequences_metadata_normal_tokens.json'
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
     
@@ -70,13 +75,41 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(device == 'cuda')
     )
-    
+    # Dans train.py, après le premier batch
+    for batch_idx, (inputs, targets) in enumerate(train_loader):
+        if batch_idx == 0:
+            print("\n🔍 First batch analysis:")
+            print(f"Input shape: {inputs.shape}")
+            print(f"Input range: [{inputs.min():.3f}, {inputs.max():.3f}]")
+            
+            # Analyser CHAQUE feature individuellement
+            print("\n📊 Feature-by-feature analysis:")
+            if hasattr(train_loader.dataset, 'feature_names'):
+                feature_names = train_loader.dataset.feature_names
+            else:
+                feature_names = [f'feat_{i}' for i in range(inputs.shape[2])]
+                
+            for i in range(inputs.shape[2]):
+                feat_values = inputs[:, :, i]
+                print(f"{i}. {feature_names[i]:20s}: min={feat_values.min():8.2f}, "
+                    f"max={feat_values.max():8.2f}, "
+                    f"mean={feat_values.mean():8.2f}, "
+                    f"std={feat_values.std():8.2f}")
+                
+                # Identifier les valeurs extrêmes
+                if feat_values.min() < -10 or feat_values.max() > 10:
+                    print(f"   ⚠️  PROBLÈME DE SCALING DÉTECTÉ!")
+            
+            print(f"\nTarget shape: {targets['prices'].shape}")
+            print(f"Target range: [{targets['prices'].min():.3f}, {targets['prices'].max():.3f}]")
+            break
     # Loss function
     criterion = MemecoinsLoss(
         price_weight=1.0,
         direction_weight=0.5,
         consistency_weight=0.2,
-        uncertainty_weight=0.1
+        uncertainty_weight=0.1,
+        use_uncertainty_weighting=False
     )
     
     # Optimizer with different learning rates
@@ -90,8 +123,7 @@ def main():
         optimizer,
         mode='min',
         factor=0.5,
-        patience=5,
-        verbose=True
+        patience=5
     )
     
     # Trainer

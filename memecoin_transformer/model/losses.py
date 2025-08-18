@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 class MemecoinsLoss(nn.Module):
     """
     Loss multi-tâches pour la prédiction de memecoins
-    Combine price prediction, direction, et consistency
+    Combine price prediction, direction, consistency, et risk penalty
     """
     
     def __init__(
@@ -17,6 +17,7 @@ class MemecoinsLoss(nn.Module):
         direction_weight: float = 0.5,
         consistency_weight: float = 0.2,
         uncertainty_weight: float = 0.1,
+        risk_penalty_weight: float = 0.1,
         use_uncertainty_weighting: bool = True
     ):
         super().__init__()
@@ -25,6 +26,7 @@ class MemecoinsLoss(nn.Module):
         self.direction_weight = direction_weight
         self.consistency_weight = consistency_weight
         self.uncertainty_weight = uncertainty_weight
+        self.risk_penalty_weight = risk_penalty_weight
         self.use_uncertainty_weighting = use_uncertainty_weighting
         
         # Smooth L1 pour la robustesse aux outliers
@@ -40,8 +42,8 @@ class MemecoinsLoss(nn.Module):
         Calcule la loss totale et les composantes individuelles
         
         Args:
-            predictions: Dict avec 'prices', 'directions', 'uncertainty', 'volatility'
-            targets: Dict avec 'prices', 'directions'
+            predictions: Dict avec 'prices', 'directions', 'uncertainty', 'volatility', 'risk'
+            targets: Dict avec 'prices', 'directions', 'current_price' (optionnel)
         """
         
         batch_size = predictions['prices'].shape[0]
@@ -55,14 +57,12 @@ class MemecoinsLoss(nn.Module):
         
         # Pondération par l'incertitude si activée
         if self.use_uncertainty_weighting and 'uncertainty' in predictions:
-            # Utilise l'incertitude prédite pour pondérer la loss
             uncertainty = predictions['uncertainty']
             price_loss = price_loss / (2 * uncertainty.pow(2)) + uncertainty.log()
         
         price_loss = price_loss.mean()
         
         # 2. Direction prediction loss
-        # Créer les labels de direction à partir des prix futurs
         current_price = targets.get('current_price', None)
         if current_price is not None:
             # Direction = 1 si prix monte, 0 sinon
@@ -82,8 +82,6 @@ class MemecoinsLoss(nn.Module):
         ).mean()
         
         # 3. Consistency loss
-        # Les prédictions de prix et direction doivent être cohérentes
-        # Si on prédit une hausse, le prix prédit devrait augmenter
         predicted_price_direction = torch.sigmoid(
             predictions['prices'] * 10  # Scale pour avoir des probas nettes
         )
@@ -93,14 +91,23 @@ class MemecoinsLoss(nn.Module):
         )
         
         # 4. Uncertainty regularization
-        # Éviter l'overconfidence : l'incertitude ne doit pas être trop faible
         uncertainty_reg = 0.0
         if 'uncertainty' in predictions:
-            # Pénaliser les incertitudes trop faibles
             min_uncertainty = 0.01
             uncertainty_reg = F.relu(min_uncertainty - predictions['uncertainty'].mean())
         
-        # 5. Volatility prediction loss (optionnel)
+        # 5. Risk penalty (NEW) : pénalise les erreurs quand risk > 0.7
+        risk_penalty = 0.0
+        if 'risk' in predictions and 'risk' in targets:
+            # Risk prediction loss (MSE between predicted and target risk)
+            risk_prediction_loss = F.mse_loss(predictions['risk'], targets['risk'])
+            
+            # Additional penalty: penalize errors when model predicts high risk
+            high_risk = (predictions['risk'] > 0.7).float()
+            error = torch.abs(predictions['prices'] - targets['prices'])
+            risk_penalty = risk_prediction_loss + torch.mean(error * high_risk)
+        
+        # 6. Volatility prediction loss (optionnel)
         volatility_loss = 0.0
         if 'volatility' in predictions and 'volatility' in targets:
             volatility_loss = F.mse_loss(
@@ -114,6 +121,7 @@ class MemecoinsLoss(nn.Module):
             self.direction_weight * direction_loss +
             self.consistency_weight * consistency_loss +
             self.uncertainty_weight * uncertainty_reg +
+            self.risk_penalty_weight * risk_penalty +  # ✅ NOUVEAU
             0.1 * volatility_loss  # Poids fixe pour la volatilité
         )
         
@@ -124,7 +132,8 @@ class MemecoinsLoss(nn.Module):
             'loss_direction': direction_loss.item(),
             'loss_consistency': consistency_loss.item(),
             'loss_uncertainty': uncertainty_reg.item() if isinstance(uncertainty_reg, torch.Tensor) else uncertainty_reg,
-            'loss_volatility': volatility_loss.item() if isinstance(volatility_loss, torch.Tensor) else volatility_loss
+            'loss_volatility': volatility_loss.item() if isinstance(volatility_loss, torch.Tensor) else volatility_loss,
+            'risk_penalty': risk_penalty.item() if isinstance(risk_penalty, torch.Tensor) else risk_penalty
         }
         
         return total_loss, metrics

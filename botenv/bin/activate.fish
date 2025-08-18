@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV /Users/stordd/Documents/GitHub/Solana/memecoin2/botenv
+set -gx VIRTUAL_ENV /Users/stordd/doc/Solana/memecoin2/botenv
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH

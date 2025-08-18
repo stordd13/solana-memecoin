@@ -1,4 +1,4 @@
-#!/Users/stordd/Documents/GitHub/Solana/memecoin2/botenv/bin/python3
+#!/Users/stordd/doc/Solana/memecoin2/botenv/bin/python3
 # -*- coding: utf-8 -*-
 import sys
 from cmdstanpy.install_cxx_toolchain import __main__
