@@ -3,6 +3,8 @@ streamlit
 polars
 numpy
 plotly
+panel
+bokeh 
 
 # Data processing and analysis
 python-dateutil
